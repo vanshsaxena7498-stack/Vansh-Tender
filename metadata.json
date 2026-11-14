@@ -1,0 +1,8 @@
+{
+  "name": "BidLedger — Tender & Bid Management CRM",
+  "description": "Official corporate Tender, GeM/CPPP Bid Management, and EMD/BG Financial Security CRM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
