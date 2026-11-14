@@ -48,7 +48,7 @@ function getStageBadgeClass(stage: TenderStage): string {
     case 'Submitted':
       return 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-400';
     case 'Tender Not Filled':
-      return 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-200';
+      return 'bg-red-100 text-red-700 border border-red-200 dark:bg-red-950/70 dark:text-red-300 dark:border-red-800/70';
     case 'Cancelled / Retendered':
       return 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400';
     default:
@@ -204,6 +204,7 @@ export function TendersTab({
         >
           {QUICK_FILTERS.map((f) => {
             const active = quickFilter === f.key;
+            const isNotFilledFilter = f.key === 'NOT_FILLED';
             return (
               <button
                 key={f.key}
@@ -212,8 +213,12 @@ export function TendersTab({
                 aria-pressed={active}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
                   active
-                    ? 'bg-[#1E3A8A] text-white dark:bg-blue-600'
-                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
+                    ? isNotFilledFilter
+                      ? 'bg-red-600 text-white dark:bg-red-600'
+                      : 'bg-[#1E3A8A] text-white dark:bg-blue-600'
+                    : isNotFilledFilter
+                      ? 'bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-900/60 hover:bg-red-100 dark:hover:bg-red-950/50'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
                 }`}
               >
                 {f.label}
@@ -286,17 +291,27 @@ export function TendersTab({
                         ? 'text-amber-600 dark:text-amber-400 font-medium'
                         : 'text-slate-600 dark:text-slate-400';
                   const isSynced = syncedSet.has(t.tenderId.toLowerCase());
+                  const isNotFilled = t.stage === 'Tender Not Filled';
 
                   return (
                     <tr
                       key={t.id}
-                      className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
+                      data-stage={t.stage}
+                      className={`transition-colors ${
+                        isNotFilled
+                          ? 'bg-red-50/80 hover:bg-red-100/80 border-l-4 border-l-red-500 dark:bg-red-950/30 dark:hover:bg-red-950/45 dark:border-l-red-500'
+                          : 'hover:bg-slate-50 dark:hover:bg-slate-800/40'
+                      }`}
                     >
                       <td className="py-2.5 px-3 align-top max-w-[165px]">
                         <button
                           type="button"
                           onClick={() => onOpenTender(t)}
-                          className="font-mono-num font-semibold text-[#1E3A8A] dark:text-blue-400 hover:underline text-left block truncate max-w-full"
+                          className={`font-mono-num font-semibold hover:underline text-left block truncate max-w-full ${
+                            isNotFilled
+                              ? 'text-red-700 dark:text-red-400'
+                              : 'text-[#1E3A8A] dark:text-blue-400'
+                          }`}
                           title={t.tenderId}
                         >
                           {t.tenderId}

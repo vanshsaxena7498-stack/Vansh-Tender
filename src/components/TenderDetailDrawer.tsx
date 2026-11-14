@@ -143,11 +143,30 @@ export function TenderDetailDrawer({
     >
       <div className="w-full max-w-2xl h-full bg-white dark:bg-slate-900 border-l border-slate-200 dark:border-slate-800 flex flex-col shadow-2xl">
         {/* Drawer Header */}
-        <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
+        <div
+          className={`flex items-start justify-between gap-4 px-6 py-4 border-b ${
+            tender.stage === 'Tender Not Filled'
+              ? 'border-red-200 dark:border-red-900/70 bg-red-50/70 dark:bg-red-950/35'
+              : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50'
+          }`}
+        >
           <div className="min-w-0">
-            <p className="font-mono-num text-xs font-semibold text-[#1E3A8A] dark:text-blue-400">
-              {tender.tenderId} · {tender.portal}
-            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <p
+                className={`font-mono-num text-xs font-semibold ${
+                  tender.stage === 'Tender Not Filled'
+                    ? 'text-red-700 dark:text-red-400'
+                    : 'text-[#1E3A8A] dark:text-blue-400'
+                }`}
+              >
+                {tender.tenderId} · {tender.portal}
+              </p>
+              {tender.stage === 'Tender Not Filled' && (
+                <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-red-100 text-red-700 border border-red-200 dark:bg-red-950/80 dark:text-red-300 dark:border-red-800">
+                  Tender Not Filled
+                </span>
+              )}
+            </div>
             <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white mt-0.5">
               {tender.title}
             </h2>
@@ -263,7 +282,11 @@ export function TenderDetailDrawer({
                   id="drawer-stage-select"
                   value={tender.stage}
                   onChange={(e) => handleStageChange(e.target.value as TenderStage)}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs font-medium text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  className={`w-full rounded-lg border px-3 py-2 text-xs font-medium focus:outline-none focus:ring-2 ${
+                    tender.stage === 'Tender Not Filled'
+                      ? 'border-red-400 dark:border-red-700 bg-red-50/70 dark:bg-red-950/30 text-red-800 dark:text-red-200 focus:ring-red-500'
+                      : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 focus:ring-blue-600'
+                  }`}
                 >
                   {STAGE_OPTIONS.map((s) => (
                     <option key={s} value={s}>

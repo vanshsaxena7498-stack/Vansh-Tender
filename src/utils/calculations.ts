@@ -186,9 +186,9 @@ export function buildStatusDistribution(tenders: Tender[]): StatusSlice[] {
       color: '#D97706',
     },
     { label: 'L1 / Won', stages: ['L1 / Won'], color: '#16A34A' },
-    { label: 'Lost', stages: ['Lost (L2/L3)'], color: '#DC2626' },
+    { label: 'Lost', stages: ['Lost (L2/L3)'], color: '#B91C1C' },
     { label: 'Cancelled', stages: ['Cancelled / Retendered'], color: '#94A3B8' },
-    { label: 'Not Filled', stages: ['Tender Not Filled'], color: '#475569' },
+    { label: 'Not Filled', stages: ['Tender Not Filled'], color: '#EF4444' },
   ];
 
   return buckets

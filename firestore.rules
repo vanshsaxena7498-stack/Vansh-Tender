@@ -72,7 +72,7 @@ service cloud.firestore {
     }
 
     function isTerminalTenderStage(stage) {
-      return stage in ['L1 / Won', 'Lost (L2/L3)', 'Cancelled / Retendered', 'Tender Not Filled'];
+      return stage in ['L1 / Won', 'Lost (L2/L3)', 'Cancelled / Retendered'];
     }
 
     function isValidInstrumentType(instrumentType) {
@@ -457,13 +457,13 @@ service cloud.firestore {
       allow update: if isVerifiedUser() &&
         isValidId(userId) &&
         isValidUserAccount(incoming(), userId) &&
-        incoming().ownerUid == existing().ownerUid &&
-        incoming().createdAt == existing().createdAt &&
+        (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+        (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
         incoming().updatedAt == request.time &&
         (
           (
             isOwner(userId) &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['ownerUid', 'email', 'createdAt', 'updatedAt'])
           ) ||
           isAdmin()
         );
@@ -492,18 +492,20 @@ service cloud.firestore {
           isValidId(profileId) &&
           profileId == 'firm' &&
           isValidFirmProfile(incoming(), userId) &&
-          incoming().ownerUid == existing().ownerUid &&
-          incoming().createdAt == existing().createdAt &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
               incoming().diff(existing()).affectedKeys().hasOnly([
+                'ownerUid',
                 'firmName',
                 'gstin',
                 'udyamNumber',
                 'adminName',
                 'adminPhotoUrl',
+                'createdAt',
                 'updatedAt'
               ])
             ) ||
@@ -583,9 +585,9 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(attachmentId) &&
           isValidAttachmentFile(incoming(), userId, attachmentId) &&
-          incoming().ownerUid == existing().ownerUid &&
-          incoming().id == existing().id &&
-          incoming().createdAt == existing().createdAt &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
@@ -629,9 +631,9 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(tenderDocId) &&
           isValidTender(incoming(), userId, tenderDocId) &&
-          incoming().ownerUid == existing().ownerUid &&
-          incoming().id == existing().id &&
-          incoming().createdAt == existing().createdAt &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
@@ -646,6 +648,8 @@ service cloud.firestore {
                   'updatedAt'
                 ]) ||
                 incoming().diff(existing()).affectedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'tenderId',
                   'portal',
                   'department',
@@ -665,7 +669,9 @@ service cloud.firestore {
                   'checklist',
                   'remarks',
                   'attachments',
+                  'clientCreatedAt',
                   'clientUpdatedAt',
+                  'createdAt',
                   'updatedAt'
                 ])
               )
@@ -701,9 +707,9 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(emdDocId) &&
           isValidEmdRecord(incoming(), userId, emdDocId) &&
-          incoming().ownerUid == existing().ownerUid &&
-          incoming().id == existing().id &&
-          incoming().createdAt == existing().createdAt &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
@@ -718,6 +724,8 @@ service cloud.firestore {
                   'updatedAt'
                 ]) ||
                 incoming().diff(existing()).affectedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'tenderRefId',
                   'tenderId',
                   'department',
@@ -733,6 +741,7 @@ service cloud.firestore {
                   'refundRef',
                   'remarks',
                   'attachments',
+                  'createdAt',
                   'updatedAt'
                 ])
               )

@@ -62,10 +62,9 @@ test('buildMonthlyChartSeries and buildStatusDistribution produce valid sorted s
     { ...SEED_TENDERS[0], id: 'tnd-not-filled', stage: 'Tender Not Filled' as const },
   ];
   const slicesWithNotFilled = buildStatusDistribution(withNotFilled);
-  assert.equal(
-    slicesWithNotFilled.find((s) => s.name === 'Not Filled')?.value,
-    1,
-  );
+  const notFilledSlice = slicesWithNotFilled.find((s) => s.name === 'Not Filled');
+  assert.equal(notFilledSlice?.value, 1);
+  assert.equal(notFilledSlice?.color, '#EF4444');
 });
 
 test('computeNotifications detects <48h deadlines, <30d BG expiry, and >60d EMD pending refund', () => {

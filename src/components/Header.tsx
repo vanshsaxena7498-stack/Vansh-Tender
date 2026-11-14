@@ -4,6 +4,7 @@ import {
   Bell,
   Clock,
   Cloud,
+  CloudAlert,
   CloudCheck,
   Lock,
   Menu,
@@ -31,6 +32,7 @@ interface HeaderProps {
   onOpenMobileMenu: () => void;
   cloudUser: CloudUserSummary | null;
   cloudSyncing: boolean;
+  cloudError?: boolean;
   onConnectCloud: () => void;
   onOpenCloudSettings: () => void;
 }
@@ -53,6 +55,7 @@ export function Header({
   onOpenMobileMenu,
   cloudUser,
   cloudSyncing,
+  cloudError = false,
   onConnectCloud,
   onOpenCloudSettings,
 }: HeaderProps) {
@@ -97,17 +100,30 @@ export function Header({
           type="button"
           onClick={cloudUser ? onOpenCloudSettings : onConnectCloud}
           disabled={cloudSyncing}
-          aria-label={cloudUser ? 'Google Cloud backup connected' : 'Connect Google Cloud backup'}
+          aria-label={
+            cloudError
+              ? 'Cloud sync issue - open settings'
+              : cloudUser
+                ? 'Google Cloud backup connected'
+                : 'Connect Google Cloud backup'
+          }
           className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
-            cloudUser
-              ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/50'
-              : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
+            cloudError
+              ? 'border-red-200 dark:border-red-800 bg-red-50/80 dark:bg-red-950/40 text-red-700 dark:text-red-300 hover:bg-red-100/70 dark:hover:bg-red-950/60'
+              : cloudUser
+                ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/50'
+                : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
           }`}
         >
           {cloudSyncing ? (
             <>
               <RefreshCw className="h-4 w-4 animate-spin text-blue-600 dark:text-blue-400" aria-hidden="true" />
               <span className="hidden sm:inline">Syncing...</span>
+            </>
+          ) : cloudError ? (
+            <>
+              <CloudAlert className="h-4 w-4 text-red-600 dark:text-red-400" aria-hidden="true" />
+              <span className="hidden sm:inline">Sync Issue</span>
             </>
           ) : cloudUser ? (
             <>

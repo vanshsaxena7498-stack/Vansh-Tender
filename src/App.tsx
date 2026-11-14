@@ -1,5 +1,5 @@
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
-import { Cloud, CloudUpload } from 'lucide-react';
+import { AlertTriangle, Cloud, CloudUpload, RefreshCw, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { DashboardTab } from './components/DashboardTab';
 import { EmdBgFormModal } from './components/EmdBgFormModal';
@@ -29,8 +29,10 @@ import type {
 import { computeNotifications } from './utils/calculations';
 import {
   backupAllToCloud,
+  clearCloudSessionCache,
   deleteEmdRecordFromCloud,
   deleteTenderFromCloud,
+  ensureUserRootDocument,
   fetchAllFromCloud,
   replaceCloudDataset,
   subscribeToUserCloudData,
@@ -47,17 +49,52 @@ import {
 
 function formatCloudErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
-  if (raw.includes("Quota exceeded for quota metric 'Free daily read units per project")) {
+  let parsedErrorText = raw;
+  let parsedOp = '';
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw) as { error?: string; operationType?: string };
+      if (typeof parsed.error === 'string') parsedErrorText = parsed.error;
+      if (typeof parsed.operationType === 'string') parsedOp = parsed.operationType;
+    } catch {
+      // Keep raw string
+    }
+  }
+
+  if (parsedErrorText.includes("Quota exceeded for quota metric 'Free daily read units per project")) {
     return `Firestore daily read quota reached. Upgrade or check usage at https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`;
   }
-  if (raw.includes('Quota exceeded')) {
+  if (parsedErrorText.includes('Quota exceeded')) {
     return 'Google Cloud Firestore daily free-tier quota exceeded. Quota resets tomorrow.';
   }
-  if (raw.includes('auth/popup-closed-by-user')) {
+  if (parsedErrorText.includes('auth/unauthorized-domain')) {
+    const host = typeof window !== 'undefined' ? window.location.hostname : 'this domain';
+    return `Google Sign-In is blocked for "${host}". Add "${host}" in Firebase Console -> Authentication -> Settings -> Authorized domains.`;
+  }
+  if (parsedErrorText.includes('auth/popup-closed-by-user')) {
     return 'Google Sign-In popup was closed before completing authentication.';
   }
-  if (raw.includes('auth/popup-blocked')) {
+  if (parsedErrorText.includes('auth/popup-blocked')) {
     return 'Sign-In popup was blocked by your browser. Please allow popups for this site.';
+  }
+  if (parsedErrorText.includes('auth/operation-not-allowed')) {
+    return 'Google Sign-In provider is not enabled in Firebase Authentication settings.';
+  }
+  if (
+    parsedErrorText.includes('auth/network-request-failed') ||
+    parsedErrorText.includes('unavailable') ||
+    parsedErrorText.includes('the client is offline')
+  ) {
+    return 'Unable to reach Firebase Cloud right now. Please check your internet connection and retry.';
+  }
+  if (
+    parsedErrorText.includes('permission-denied') ||
+    parsedErrorText.includes('Missing or insufficient permissions')
+  ) {
+    return `Cloud sync permission denied${parsedOp ? ` during ${parsedOp}` : ''}. Please sign out and sign in again with a verified Google account.`;
+  }
+  if (parsedErrorText.includes('failed-precondition')) {
+    return 'Firestore database index or precondition is missing. Please retry sync in a moment.';
   }
   return 'Could not sync with Firebase Firestore. Please check your connection and try again.';
 }
@@ -126,6 +163,9 @@ export default function App() {
     const initializeFirestoreSession = async () => {
       setCloudSyncing(true);
       try {
+        await ensureUserRootDocument(firebaseUser);
+        if (cancelled) return;
+
         const cloud = await fetchAllFromCloud(firebaseUser.uid);
         if (cancelled) return;
 
@@ -169,6 +209,7 @@ export default function App() {
             mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
           );
           markSyncedNow();
+          setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
         }
 
         if (cancelled) return;
@@ -232,6 +273,8 @@ export default function App() {
       markSyncedNow();
       if (successMessage) {
         setCloudFeedback({ type: 'ok', msg: successMessage });
+      } else {
+        setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
       }
     } catch (err) {
       setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
@@ -256,6 +299,7 @@ export default function App() {
     setCloudSyncing(true);
     try {
       await signOut(auth);
+      clearCloudSessionCache();
       setCloudFeedback({
         type: 'ok',
         msg: 'Signed out of Google Cloud. Sign back in anytime to read & save data in Firestore.',
@@ -284,6 +328,7 @@ export default function App() {
 
   const handleRestoreFromCloud = () => {
     void runCloudTask(async (user) => {
+      await ensureUserRootDocument(user);
       const cloud = await fetchAllFromCloud(user.uid);
       attachmentFilesRef.current = cloud.attachmentFiles;
       if (cloud.profile) {
@@ -525,6 +570,7 @@ export default function App() {
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           cloudUser={cloudUserSummary}
           cloudSyncing={cloudSyncing}
+          cloudError={cloudFeedback?.type === 'err'}
           onConnectCloud={handleConnectCloud}
           onOpenCloudSettings={() => setActiveTab('settings')}
         />
@@ -547,6 +593,45 @@ export default function App() {
                 <CloudUpload className="h-3.5 w-3.5" aria-hidden="true" />
                 <span>{cloudSyncing ? 'Connecting...' : 'Sign in with Google'}</span>
               </button>
+            </div>
+          )}
+
+          {cloudFeedback && activeTab !== 'settings' && (
+            <div
+              role={cloudFeedback.type === 'err' ? 'alert' : 'status'}
+              className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3 text-xs font-medium ${
+                cloudFeedback.type === 'err'
+                  ? 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 text-red-800 dark:text-red-200'
+                  : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-200'
+              }`}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                {cloudFeedback.type === 'err' && (
+                  <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0" aria-hidden="true" />
+                )}
+                <span className="break-words">{cloudFeedback.msg}</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {cloudFeedback.type === 'err' && firebaseUser && (
+                  <button
+                    type="button"
+                    onClick={handleBackupToCloudNow}
+                    disabled={cloudSyncing}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium"
+                  >
+                    <RefreshCw className={`h-3 w-3 ${cloudSyncing ? 'animate-spin' : ''}`} aria-hidden="true" />
+                    <span>Retry Sync</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setCloudFeedback(null)}
+                  aria-label="Dismiss cloud notification"
+                  className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              </div>
             </div>
           )}
 

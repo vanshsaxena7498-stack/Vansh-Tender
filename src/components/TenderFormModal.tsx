@@ -264,7 +264,11 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
                     id="t-stage"
                     value={stage}
                     onChange={(e) => setStage(e.target.value as TenderStage)}
-                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    className={`w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 ${
+                      stage === 'Tender Not Filled'
+                        ? 'border-red-400 dark:border-red-700 bg-red-50/70 dark:bg-red-950/30 text-red-800 dark:text-red-200 font-medium focus:ring-red-500'
+                        : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 focus:ring-blue-600'
+                    }`}
                   >
                     {STAGE_OPTIONS.map((s) => (
                       <option key={s} value={s}>

@@ -25,7 +25,6 @@ const TERMINAL_TENDER_STAGES = new Set([
   'L1 / Won',
   'Lost (L2/L3)',
   'Cancelled / Retendered',
-  'Tender Not Filled',
 ]);
 const VALID_INSTRUMENTS = new Set([
   'Online / NEFT / RTGS',

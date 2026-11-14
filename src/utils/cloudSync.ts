@@ -33,8 +33,15 @@ const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'L1 / Won',
   'Lost (L2/L3)',
   'Cancelled / Retendered',
-  'Tender Not Filled',
 ]);
+
+const ensuredUserUids = new Set<string>();
+const syncedAttachmentKeys = new Set<string>();
+
+export function clearCloudSessionCache(): void {
+  ensuredUserUids.clear();
+  syncedAttachmentKeys.clear();
+}
 
 const TERMINAL_FINANCIAL_STATUS = new Set<EmdBgRecord['status']>([
   'Refunded / Released',
@@ -116,27 +123,39 @@ function docToPreferences(data: Record<string, unknown>): UserPreferences {
 }
 
 export async function ensureUserRootDocument(user: User): Promise<void> {
+  if (ensuredUserUids.has(user.uid)) return;
   const userPath = `users/${user.uid}`;
   const userRef = doc(db, 'users', user.uid);
+  const safeEmail = (user.email ?? '').slice(0, 200);
   try {
     const snap = await getDoc(userRef);
     const now = serverTimestamp();
     if (!snap.exists()) {
       await setDoc(userRef, {
         ownerUid: user.uid,
-        email: (user.email ?? '').slice(0, 200),
+        email: safeEmail,
         createdAt: now,
         updatedAt: now,
       });
     } else {
-      await setDoc(userRef, {
-        ownerUid: snap.data().ownerUid ?? user.uid,
-        email: (user.email ?? '').slice(0, 200),
-        createdAt: snap.data().createdAt ?? now,
-        updatedAt: now,
-      });
+      const data = snap.data();
+      const needsRepair =
+        data.ownerUid !== user.uid ||
+        data.email !== safeEmail ||
+        data.createdAt === undefined ||
+        data.createdAt === null;
+      if (needsRepair) {
+        await setDoc(userRef, {
+          ownerUid: user.uid,
+          email: safeEmail,
+          createdAt: data.createdAt ?? now,
+          updatedAt: now,
+        });
+      }
     }
+    ensuredUserUids.add(user.uid);
   } catch (error) {
+    ensuredUserUids.delete(user.uid);
     handleFirestoreError(error, OperationType.WRITE, userPath);
   }
 }
@@ -182,11 +201,25 @@ export async function syncAttachmentFilesToCloud(
   for (const att of list) {
     if (!att.dataUrl) continue;
     const safeId = sanitizeDocId(att.id);
+    const cacheKey = `${user.uid}:${safeId}:${att.fileSize}:${att.uploadedAt}`;
+    if (syncedAttachmentKeys.has(cacheKey)) continue;
+
     const path = `users/${user.uid}/attachmentFiles/${safeId}`;
     const ref = doc(db, 'users', user.uid, 'attachmentFiles', safeId);
     try {
       const snap = await getDoc(ref);
-      const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+      const existingData = snap.exists() ? snap.data() : null;
+      if (
+        existingData &&
+        existingData.ownerUid === user.uid &&
+        existingData.fileSize === att.fileSize &&
+        existingData.fileName === (att.fileName.trim() || 'attachment') &&
+        existingData.createdAt
+      ) {
+        syncedAttachmentKeys.add(cacheKey);
+        continue;
+      }
+      const existingCreatedAt = existingData?.createdAt;
       const payload = buildCloudAttachmentFilePayload(
         att,
         user.uid,
@@ -195,6 +228,7 @@ export async function syncAttachmentFilesToCloud(
       );
       if (payload) {
         await setDoc(ref, payload);
+        syncedAttachmentKeys.add(cacheKey);
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
@@ -393,6 +427,7 @@ export async function replaceCloudDataset(
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
 ): Promise<void> {
+  await ensureUserRootDocument(user);
   const existing = await fetchAllFromCloud(user.uid);
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
