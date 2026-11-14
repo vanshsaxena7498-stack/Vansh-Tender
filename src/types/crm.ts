@@ -115,7 +115,41 @@ export interface UserPreferences {
   darkMode: boolean;
 }
 
-export type TabKey = 'dashboard' | 'tenders' | 'emdbg' | 'settings';
+export type TabKey = 'dashboard' | 'tenders' | 'maf' | 'emdbg' | 'settings';
+
+export type MafItemStatus =
+  | 'Not Requested'
+  | 'Requested / Follow-up'
+  | 'Under Approval'
+  | 'Received / Approved'
+  | 'Rejected';
+
+export interface MafLineItem {
+  itemId: string;
+  itemName: string;
+  requiredQuantity: string;
+  oemName: string;
+  oemContact?: string;
+  mafStatus: MafItemStatus;
+  validityDate: string;
+  mafDocumentUrl: string;
+  mafDocumentName?: string;
+  mafAttachmentId?: string;
+  remarks: string;
+  updatedAt?: string;
+}
+
+export interface MafTrackerRecord {
+  id: string;
+  tenderRefId: string;
+  tenderId: string;
+  tenderTitle?: string;
+  department?: string;
+  tenderDueDate?: string;
+  itemsMAF: MafLineItem[];
+  createdAt: string;
+  updatedAt: string;
+}
 
 export type NotificationCategory = 'deadline_48h' | 'bg_expiry_30d' | 'emd_refund_60d';
 
@@ -135,4 +169,5 @@ export interface CrmBackupPayload {
   profile: FirmProfile;
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
+  mafTrackers?: MafTrackerRecord[];
 }

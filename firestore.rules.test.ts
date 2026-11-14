@@ -284,3 +284,96 @@ test('Dirty Dozen adversarial payloads all evaluate to PERMISSION_DENIED', () =>
     ['b'],
   );
 });
+
+function isValidMafTracker(
+  data: Record<string, unknown>,
+  auth: AuthContext,
+  userId: string,
+  mafDocId: string,
+): boolean {
+  const keys = [
+    'ownerUid',
+    'id',
+    'tenderRefId',
+    'tenderId',
+    'tenderTitle',
+    'department',
+    'tenderDueDate',
+    'itemsMAF',
+    'clientCreatedAt',
+    'clientUpdatedAt',
+    'createdAt',
+    'updatedAt',
+  ];
+  if (!hasExactKeys(data, keys, keys)) return false;
+  return (
+    isValidId(data.ownerUid) &&
+    data.ownerUid === userId &&
+    data.ownerUid === auth.uid &&
+    isValidId(data.id) &&
+    data.id === mafDocId &&
+    typeof data.tenderRefId === 'string' &&
+    data.tenderRefId.length <= 128 &&
+    typeof data.tenderId === 'string' &&
+    data.tenderId.length >= 1 &&
+    data.tenderId.length <= 120 &&
+    typeof data.tenderTitle === 'string' &&
+    data.tenderTitle.length <= 300 &&
+    typeof data.department === 'string' &&
+    data.department.length <= 200 &&
+    typeof data.tenderDueDate === 'string' &&
+    data.tenderDueDate.length <= 32 &&
+    Array.isArray(data.itemsMAF) &&
+    data.itemsMAF.length <= 50 &&
+    typeof data.clientCreatedAt === 'string' &&
+    typeof data.clientUpdatedAt === 'string' &&
+    data.createdAt === SERVER_TIME &&
+    data.updatedAt === SERVER_TIME
+  );
+}
+
+test('MafTracker Firestore rules enforce ownership, bounded itemsMAF (<= 50), and no shadow fields', () => {
+  const verifiedUser: AuthContext = {
+    uid: 'u2',
+    token: { email: 'user@example.com', email_verified: true },
+  };
+  const validMaf: Record<string, unknown> = {
+    ownerUid: 'u2',
+    id: 'maf-tnd-2',
+    tenderRefId: 'tnd-2',
+    tenderId: 'CPPP/2026/NHAI/88341',
+    tenderTitle: 'ANPR Camera Supply',
+    department: 'NHAI',
+    tenderDueDate: '2026-11-15T14:00',
+    itemsMAF: [{ itemId: 'i1', itemName: 'Dome Camera', oemName: 'CP Plus' }],
+    clientCreatedAt: '2026-11-10T10:00:00Z',
+    clientUpdatedAt: '2026-11-12T10:00:00Z',
+    createdAt: SERVER_TIME,
+    updatedAt: SERVER_TIME,
+  };
+  assert.equal(isValidMafTracker(validMaf, verifiedUser, 'u2', 'maf-tnd-2'), true);
+
+  // Oversized itemsMAF (> 50)
+  assert.equal(
+    isValidMafTracker(
+      { ...validMaf, itemsMAF: Array.from({ length: 51 }, (_, idx) => ({ itemId: `i-${idx}` })) },
+      verifiedUser,
+      'u2',
+      'maf-tnd-2',
+    ),
+    false,
+  );
+
+  // Shadow field
+  assert.equal(
+    isValidMafTracker({ ...validMaf, secretFlag: true }, verifiedUser, 'u2', 'maf-tnd-2'),
+    false,
+  );
+
+  // Cross-tenant ownerUid
+  assert.equal(
+    isValidMafTracker({ ...validMaf, ownerUid: 'victim' }, verifiedUser, 'u2', 'maf-tnd-2'),
+    false,
+  );
+});
+

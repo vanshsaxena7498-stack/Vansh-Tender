@@ -463,6 +463,79 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "MafTracker": {
+      "title": "MafTracker",
+      "description": "Manufacturer Authorization Form (MAF) tracker record linked to a tender with per-item OEM status entries.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "tenderRefId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "tenderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "tenderTitle": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "department": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "tenderDueDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "itemsMAF": {
+          "type": "array"
+        },
+        "clientCreatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "clientUpdatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "id",
+        "tenderRefId",
+        "tenderId",
+        "tenderTitle",
+        "department",
+        "tenderDueDate",
+        "itemsMAF",
+        "clientCreatedAt",
+        "clientUpdatedAt",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -507,6 +580,12 @@
         "$ref": "#/entities/AttachmentFile"
       },
       "description": "Per-attachment binary/dataUrl documents kept under 1 MiB in Firestore."
+    },
+    "/users/{userId}/maf_tracker/{mafDocId}": {
+      "schema": {
+        "$ref": "#/entities/MafTracker"
+      },
+      "description": "Tender-OEM MAF tracker records with nested itemsMAF line items stored exclusively in Firestore."
     }
   }
 }

@@ -425,6 +425,62 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidMafTracker(data, userId, mafDocId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'id',
+          'tenderRefId',
+          'tenderId',
+          'tenderTitle',
+          'department',
+          'tenderDueDate',
+          'itemsMAF',
+          'clientCreatedAt',
+          'clientUpdatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'id',
+          'tenderRefId',
+          'tenderId',
+          'tenderTitle',
+          'department',
+          'tenderDueDate',
+          'itemsMAF',
+          'clientCreatedAt',
+          'clientUpdatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        isValidId(data.id) &&
+        data.id == mafDocId &&
+        data.tenderRefId is string &&
+        data.tenderRefId.size() <= 128 &&
+        data.tenderId is string &&
+        data.tenderId.size() >= 1 &&
+        data.tenderId.size() <= 120 &&
+        data.tenderTitle is string &&
+        data.tenderTitle.size() <= 300 &&
+        data.department is string &&
+        data.department.size() <= 200 &&
+        data.tenderDueDate is string &&
+        data.tenderDueDate.size() <= 32 &&
+        data.itemsMAF is list &&
+        data.itemsMAF.size() <= 50 &&
+        (data.itemsMAF.size() == 0 || data.itemsMAF[0] is map) &&
+        data.clientCreatedAt is string &&
+        data.clientCreatedAt.size() <= 40 &&
+        data.clientUpdatedAt is string &&
+        data.clientUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // -------------------------------------------------------------------------
     // Collection Rules
     // -------------------------------------------------------------------------
@@ -752,6 +808,59 @@ service cloud.firestore {
         allow delete: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(emdDocId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /maf_tracker/{mafDocId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(mafDocId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(mafDocId) &&
+          isOwner(userId) &&
+          isValidMafTracker(incoming(), userId, mafDocId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(mafDocId) &&
+          isValidMafTracker(incoming(), userId, mafDocId) &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'tenderRefId',
+                'tenderId',
+                'tenderTitle',
+                'department',
+                'tenderDueDate',
+                'itemsMAF',
+                'clientCreatedAt',
+                'clientUpdatedAt',
+                'createdAt',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(mafDocId) &&
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
       }

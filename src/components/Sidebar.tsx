@@ -4,6 +4,7 @@ import {
   FileSpreadsheet,
   Landmark,
   Settings,
+  ShieldCheck,
   User,
   X,
 } from 'lucide-react';
@@ -14,6 +15,7 @@ interface SidebarProps {
   onSelectTab: (tab: TabKey) => void;
   firmProfile: FirmProfile;
   tenderCount: number;
+  mafCount?: number;
   emdCount: number;
   mobileOpen: boolean;
   onCloseMobile: () => void;
@@ -22,6 +24,7 @@ interface SidebarProps {
 const NAV_ITEMS: { key: TabKey; label: string; icon: typeof BarChart3 }[] = [
   { key: 'dashboard', label: 'Executive Dashboard', icon: BarChart3 },
   { key: 'tenders', label: 'Daily Tender Data', icon: FileSpreadsheet },
+  { key: 'maf', label: 'MAF Status', icon: ShieldCheck },
   { key: 'emdbg', label: 'EMD & BG Tracker', icon: Landmark },
   { key: 'settings', label: 'Admin Settings', icon: Settings },
 ];
@@ -31,6 +34,7 @@ export function Sidebar({
   onSelectTab,
   firmProfile,
   tenderCount,
+  mafCount = 0,
   emdCount,
   mobileOpen,
   onCloseMobile,
@@ -74,7 +78,13 @@ export function Sidebar({
           const Icon = item.icon;
           const isActive = activeTab === item.key;
           const countLabel =
-            item.key === 'tenders' ? tenderCount : item.key === 'emdbg' ? emdCount : null;
+            item.key === 'tenders'
+              ? tenderCount
+              : item.key === 'maf'
+                ? mafCount
+                : item.key === 'emdbg'
+                  ? emdCount
+                  : null;
 
           return (
             <button

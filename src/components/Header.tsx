@@ -40,6 +40,7 @@ interface HeaderProps {
 const TAB_TITLES: Record<TabKey, string> = {
   dashboard: 'Monthly Executive Dashboard',
   tenders: 'Daily Tender Operations',
+  maf: 'MAF Status',
   emdbg: 'EMD & Bank Guarantee Tracker',
   settings: 'Admin Settings & Backups',
 };

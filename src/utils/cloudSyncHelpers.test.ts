@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { EmdBgRecord, FirmProfile, Tender } from '../types/crm';
+import type { EmdBgRecord, FirmProfile, MafTrackerRecord, Tender } from '../types/crm';
 import {
   buildCloudAttachmentFilePayload,
   buildCloudEmdPayload,
+  buildCloudMafTrackerPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudTenderPayload,
   CLOUD_LIMITS,
   mergeCloudEmdWithFiles,
+  mergeCloudMafTrackersWithFiles,
   mergeCloudProfileWithLocal,
   mergeCloudTendersWithFiles,
   sanitizeDocId,
@@ -164,3 +166,55 @@ test('buildCloudEmdPayload and mergeCloudEmdWithFiles rehydrate attachment files
   assert.equal(mergedProfile.firmName, 'Saxena Corp');
   assert.equal(mergedProfile.adminPhotoUrl, 'data:image/jpeg;base64,PHOTO');
 });
+
+test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and preserves external URLs', () => {
+  const dataUri = 'data:application/pdf;base64,' + 'D'.repeat(20000);
+  const tracker: MafTrackerRecord = {
+    id: 'maf-tnd-2',
+    tenderRefId: 'tnd-2',
+    tenderId: 'CPPP/2026/NHAI/88341',
+    tenderTitle: 'ANPR Camera Tender',
+    department: 'NHAI',
+    tenderDueDate: '2026-11-15T14:00',
+    itemsMAF: [
+      {
+        itemId: 'item-1',
+        itemName: 'Dome Cameras',
+        requiredQuantity: '100 Nos',
+        oemName: 'CP Plus',
+        mafStatus: 'Received / Approved',
+        validityDate: '2026-12-22',
+        mafDocumentUrl: dataUri,
+        mafDocumentName: 'maf_signed.pdf',
+        mafAttachmentId: 'maf-att-1',
+        remarks: 'Signed copy uploaded',
+      },
+      {
+        itemId: 'item-2',
+        itemName: 'PTZ Cameras',
+        requiredQuantity: '20 Nos',
+        oemName: 'Hikvision',
+        mafStatus: 'Under Approval',
+        validityDate: '2026-12-21',
+        mafDocumentUrl: 'https://drive.google.com/file/d/abc/view',
+        mafDocumentName: 'Cloud link',
+        remarks: 'Cloud drive draft',
+      },
+    ],
+    createdAt: '2026-11-10T10:00:00Z',
+    updatedAt: '2026-11-13T10:00:00Z',
+  };
+
+  const payload = buildCloudMafTrackerPayload(tracker, 'uid-1', TOKEN);
+  const cloudItems = payload.itemsMAF as MafTrackerRecord['itemsMAF'];
+  assert.equal(cloudItems.length, 2);
+  assert.equal(cloudItems[0].mafDocumentUrl, '');
+  assert.equal(cloudItems[0].mafAttachmentId, 'maf-att-1');
+  assert.equal(cloudItems[1].mafDocumentUrl, 'https://drive.google.com/file/d/abc/view');
+
+  const fileMap = new Map<string, string>([['maf-att-1', dataUri]]);
+  const merged = mergeCloudMafTrackersWithFiles([{ ...tracker, itemsMAF: cloudItems }], fileMap, []);
+  assert.equal(merged[0].itemsMAF[0].mafDocumentUrl, dataUri);
+  assert.equal(merged[0].itemsMAF[1].mafDocumentUrl, 'https://drive.google.com/file/d/abc/view');
+});
+

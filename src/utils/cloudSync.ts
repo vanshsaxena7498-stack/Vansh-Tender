@@ -12,22 +12,27 @@ import {
   where,
   type Unsubscribe,
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
+import { db, handleFirestoreError, OperationType, storage } from '../lib/firebase';
 import type {
   AttachmentItem,
   EmdBgRecord,
   FirmProfile,
+  MafTrackerRecord,
   Tender,
   UserPreferences,
 } from '../types/crm';
+import { MAX_ATTACHMENT_BYTES, readAttachmentForFirestore } from './attachments';
 import {
   buildCloudAttachmentFilePayload,
   buildCloudEmdPayload,
+  buildCloudMafTrackerPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudTenderPayload,
   sanitizeDocId,
 } from './cloudSyncHelpers';
+import { validateMafUploadFile } from './mafCalculations';
 
 const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'L1 / Won',
@@ -101,6 +106,22 @@ function docToEmdRecord(data: Record<string, unknown>): EmdBgRecord {
     attachments: Array.isArray(data.attachments)
       ? (data.attachments as EmdBgRecord['attachments'])
       : [],
+  };
+}
+
+function docToMafTracker(data: Record<string, unknown>): MafTrackerRecord {
+  return {
+    id: String(data.id ?? ''),
+    tenderRefId: String(data.tenderRefId ?? ''),
+    tenderId: String(data.tenderId ?? ''),
+    tenderTitle: String(data.tenderTitle ?? ''),
+    department: String(data.department ?? ''),
+    tenderDueDate: String(data.tenderDueDate ?? ''),
+    itemsMAF: Array.isArray(data.itemsMAF)
+      ? (data.itemsMAF as MafTrackerRecord['itemsMAF'])
+      : [],
+    createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
+    updatedAt: String(data.clientUpdatedAt ?? new Date().toISOString()),
   };
 }
 
@@ -236,6 +257,76 @@ export async function syncAttachmentFilesToCloud(
   }
 }
 
+export async function uploadMafDocumentFile(
+  user: User | null,
+  trackerId: string,
+  itemId: string,
+  file: File,
+): Promise<{
+  mafDocumentUrl: string;
+  mafDocumentName: string;
+  mafAttachmentId?: string;
+}> {
+  const validationErr = validateMafUploadFile(file);
+  if (validationErr) {
+    throw new Error(validationErr);
+  }
+
+  const isCompressibleImage =
+    file.type.startsWith('image/') && file.type !== 'image/svg+xml' && file.type !== 'image/gif';
+
+  // Use Firebase Storage for large non-image PDFs (> 650 KB) when signed in
+  if (!isCompressibleImage && file.size > MAX_ATTACHMENT_BYTES) {
+    if (!user) {
+      throw new Error(
+        'PDF exceeds 650 KB. Sign in with Google for Firebase Storage upload, compress the PDF under 650 KB, or paste a Cloud Drive link.',
+      );
+    }
+    const safeName = file.name.replace(/[^a-zA-Z0-9._\-]/g, '_');
+    const path = `users/${user.uid}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`;
+    try {
+      const fileRef = storageRef(storage, path);
+      await uploadBytes(fileRef, file, {
+        contentType: file.type || 'application/pdf',
+      });
+      const url = await getDownloadURL(fileRef);
+      return {
+        mafDocumentUrl: url,
+        mafDocumentName: file.name,
+        mafAttachmentId: undefined,
+      };
+    } catch {
+      throw new Error(
+        'Could not upload large PDF to Firebase Storage. Please upload a PDF under 650 KB or paste a Google Drive link.',
+      );
+    }
+  }
+
+  // Images (auto-compressed) or PDFs <= 650 KB -> store cleanly in attachmentFiles subcollection
+  const prepared = await readAttachmentForFirestore(file);
+  const attId = sanitizeDocId(`maf_${itemId}_${Date.now()}`);
+  const attachmentItem: AttachmentItem = {
+    id: attId,
+    slotLabel: 'MAF Document',
+    fileName: file.name,
+    fileType: prepared.fileType,
+    fileSize: prepared.fileSize,
+    uploadedAt: new Date().toISOString(),
+    dataUrl: prepared.dataUrl,
+  };
+
+  if (user) {
+    await ensureUserRootDocument(user);
+    await syncAttachmentFilesToCloud(user, [attachmentItem]);
+  }
+
+  return {
+    mafDocumentUrl: prepared.dataUrl,
+    mafDocumentName: file.name,
+    mafAttachmentId: attId,
+  };
+}
+
 export async function syncTenderToCloud(user: User, tender: Tender): Promise<void> {
   await ensureUserRootDocument(user);
   await syncAttachmentFilesToCloud(user, tender.attachments);
@@ -312,6 +403,60 @@ export async function deleteEmdRecordFromCloud(user: User, recordId: string): Pr
   }
 }
 
+export async function syncMafTrackerToCloud(
+  user: User,
+  tracker: MafTrackerRecord,
+): Promise<void> {
+  await ensureUserRootDocument(user);
+
+  const inlineMafAttachments: AttachmentItem[] = [];
+  for (const item of tracker.itemsMAF ?? []) {
+    if (item.mafAttachmentId && item.mafDocumentUrl?.startsWith('data:')) {
+      inlineMafAttachments.push({
+        id: item.mafAttachmentId,
+        slotLabel: 'MAF Document',
+        fileName: item.mafDocumentName || `${item.oemName}_MAF`,
+        fileType: item.mafDocumentUrl.startsWith('data:application/pdf')
+          ? 'application/pdf'
+          : 'image/jpeg',
+        fileSize: Math.round((item.mafDocumentUrl.length * 3) / 4),
+        uploadedAt: item.updatedAt || tracker.updatedAt,
+        dataUrl: item.mafDocumentUrl,
+      });
+    }
+  }
+  if (inlineMafAttachments.length > 0) {
+    await syncAttachmentFilesToCloud(user, inlineMafAttachments);
+  }
+
+  const safeId = sanitizeDocId(tracker.id);
+  const path = `users/${user.uid}/maf_tracker/${safeId}`;
+  const ref = doc(db, 'users', user.uid, 'maf_tracker', safeId);
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const payload = buildCloudMafTrackerPayload(
+      { ...tracker, id: safeId },
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    await setDoc(ref, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function deleteMafTrackerFromCloud(user: User, trackerId: string): Promise<void> {
+  const safeId = sanitizeDocId(trackerId);
+  const path = `users/${user.uid}/maf_tracker/${safeId}`;
+  try {
+    await deleteDoc(doc(db, 'users', user.uid, 'maf_tracker', safeId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 export async function fetchAttachmentFileDataUrl(
   uid: string,
   attachmentId: string,
@@ -333,18 +478,21 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   preferences: UserPreferences | null;
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
+  mafTrackers: MafTrackerRecord[];
   attachmentFiles: Map<string, string>;
 }> {
   const profilePath = `users/${uid}/profile/firm`;
   const prefsPath = `users/${uid}/settings/preferences`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
+  const mafPath = `users/${uid}/maf_tracker`;
   const filesPath = `users/${uid}/attachmentFiles`;
 
   let profile: FirmProfile | null = null;
   let preferences: UserPreferences | null = null;
   let tenders: Tender[] = [];
   let emdRecords: EmdBgRecord[] = [];
+  let mafTrackers: MafTrackerRecord[] = [];
   const attachmentFiles = new Map<string, string>();
 
   try {
@@ -382,6 +530,14 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
+    const mQuery = query(collection(db, 'users', uid, 'maf_tracker'), where('ownerUid', '==', uid));
+    const mSnap = await getDocs(mQuery);
+    mafTrackers = mSnap.docs.map((d) => docToMafTracker(d.data()));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, mafPath);
+  }
+
+  try {
     const fQuery = query(
       collection(db, 'users', uid, 'attachmentFiles'),
       where('ownerUid', '==', uid),
@@ -397,7 +553,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
     handleFirestoreError(error, OperationType.LIST, filesPath);
   }
 
-  return { profile, preferences, tenders, emdRecords, attachmentFiles };
+  return { profile, preferences, tenders, emdRecords, mafTrackers, attachmentFiles };
 }
 
 export async function backupAllToCloud(
@@ -406,6 +562,7 @@ export async function backupAllToCloud(
   preferences: UserPreferences,
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
+  mafTrackers: MafTrackerRecord[] = [],
 ): Promise<void> {
   await ensureUserRootDocument(user);
   await syncProfileToCloud(user, profile);
@@ -418,6 +575,10 @@ export async function backupAllToCloud(
   for (const record of emdRecords) {
     await syncEmdRecordToCloud(user, record);
   }
+
+  for (const tracker of mafTrackers) {
+    await syncMafTrackerToCloud(user, tracker);
+  }
 }
 
 export async function replaceCloudDataset(
@@ -426,11 +587,13 @@ export async function replaceCloudDataset(
   preferences: UserPreferences,
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
+  mafTrackers: MafTrackerRecord[] = [],
 ): Promise<void> {
   await ensureUserRootDocument(user);
   const existing = await fetchAllFromCloud(user.uid);
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
+  const nextMafIds = new Set(mafTrackers.map((m) => sanitizeDocId(m.id)));
   const nextAttachmentIds = new Set<string>();
 
   for (const t of tenders) {
@@ -438,6 +601,13 @@ export async function replaceCloudDataset(
   }
   for (const r of emdRecords) {
     for (const a of r.attachments ?? []) nextAttachmentIds.add(sanitizeDocId(a.id));
+  }
+  for (const m of mafTrackers) {
+    for (const item of m.itemsMAF ?? []) {
+      if (item.mafAttachmentId) {
+        nextAttachmentIds.add(sanitizeDocId(item.mafAttachmentId));
+      }
+    }
   }
 
   for (const oldTender of existing.tenders) {
@@ -449,6 +619,12 @@ export async function replaceCloudDataset(
   for (const oldEmd of existing.emdRecords) {
     if (!nextEmdIds.has(sanitizeDocId(oldEmd.id))) {
       await deleteEmdRecordFromCloud(user, oldEmd.id);
+    }
+  }
+
+  for (const oldMaf of existing.mafTrackers) {
+    if (!nextMafIds.has(sanitizeDocId(oldMaf.id))) {
+      await deleteMafTrackerFromCloud(user, oldMaf.id);
     }
   }
 
@@ -464,7 +640,7 @@ export async function replaceCloudDataset(
     }
   }
 
-  await backupAllToCloud(user, profile, preferences, tenders, emdRecords);
+  await backupAllToCloud(user, profile, preferences, tenders, emdRecords, mafTrackers);
 }
 
 export function subscribeToUserCloudData(
@@ -474,6 +650,7 @@ export function subscribeToUserCloudData(
     onPreferences: (prefs: UserPreferences) => void;
     onTenders: (tenders: Tender[]) => void;
     onEmdRecords: (records: EmdBgRecord[]) => void;
+    onMafTrackers: (trackers: MafTrackerRecord[]) => void;
     onAttachmentFiles: (fileMap: Map<string, string>) => void;
     onError: (err: Error) => void;
   },
@@ -482,6 +659,7 @@ export function subscribeToUserCloudData(
   const prefsPath = `users/${uid}/settings/preferences`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
+  const mafPath = `users/${uid}/maf_tracker`;
   const filesPath = `users/${uid}/attachmentFiles`;
 
   const unsubProfile = onSnapshot(
@@ -544,6 +722,20 @@ export function subscribeToUserCloudData(
     },
   );
 
+  const unsubMaf = onSnapshot(
+    query(collection(db, 'users', uid, 'maf_tracker'), where('ownerUid', '==', uid)),
+    (snap) => {
+      callbacks.onMafTrackers(snap.docs.map((d) => docToMafTracker(d.data())));
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, mafPath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
   const unsubFiles = onSnapshot(
     query(collection(db, 'users', uid, 'attachmentFiles'), where('ownerUid', '==', uid)),
     (snap) => {
@@ -570,6 +762,7 @@ export function subscribeToUserCloudData(
     unsubPrefs();
     unsubTenders();
     unsubEmd();
+    unsubMaf();
     unsubFiles();
   };
 }

@@ -15,7 +15,13 @@ import {
   Upload,
   User,
 } from 'lucide-react';
-import type { CrmBackupPayload, EmdBgRecord, FirmProfile, Tender } from '../types/crm';
+import type {
+  CrmBackupPayload,
+  EmdBgRecord,
+  FirmProfile,
+  MafTrackerRecord,
+  Tender,
+} from '../types/crm';
 import { compressProfilePhotoDataUrl } from '../utils/attachments';
 import { buildCsvContent, downloadTextFile } from '../utils/formatters';
 import type { CloudUserSummary } from './Header';
@@ -25,6 +31,7 @@ interface SettingsTabProps {
   currentPin: string;
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
+  mafTrackers: MafTrackerRecord[];
   onSaveProfile: (profile: FirmProfile) => void;
   onUpdatePin: (newPin: string) => void;
   onImportBackup: (payload: CrmBackupPayload) => void;
@@ -45,6 +52,7 @@ export function SettingsTab({
   currentPin,
   tenders,
   emdRecords,
+  mafTrackers,
   onSaveProfile,
   onUpdatePin,
   onImportBackup,
@@ -162,18 +170,19 @@ export function SettingsTab({
 
   const handleDownloadJsonBackup = () => {
     const payload: CrmBackupPayload = {
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       profile,
       tenders,
       emdRecords,
+      mafTrackers,
     };
     downloadTextFile(
       `BidLedger_Full_Backup_${new Date().toISOString().slice(0, 10)}.json`,
       JSON.stringify(payload, null, 2),
       'application/json',
     );
-    setBackupMsg({ type: 'ok', msg: 'Full JSON backup downloaded.' });
+    setBackupMsg({ type: 'ok', msg: 'Full JSON backup downloaded (including MAF Trackers).' });
   };
 
   const handleExportAllCsv = () => {
@@ -253,7 +262,10 @@ export function SettingsTab({
         setBackupMsg({ type: 'err', msg: 'Invalid backup JSON structure.' });
         return;
       }
-      onImportBackup(parsed);
+      onImportBackup({
+        ...parsed,
+        mafTrackers: Array.isArray(parsed.mafTrackers) ? parsed.mafTrackers : [],
+      });
       setFirmName(parsed.profile.firmName);
       setGstin(parsed.profile.gstin);
       setUdyamNumber(parsed.profile.udyamNumber);
@@ -261,7 +273,7 @@ export function SettingsTab({
       setAdminPhotoUrl(parsed.profile.adminPhotoUrl ?? '');
       setBackupMsg({
         type: 'ok',
-        msg: `Restored ${parsed.tenders.length} tenders and ${parsed.emdRecords.length} EMD/BG records.`,
+        msg: `Restored ${parsed.tenders.length} tenders, ${parsed.emdRecords.length} EMD/BG records, and ${(parsed.mafTrackers ?? []).length} MAF trackers.`,
       });
     } catch {
       setBackupMsg({ type: 'err', msg: 'Could not parse JSON backup file.' });
@@ -315,7 +327,7 @@ export function SettingsTab({
                 Connect your Google Account for Automatic Cloud Backup
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Sign in with Google once to back up all {tenders.length} tenders, {emdRecords.length} EMD/BG records, and firm settings to Google Cloud Firestore in real time across devices.
+                Sign in with Google once to back up all {tenders.length} tenders, {mafTrackers.length} MAF trackers, {emdRecords.length} EMD/BG records, and firm settings to Google Cloud Firestore in real time across devices.
               </p>
             </div>
             <button

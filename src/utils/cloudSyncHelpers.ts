@@ -2,6 +2,8 @@ import type {
   AttachmentItem,
   EmdBgRecord,
   FirmProfile,
+  MafLineItem,
+  MafTrackerRecord,
   Tender,
   UserPreferences,
 } from '../types/crm';
@@ -26,6 +28,13 @@ export const CLOUD_LIMITS = {
   CHECKLIST_MAX: 30,
   REMARKS_LIST_MAX: 100,
   ATTACHMENTS_LIST_MAX: 10,
+  MAF_ITEMS_MAX: 50,
+  MAF_ITEM_NAME_MAX: 220,
+  MAF_OEM_NAME_MAX: 150,
+  MAF_CONTACT_MAX: 120,
+  MAF_QTY_MAX: 60,
+  MAF_URL_MAX: 2000,
+  MAF_REMARKS_MAX: 500,
 } as const;
 
 function clampStr(val: string | undefined | null, maxLen: number, fallback = ''): string {
@@ -265,3 +274,80 @@ export function mergeCloudEmdWithFiles(
     ),
   }));
 }
+
+export function sanitizeMafLineItemForCloud(item: MafLineItem): MafLineItem {
+  const rawUrl = typeof item.mafDocumentUrl === 'string' ? item.mafDocumentUrl.trim() : '';
+  const safeUrl = rawUrl.startsWith('data:') ? '' : clampStr(rawUrl, CLOUD_LIMITS.MAF_URL_MAX);
+  return {
+    itemId: sanitizeDocId(item.itemId),
+    itemName: clampStr(item.itemName.trim() || 'Item', CLOUD_LIMITS.MAF_ITEM_NAME_MAX),
+    requiredQuantity: clampStr(item.requiredQuantity, CLOUD_LIMITS.MAF_QTY_MAX),
+    oemName: clampStr(item.oemName.trim() || 'OEM', CLOUD_LIMITS.MAF_OEM_NAME_MAX),
+    oemContact: clampStr(item.oemContact, CLOUD_LIMITS.MAF_CONTACT_MAX),
+    mafStatus: item.mafStatus,
+    validityDate: clampStr(item.validityDate, CLOUD_LIMITS.DATE_MAX),
+    mafDocumentUrl: safeUrl,
+    mafDocumentName: clampStr(item.mafDocumentName, 200),
+    mafAttachmentId: item.mafAttachmentId ? sanitizeDocId(item.mafAttachmentId) : '',
+    remarks: clampStr(item.remarks, CLOUD_LIMITS.MAF_REMARKS_MAX),
+    updatedAt: clampStr(item.updatedAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
+  };
+}
+
+export function buildCloudMafTrackerPayload<TTime>(
+  tracker: MafTrackerRecord,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  const safeId = sanitizeDocId(tracker.id);
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    id: safeId,
+    tenderRefId: clampStr(tracker.tenderRefId, CLOUD_LIMITS.ID_MAX),
+    tenderId: clampStr(tracker.tenderId.trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX),
+    tenderTitle: clampStr(tracker.tenderTitle, CLOUD_LIMITS.TITLE_MAX),
+    department: clampStr(tracker.department, CLOUD_LIMITS.DEPARTMENT_MAX),
+    tenderDueDate: clampStr(tracker.tenderDueDate, CLOUD_LIMITS.DATE_MAX),
+    itemsMAF: (tracker.itemsMAF ?? [])
+      .slice(0, CLOUD_LIMITS.MAF_ITEMS_MAX)
+      .map(sanitizeMafLineItemForCloud),
+    clientCreatedAt: clampStr(tracker.createdAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
+    clientUpdatedAt: clampStr(tracker.updatedAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
+
+export function mergeCloudMafTrackersWithFiles(
+  cloudTrackers: MafTrackerRecord[],
+  fileDataMap: ReadonlyMap<string, string>,
+  currentTrackers: MafTrackerRecord[],
+): MafTrackerRecord[] {
+  const currentById = new Map(currentTrackers.map((t) => [t.id, t]));
+  return cloudTrackers.map((tracker) => {
+    const prevItemsById = new Map(
+      (currentById.get(tracker.id)?.itemsMAF ?? []).map((it) => [it.itemId, it]),
+    );
+    return {
+      ...tracker,
+      itemsMAF: (tracker.itemsMAF ?? []).map((item) => {
+        if (item.mafDocumentUrl) return item;
+        if (item.mafAttachmentId) {
+          const fromMap =
+            fileDataMap.get(item.mafAttachmentId) ??
+            fileDataMap.get(sanitizeDocId(item.mafAttachmentId));
+          if (fromMap) {
+            return { ...item, mafDocumentUrl: fromMap };
+          }
+        }
+        const prevItem = prevItemsById.get(item.itemId);
+        if (prevItem?.mafDocumentUrl && prevItem.mafDocumentUrl.startsWith('data:')) {
+          return { ...item, mafDocumentUrl: prevItem.mafDocumentUrl };
+        }
+        return item;
+      }),
+    };
+  });
+}
+

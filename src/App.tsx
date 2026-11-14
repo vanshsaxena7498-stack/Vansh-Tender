@@ -1,11 +1,21 @@
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
-import { AlertTriangle, Cloud, CloudUpload, RefreshCw, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Cloud,
+  CloudUpload,
+  RefreshCw,
+  X,
+} from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { DashboardTab } from './components/DashboardTab';
 import { EmdBgFormModal } from './components/EmdBgFormModal';
 import { EmdBgTab } from './components/EmdBgTab';
 import { Header, type CloudUserSummary } from './components/Header';
 import { LockScreen } from './components/LockScreen';
+import { MafItemModal } from './components/MafItemModal';
+import { MafStatusTab } from './components/MafStatusTab';
+import { MafTrackerFormModal } from './components/MafTrackerFormModal';
 import { SettingsTab } from './components/SettingsTab';
 import { Sidebar } from './components/Sidebar';
 import { TenderDetailDrawer } from './components/TenderDetailDrawer';
@@ -14,6 +24,7 @@ import { TendersTab } from './components/TendersTab';
 import {
   DEFAULT_FIRM_PROFILE,
   SEED_EMD_RECORDS,
+  SEED_MAF_TRACKERS,
   SEED_TENDERS,
 } from './data/seedData';
 import { auth, firebaseConfig, googleProvider } from './lib/firebase';
@@ -21,6 +32,9 @@ import type {
   CrmBackupPayload,
   EmdBgRecord,
   FirmProfile,
+  MafItemStatus,
+  MafLineItem,
+  MafTrackerRecord,
   NotificationItem,
   TabKey,
   Tender,
@@ -31,21 +45,32 @@ import {
   backupAllToCloud,
   clearCloudSessionCache,
   deleteEmdRecordFromCloud,
+  deleteMafTrackerFromCloud,
   deleteTenderFromCloud,
   ensureUserRootDocument,
   fetchAllFromCloud,
   replaceCloudDataset,
   subscribeToUserCloudData,
   syncEmdRecordToCloud,
+  syncMafTrackerToCloud,
   syncPreferencesToCloud,
   syncProfileToCloud,
   syncTenderToCloud,
+  uploadMafDocumentFile,
 } from './utils/cloudSync';
 import {
   mergeCloudEmdWithFiles,
+  mergeCloudMafTrackersWithFiles,
   mergeCloudProfileWithLocal,
   mergeCloudTendersWithFiles,
 } from './utils/cloudSyncHelpers';
+import { findMatchingDailyTender } from './utils/mafCalculations';
+
+interface ToastNotice {
+  id: string;
+  type: 'ok' | 'err';
+  msg: string;
+}
 
 function formatCloudErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -102,6 +127,7 @@ function formatCloudErrorMessage(err: unknown): string {
 export default function App() {
   const [tenders, setTenders] = useState<Tender[]>(SEED_TENDERS);
   const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(SEED_EMD_RECORDS);
+  const [mafTrackers, setMafTrackers] = useState<MafTrackerRecord[]>(SEED_MAF_TRACKERS);
   const [firmProfile, setFirmProfile] = useState<FirmProfile>(DEFAULT_FIRM_PROFILE);
   const [adminPin, setAdminPin] = useState<string>('1234');
   const [darkMode, setDarkMode] = useState<boolean>(false);
@@ -118,6 +144,7 @@ export default function App() {
   const [cloudFeedback, setCloudFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(
     null,
   );
+  const [toasts, setToasts] = useState<ToastNotice[]>([]);
 
   // Modal & Drawer states
   const [tenderModalTarget, setTenderModalTarget] = useState<Tender | null | undefined>(
@@ -127,18 +154,47 @@ export default function App() {
   const [emdModalTarget, setEmdModalTarget] = useState<EmdBgRecord | null | undefined>(
     undefined,
   );
+  const [mafTrackerModalTarget, setMafTrackerModalTarget] = useState<
+    MafTrackerRecord | null | undefined
+  >(undefined);
+  const [mafItemModalTarget, setMafItemModalTarget] = useState<{
+    tracker: MafTrackerRecord;
+    item: MafLineItem | null;
+  } | null>(null);
 
   // In-memory refs for async Firestore listeners and attachment payloads
   const attachmentFilesRef = useRef<Map<string, string>>(new Map());
-  const stateRef = useRef({ tenders, emdRecords, firmProfile, adminPin, darkMode });
+  const stateRef = useRef({
+    tenders,
+    emdRecords,
+    mafTrackers,
+    firmProfile,
+    adminPin,
+    darkMode,
+  });
   useEffect(() => {
-    stateRef.current = { tenders, emdRecords, firmProfile, adminPin, darkMode };
-  }, [tenders, emdRecords, firmProfile, adminPin, darkMode]);
+    stateRef.current = {
+      tenders,
+      emdRecords,
+      mafTrackers,
+      firmProfile,
+      adminPin,
+      darkMode,
+    };
+  }, [tenders, emdRecords, mafTrackers, firmProfile, adminPin, darkMode]);
 
   // Apply Dark Mode class on root element (no localStorage)
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+
+  const showToast = (type: 'ok' | 'err', msg: string) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-3), { id, type, msg }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3800);
+  };
 
   const markSyncedNow = () => {
     setLastCloudSyncAt(new Date().toISOString());
@@ -175,18 +231,20 @@ export default function App() {
           !cloud.profile &&
           !cloud.preferences &&
           cloud.tenders.length === 0 &&
-          cloud.emdRecords.length === 0;
+          cloud.emdRecords.length === 0 &&
+          cloud.mafTrackers.length === 0;
 
         if (cloudIsEmpty) {
           const {
             firmProfile: curProfile,
             tenders: curTenders,
             emdRecords: curEmd,
+            mafTrackers: curMaf,
             adminPin: curPin,
             darkMode: curDark,
           } = stateRef.current;
           const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
-          await backupAllToCloud(firebaseUser, curProfile, prefs, curTenders, curEmd);
+          await backupAllToCloud(firebaseUser, curProfile, prefs, curTenders, curEmd, curMaf);
           if (!cancelled) {
             markSyncedNow();
             setCloudFeedback({
@@ -208,6 +266,11 @@ export default function App() {
           setEmdRecords((prev) =>
             mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
           );
+          if (cloud.mafTrackers.length > 0) {
+            setMafTrackers((prev) =>
+              mergeCloudMafTrackersWithFiles(cloud.mafTrackers, cloud.attachmentFiles, prev),
+            );
+          }
           markSyncedNow();
           setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
         }
@@ -236,10 +299,17 @@ export default function App() {
             );
             markSyncedNow();
           },
+          onMafTrackers: (remoteMaf) => {
+            setMafTrackers((prev) =>
+              mergeCloudMafTrackersWithFiles(remoteMaf, attachmentFilesRef.current, prev),
+            );
+            markSyncedNow();
+          },
           onAttachmentFiles: (remoteFiles) => {
             attachmentFilesRef.current = remoteFiles;
             setTenders((prev) => mergeCloudTendersWithFiles(prev, remoteFiles, prev));
             setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, remoteFiles, prev));
+            setMafTrackers((prev) => mergeCloudMafTrackersWithFiles(prev, remoteFiles, prev));
             markSyncedNow();
           },
           onError: (err) => {
@@ -316,13 +386,14 @@ export default function App() {
       firmProfile: curProfile,
       tenders: curTenders,
       emdRecords: curEmd,
+      mafTrackers: curMaf,
       adminPin: curPin,
       darkMode: curDark,
     } = stateRef.current;
     const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
     void runCloudTask(
-      (user) => replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd),
-      `Synced ${curTenders.length} tenders, ${curEmd.length} EMD/BG records & firm settings to Firebase Firestore.`,
+      (user) => replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf),
+      `Synced ${curTenders.length} tenders, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
     );
   };
 
@@ -343,6 +414,9 @@ export default function App() {
       );
       setEmdRecords((prev) =>
         mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
+      );
+      setMafTrackers((prev) =>
+        mergeCloudMafTrackersWithFiles(cloud.mafTrackers, cloud.attachmentFiles, prev),
       );
     }, 'Reloaded latest data from Firebase Firestore.');
   };
@@ -400,7 +474,57 @@ export default function App() {
     }
   };
 
-  const handleSaveTender = (saved: Tender, syncToEmd: boolean) => {
+  const cacheMafPayloads = (items?: MafLineItem[]) => {
+    for (const item of items ?? []) {
+      if (item.mafAttachmentId && item.mafDocumentUrl?.startsWith('data:')) {
+        attachmentFilesRef.current.set(item.mafAttachmentId, item.mafDocumentUrl);
+      }
+    }
+  };
+
+  const buildSyncedMafTrackersForTender = (
+    saved: Tender,
+    currentTrackers: MafTrackerRecord[],
+  ): { nextTrackers: MafTrackerRecord[]; changedTrackers: MafTrackerRecord[] } => {
+    const changedTrackers: MafTrackerRecord[] = [];
+    const normalizedSavedCode = saved.tenderId.trim().toLowerCase();
+    const nowIso = new Date().toISOString();
+
+    const nextTrackers = currentTrackers.map((tracker) => {
+      const isMatch =
+        (tracker.tenderRefId && tracker.tenderRefId === saved.id) ||
+        tracker.tenderId.trim().toLowerCase() === normalizedSavedCode;
+      if (!isMatch) return tracker;
+
+      const needsUpdate =
+        tracker.tenderRefId !== saved.id ||
+        tracker.tenderId !== saved.tenderId ||
+        tracker.tenderTitle !== saved.title ||
+        tracker.department !== saved.department ||
+        tracker.tenderDueDate !== saved.submissionDueDate;
+      if (!needsUpdate) return tracker;
+
+      const updatedTracker: MafTrackerRecord = {
+        ...tracker,
+        tenderRefId: saved.id,
+        tenderId: saved.tenderId,
+        tenderTitle: saved.title,
+        department: saved.department,
+        tenderDueDate: saved.submissionDueDate,
+        updatedAt: nowIso,
+      };
+      changedTrackers.push(updatedTracker);
+      return updatedTracker;
+    });
+
+    return { nextTrackers, changedTrackers };
+  };
+
+  const handleSaveTender = (
+    saved: Tender,
+    syncToEmd: boolean,
+    initialMafItems?: MafLineItem[],
+  ) => {
     cacheAttachmentPayloads(saved.attachments);
     setTenders((prev) => {
       const exists = prev.some((t) => t.id === saved.id);
@@ -421,6 +545,37 @@ export default function App() {
       }
     }
 
+    const { changedTrackers } = buildSyncedMafTrackersForTender(
+      saved,
+      stateRef.current.mafTrackers,
+    );
+
+    let linkedMafToSync: MafTrackerRecord | null = null;
+    if (initialMafItems && initialMafItems.length > 0) {
+      const nowIso = new Date().toISOString();
+      linkedMafToSync = {
+        id: `maf-${saved.id}`,
+        tenderRefId: saved.id,
+        tenderId: saved.tenderId,
+        tenderTitle: saved.title,
+        department: saved.department,
+        tenderDueDate: saved.submissionDueDate,
+        itemsMAF: initialMafItems,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      setMafTrackers((prev) => {
+        const synced = buildSyncedMafTrackersForTender(saved, prev).nextTrackers;
+        return [linkedMafToSync!, ...synced];
+      });
+      showToast(
+        'ok',
+        `Tender saved & initialized ${initialMafItems.length} MAF tracker item(s).`,
+      );
+    } else if (changedTrackers.length > 0) {
+      setMafTrackers((prev) => buildSyncedMafTrackersForTender(saved, prev).nextTrackers);
+    }
+
     setTenderModalTarget(undefined);
 
     void runCloudTask(async (user) => {
@@ -428,13 +583,31 @@ export default function App() {
       if (linkedRecordToSync) {
         await syncEmdRecordToCloud(user, linkedRecordToSync);
       }
+      if (linkedMafToSync) {
+        await syncMafTrackerToCloud(user, linkedMafToSync);
+      }
+      for (const updatedMaf of changedTrackers) {
+        await syncMafTrackerToCloud(user, updatedMaf);
+      }
     });
   };
 
   const handleUpdateTenderInline = (updated: Tender) => {
     cacheAttachmentPayloads(updated.attachments);
     setTenders((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
-    void runCloudTask((user) => syncTenderToCloud(user, updated));
+    const { changedTrackers } = buildSyncedMafTrackersForTender(
+      updated,
+      stateRef.current.mafTrackers,
+    );
+    if (changedTrackers.length > 0) {
+      setMafTrackers((prev) => buildSyncedMafTrackersForTender(updated, prev).nextTrackers);
+    }
+    void runCloudTask(async (user) => {
+      await syncTenderToCloud(user, updated);
+      for (const updatedMaf of changedTrackers) {
+        await syncMafTrackerToCloud(user, updatedMaf);
+      }
+    });
   };
 
   const handleDeleteTender = (id: string) => {
@@ -474,6 +647,201 @@ export default function App() {
     void runCloudTask((user) => deleteEmdRecordFromCloud(user, id));
   };
 
+  // MAF Tracker Optimistic Handlers
+  const syncMafOptimistic = async (
+    prevSnapshot: MafTrackerRecord[],
+    nextList: MafTrackerRecord[],
+    cloudOp: (user: User) => Promise<void>,
+    toastMsg: string,
+  ) => {
+    setMafTrackers(nextList);
+    showToast('ok', toastMsg);
+    if (!firebaseUser) return;
+    setCloudSyncing(true);
+    try {
+      await cloudOp(firebaseUser);
+      markSyncedNow();
+      setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+    } catch (err) {
+      setMafTrackers(prevSnapshot);
+      const formatted = formatCloudErrorMessage(err);
+      showToast('err', formatted);
+      setCloudFeedback({ type: 'err', msg: formatted });
+    } finally {
+      setCloudSyncing(false);
+    }
+  };
+
+  const handleSaveMafTracker = (saved: MafTrackerRecord) => {
+    const matchedTender = findMatchingDailyTender(
+      stateRef.current.tenders,
+      saved.tenderId,
+      saved.tenderRefId,
+    );
+    if (!matchedTender) {
+      showToast(
+        'err',
+        `Tender "${saved.tenderId}" is not in Daily Tender Data. Please add it there first.`,
+      );
+      return;
+    }
+
+    const canonicalTracker: MafTrackerRecord = {
+      ...saved,
+      tenderRefId: matchedTender.id,
+      tenderId: matchedTender.tenderId,
+      tenderTitle: matchedTender.title,
+      department: matchedTender.department,
+      tenderDueDate: matchedTender.submissionDueDate,
+    };
+
+    cacheMafPayloads(canonicalTracker.itemsMAF);
+    const prevSnapshot = stateRef.current.mafTrackers;
+    const exists = prevSnapshot.some((t) => t.id === canonicalTracker.id);
+    const nextList = exists
+      ? prevSnapshot.map((t) => (t.id === canonicalTracker.id ? canonicalTracker : t))
+      : [canonicalTracker, ...prevSnapshot];
+    setMafTrackerModalTarget(undefined);
+    void syncMafOptimistic(
+      prevSnapshot,
+      nextList,
+      (user) => syncMafTrackerToCloud(user, canonicalTracker),
+      exists
+        ? `Updated MAF tracker for ${canonicalTracker.tenderId}.`
+        : `Created MAF tracker for ${canonicalTracker.tenderId} (${canonicalTracker.itemsMAF.length} item(s)).`,
+    );
+  };
+
+  const handleDeleteMafTracker = (trackerId: string) => {
+    const prevSnapshot = stateRef.current.mafTrackers;
+    const target = prevSnapshot.find((t) => t.id === trackerId);
+    const nextList = prevSnapshot.filter((t) => t.id !== trackerId);
+    void syncMafOptimistic(
+      prevSnapshot,
+      nextList,
+      (user) => deleteMafTrackerFromCloud(user, trackerId),
+      `Removed MAF tracker ${target?.tenderId ?? ''}.`,
+    );
+  };
+
+  const handleSaveMafItem = (trackerId: string, savedItem: MafLineItem) => {
+    cacheMafPayloads([savedItem]);
+    const prevSnapshot = stateRef.current.mafTrackers;
+    const target = prevSnapshot.find((t) => t.id === trackerId);
+    if (!target) return;
+
+    const nowIso = new Date().toISOString();
+    const itemExists = target.itemsMAF.some((i) => i.itemId === savedItem.itemId);
+    const updatedTracker: MafTrackerRecord = {
+      ...target,
+      itemsMAF: itemExists
+        ? target.itemsMAF.map((i) => (i.itemId === savedItem.itemId ? savedItem : i))
+        : [...target.itemsMAF, savedItem],
+      updatedAt: nowIso,
+    };
+    const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+    setMafItemModalTarget(null);
+
+    void syncMafOptimistic(
+      prevSnapshot,
+      nextList,
+      (user) => syncMafTrackerToCloud(user, updatedTracker),
+      itemExists
+        ? `Updated "${savedItem.itemName}" (${savedItem.oemName}).`
+        : `Added "${savedItem.itemName}" (${savedItem.oemName}) to ${target.tenderId}.`,
+    );
+  };
+
+  const handleInlineMafStatusChange = (
+    trackerId: string,
+    itemId: string,
+    nextStatus: MafItemStatus,
+  ) => {
+    const prevSnapshot = stateRef.current.mafTrackers;
+    const target = prevSnapshot.find((t) => t.id === trackerId);
+    if (!target) return;
+    const nowIso = new Date().toISOString();
+    const item = target.itemsMAF.find((i) => i.itemId === itemId);
+    const updatedTracker: MafTrackerRecord = {
+      ...target,
+      itemsMAF: target.itemsMAF.map((i) =>
+        i.itemId === itemId ? { ...i, mafStatus: nextStatus, updatedAt: nowIso } : i,
+      ),
+      updatedAt: nowIso,
+    };
+    const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+
+    void syncMafOptimistic(
+      prevSnapshot,
+      nextList,
+      (user) => syncMafTrackerToCloud(user, updatedTracker),
+      `${item?.oemName ?? 'OEM'} MAF status set to "${nextStatus}".`,
+    );
+  };
+
+  const handleUploadMafFile = async (trackerId: string, itemId: string, file: File) => {
+    const result = await uploadMafDocumentFile(firebaseUser, trackerId, itemId, file);
+    if (result.mafAttachmentId && result.mafDocumentUrl.startsWith('data:')) {
+      attachmentFilesRef.current.set(result.mafAttachmentId, result.mafDocumentUrl);
+    }
+    return result;
+  };
+
+  const handleInlineMafFileUpload = async (trackerId: string, itemId: string, file: File) => {
+    try {
+      const uploaded = await handleUploadMafFile(trackerId, itemId, file);
+      const prevSnapshot = stateRef.current.mafTrackers;
+      const target = prevSnapshot.find((t) => t.id === trackerId);
+      if (!target) return;
+      const nowIso = new Date().toISOString();
+      const updatedTracker: MafTrackerRecord = {
+        ...target,
+        itemsMAF: target.itemsMAF.map((i) =>
+          i.itemId === itemId
+            ? {
+                ...i,
+                mafDocumentUrl: uploaded.mafDocumentUrl,
+                mafDocumentName: uploaded.mafDocumentName,
+                mafAttachmentId: uploaded.mafAttachmentId,
+                updatedAt: nowIso,
+              }
+            : i,
+        ),
+        updatedAt: nowIso,
+      };
+      const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+      await syncMafOptimistic(
+        prevSnapshot,
+        nextList,
+        (user) => syncMafTrackerToCloud(user, updatedTracker),
+        `Uploaded "${uploaded.mafDocumentName}" successfully.`,
+      );
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'Failed to upload MAF document.');
+    }
+  };
+
+  const handleDeleteMafItem = (trackerId: string, itemId: string) => {
+    const prevSnapshot = stateRef.current.mafTrackers;
+    const target = prevSnapshot.find((t) => t.id === trackerId);
+    if (!target) return;
+    const removed = target.itemsMAF.find((i) => i.itemId === itemId);
+    const nowIso = new Date().toISOString();
+    const updatedTracker: MafTrackerRecord = {
+      ...target,
+      itemsMAF: target.itemsMAF.filter((i) => i.itemId !== itemId),
+      updatedAt: nowIso,
+    };
+    const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+
+    void syncMafOptimistic(
+      prevSnapshot,
+      nextList,
+      (user) => syncMafTrackerToCloud(user, updatedTracker),
+      `Removed "${removed?.itemName ?? 'item'}" from ${target.tenderId}.`,
+    );
+  };
+
   const handleSaveProfile = (nextProfile: FirmProfile) => {
     setFirmProfile(nextProfile);
     void runCloudTask((user) => syncProfileToCloud(user, nextProfile));
@@ -506,15 +874,27 @@ export default function App() {
   const handleImportBackup = (payload: CrmBackupPayload) => {
     for (const t of payload.tenders) cacheAttachmentPayloads(t.attachments);
     for (const r of payload.emdRecords) cacheAttachmentPayloads(r.attachments);
+    for (const m of payload.mafTrackers ?? []) cacheMafPayloads(m.itemsMAF);
+
+    const nextMaf = payload.mafTrackers ?? [];
     setFirmProfile(payload.profile);
     setTenders(payload.tenders);
     setEmdRecords(payload.emdRecords);
+    setMafTrackers(nextMaf);
+
     const prefs: UserPreferences = {
       adminPin: stateRef.current.adminPin,
       darkMode: stateRef.current.darkMode,
     };
     void runCloudTask((user) =>
-      replaceCloudDataset(user, payload.profile, prefs, payload.tenders, payload.emdRecords),
+      replaceCloudDataset(
+        user,
+        payload.profile,
+        prefs,
+        payload.tenders,
+        payload.emdRecords,
+        nextMaf,
+      ),
     );
   };
 
@@ -522,13 +902,21 @@ export default function App() {
     setFirmProfile(DEFAULT_FIRM_PROFILE);
     setTenders(SEED_TENDERS);
     setEmdRecords(SEED_EMD_RECORDS);
+    setMafTrackers(SEED_MAF_TRACKERS);
     setSelectedTenderId(null);
     const prefs: UserPreferences = {
       adminPin: stateRef.current.adminPin,
       darkMode: stateRef.current.darkMode,
     };
     void runCloudTask((user) =>
-      replaceCloudDataset(user, DEFAULT_FIRM_PROFILE, prefs, SEED_TENDERS, SEED_EMD_RECORDS),
+      replaceCloudDataset(
+        user,
+        DEFAULT_FIRM_PROFILE,
+        prefs,
+        SEED_TENDERS,
+        SEED_EMD_RECORDS,
+        SEED_MAF_TRACKERS,
+      ),
     );
   };
 
@@ -536,13 +924,14 @@ export default function App() {
     attachmentFilesRef.current.clear();
     setTenders([]);
     setEmdRecords([]);
+    setMafTrackers([]);
     setSelectedTenderId(null);
     const prefs: UserPreferences = {
       adminPin: stateRef.current.adminPin,
       darkMode: stateRef.current.darkMode,
     };
     void runCloudTask((user) =>
-      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], []),
+      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], []),
     );
   };
 
@@ -553,6 +942,7 @@ export default function App() {
         onSelectTab={setActiveTab}
         firmProfile={firmProfile}
         tenderCount={tenders.length}
+        mafCount={mafTrackers.length}
         emdCount={emdRecords.length}
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
@@ -581,7 +971,7 @@ export default function App() {
               <div className="flex items-center gap-2.5 min-w-0">
                 <Cloud className="h-4 w-4 text-[#1E3A8A] dark:text-blue-400 shrink-0" aria-hidden="true" />
                 <p className="text-xs text-slate-800 dark:text-slate-200">
-                  <span className="font-semibold">Firestore Cloud Mode:</span> Browser storage is disabled. Sign in with Google to save and load all tenders, EMD/BG records, and attachments in Firebase Firestore.
+                  <span className="font-semibold">Firestore Cloud Mode:</span> Browser storage is disabled. Sign in with Google to save and load all tenders, MAF statuses, EMD/BG records, and attachments in Firebase Firestore.
                 </p>
               </div>
               <button
@@ -659,6 +1049,22 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'maf' && (
+            <MafStatusTab
+              trackers={mafTrackers}
+              tenders={tenders}
+              onAddTracker={() => setMafTrackerModalTarget(null)}
+              onEditTracker={(tracker) => setMafTrackerModalTarget(tracker)}
+              onDeleteTracker={handleDeleteMafTracker}
+              onOpenNewItemModal={(tracker) => setMafItemModalTarget({ tracker, item: null })}
+              onOpenEditItemModal={(tracker, item) => setMafItemModalTarget({ tracker, item })}
+              onInlineStatusChange={handleInlineMafStatusChange}
+              onInlineFileUpload={handleInlineMafFileUpload}
+              onDeleteItem={handleDeleteMafItem}
+              onValidationError={(msg) => showToast('err', msg)}
+            />
+          )}
+
           {activeTab === 'emdbg' && (
             <EmdBgTab
               records={emdRecords}
@@ -675,6 +1081,7 @@ export default function App() {
               currentPin={adminPin}
               tenders={tenders}
               emdRecords={emdRecords}
+              mafTrackers={mafTrackers}
               onSaveProfile={handleSaveProfile}
               onUpdatePin={handleUpdatePin}
               onImportBackup={handleImportBackup}
@@ -729,12 +1136,72 @@ export default function App() {
         />
       )}
 
+      {mafTrackerModalTarget !== undefined && (
+        <MafTrackerFormModal
+          initialTracker={mafTrackerModalTarget}
+          tenders={tenders}
+          existingTrackers={mafTrackers}
+          onClose={() => setMafTrackerModalTarget(undefined)}
+          onSave={handleSaveMafTracker}
+          onUploadFile={handleUploadMafFile}
+        />
+      )}
+
+      {mafItemModalTarget && (
+        <MafItemModal
+          trackerId={mafItemModalTarget.tracker.id}
+          tenderId={mafItemModalTarget.tracker.tenderId}
+          tenderTitle={mafItemModalTarget.tracker.tenderTitle || 'Linked Tender'}
+          initialItem={mafItemModalTarget.item}
+          onClose={() => setMafItemModalTarget(null)}
+          onSave={(savedItem) => handleSaveMafItem(mafItemModalTarget.tracker.id, savedItem)}
+          onUploadFile={handleUploadMafFile}
+        />
+      )}
+
       {isLocked && (
         <LockScreen
           expectedPin={adminPin}
           firmProfile={firmProfile}
           onUnlock={() => setIsLocked(false)}
         />
+      )}
+
+      {/* Toast Notification Stack */}
+      {toasts.length > 0 && (
+        <div
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-[60] flex flex-col gap-2 max-w-sm w-full pointer-events-none px-4 sm:px-0"
+        >
+          {toasts.map((toast) => (
+            <div
+              key={toast.id}
+              role={toast.type === 'err' ? 'alert' : 'status'}
+              className={`pointer-events-auto flex items-center justify-between gap-2.5 rounded-xl border px-3.5 py-2.5 shadow-lg text-xs font-medium ${
+                toast.type === 'err'
+                  ? 'border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950 text-red-800 dark:text-red-200'
+                  : 'border-emerald-300 dark:border-emerald-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100'
+              }`}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                {toast.type === 'err' ? (
+                  <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                )}
+                <span className="truncate">{toast.msg}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setToasts((prev) => prev.filter((t) => t.id !== toast.id))}
+                aria-label="Close toast"
+                className="p-0.5 rounded hover:bg-black/5 dark:hover:bg-white/10 shrink-0"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
