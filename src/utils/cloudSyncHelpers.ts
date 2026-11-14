@@ -1,4 +1,10 @@
-import type { AttachmentItem, EmdBgRecord, FirmProfile, Tender } from '../types/crm';
+import type {
+  AttachmentItem,
+  EmdBgRecord,
+  FirmProfile,
+  Tender,
+  UserPreferences,
+} from '../types/crm';
 
 export const CLOUD_LIMITS = {
   ID_MAX: 128,
@@ -15,8 +21,8 @@ export const CLOUD_LIMITS = {
   GSTIN_MAX: 32,
   UDYAM_MAX: 40,
   ADMIN_NAME_MAX: 100,
-  PHOTO_URL_MAX: 140000,
-  ATTACHMENT_DATA_URL_MAX: 90000,
+  PHOTO_URL_MAX: 145000,
+  ATTACHMENT_DATA_URL_MAX: 950000,
   CHECKLIST_MAX: 30,
   REMARKS_LIST_MAX: 100,
   ATTACHMENTS_LIST_MAX: 10,
@@ -45,11 +51,11 @@ export function sanitizePhotoForCloud(photoUrl: string | undefined): string {
   return photoUrl.length <= CLOUD_LIMITS.PHOTO_URL_MAX ? photoUrl : '';
 }
 
-export function sanitizeAttachmentForCloud(att: AttachmentItem): AttachmentItem {
-  const keepDataUrl =
-    typeof att.dataUrl === 'string' && att.dataUrl.length <= CLOUD_LIMITS.ATTACHMENT_DATA_URL_MAX
-      ? att.dataUrl
-      : '';
+/**
+ * Strips heavy dataUrl from Tender/EmdBgRecord attachment metadata so parent
+ * documents stay compact; binary payloads live in /users/{uid}/attachmentFiles/{id}.
+ */
+export function sanitizeAttachmentMetadataForCloud(att: AttachmentItem): AttachmentItem {
   return {
     id: sanitizeDocId(att.id),
     slotLabel: clampStr(att.slotLabel, 80, 'Attachment'),
@@ -57,7 +63,45 @@ export function sanitizeAttachmentForCloud(att: AttachmentItem): AttachmentItem 
     fileType: clampStr(att.fileType, 120, 'application/octet-stream'),
     fileSize: clampNonNegativeNumber(att.fileSize),
     uploadedAt: clampStr(att.uploadedAt, 40),
-    dataUrl: keepDataUrl,
+    dataUrl: '',
+  };
+}
+
+export function buildCloudAttachmentFilePayload<TTime>(
+  att: AttachmentItem,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> | null {
+  if (!att.dataUrl || att.dataUrl.length > CLOUD_LIMITS.ATTACHMENT_DATA_URL_MAX) {
+    return null;
+  }
+  const safeId = sanitizeDocId(att.id);
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    id: safeId,
+    fileName: clampStr(att.fileName.trim() || 'attachment', 200),
+    fileType: clampStr(att.fileType.trim() || 'application/octet-stream', 120),
+    fileSize: clampNonNegativeNumber(att.fileSize),
+    dataUrl: att.dataUrl,
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
+
+export function buildCloudPreferencesPayload<TTime>(
+  prefs: UserPreferences,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  const safePin = /^\d{4}$/.test(prefs.adminPin) ? prefs.adminPin : '1234';
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    adminPin: safePin,
+    darkMode: Boolean(prefs.darkMode),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
   };
 }
 
@@ -120,7 +164,7 @@ export function buildCloudTenderPayload<TTime>(
     })),
     attachments: (tender.attachments ?? [])
       .slice(0, CLOUD_LIMITS.ATTACHMENTS_LIST_MAX)
-      .map(sanitizeAttachmentForCloud),
+      .map(sanitizeAttachmentMetadataForCloud),
     clientCreatedAt: clampStr(tender.createdAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
     clientUpdatedAt: clampStr(tender.updatedAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
     createdAt: existingCreatedAt ?? serverTimeToken,
@@ -154,65 +198,70 @@ export function buildCloudEmdPayload<TTime>(
     remarks: clampStr(record.remarks, CLOUD_LIMITS.REMARKS_TEXT_MAX),
     attachments: (record.attachments ?? [])
       .slice(0, CLOUD_LIMITS.ATTACHMENTS_LIST_MAX)
-      .map(sanitizeAttachmentForCloud),
+      .map(sanitizeAttachmentMetadataForCloud),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
   };
 }
 
-export function mergeCloudAttachmentsWithLocal(
-  cloudAttachments: AttachmentItem[] | undefined,
-  localAttachments: AttachmentItem[] | undefined,
+export function mergeAttachmentMapWithItems(
+  attachments: AttachmentItem[] | undefined,
+  fileDataMap: ReadonlyMap<string, string>,
+  fallbackList?: AttachmentItem[],
 ): AttachmentItem[] {
-  const cloudList = cloudAttachments ?? [];
-  const localById = new Map((localAttachments ?? []).map((item) => [item.id, item]));
-  return cloudList.map((att) => {
+  const list = attachments ?? [];
+  const fallbackById = new Map((fallbackList ?? []).map((item) => [item.id, item]));
+  return list.map((att) => {
     if (att.dataUrl) return att;
-    const localMatch = localById.get(att.id);
-    if (localMatch?.dataUrl) {
-      return { ...att, dataUrl: localMatch.dataUrl };
-    }
+    const fromCloudFiles = fileDataMap.get(att.id) ?? fileDataMap.get(sanitizeDocId(att.id));
+    if (fromCloudFiles) return { ...att, dataUrl: fromCloudFiles };
+    const fromFallback = fallbackById.get(att.id);
+    if (fromFallback?.dataUrl) return { ...att, dataUrl: fromFallback.dataUrl };
     return att;
   });
 }
 
 export function mergeCloudProfileWithLocal(
   cloudProfile: FirmProfile,
-  localProfile: FirmProfile,
+  currentProfile: FirmProfile,
 ): FirmProfile {
   return {
-    firmName: cloudProfile.firmName || localProfile.firmName,
-    gstin: cloudProfile.gstin ?? localProfile.gstin,
-    udyamNumber: cloudProfile.udyamNumber ?? localProfile.udyamNumber,
-    adminName: cloudProfile.adminName || localProfile.adminName,
-    adminPhotoUrl: cloudProfile.adminPhotoUrl || localProfile.adminPhotoUrl || '',
+    firmName: cloudProfile.firmName || currentProfile.firmName,
+    gstin: cloudProfile.gstin ?? currentProfile.gstin,
+    udyamNumber: cloudProfile.udyamNumber ?? currentProfile.udyamNumber,
+    adminName: cloudProfile.adminName || currentProfile.adminName,
+    adminPhotoUrl: cloudProfile.adminPhotoUrl || currentProfile.adminPhotoUrl || '',
   };
 }
 
-export function mergeCloudTendersWithLocal(
+export function mergeCloudTendersWithFiles(
   cloudTenders: Tender[],
-  localTenders: Tender[],
+  fileDataMap: ReadonlyMap<string, string>,
+  currentTenders: Tender[],
 ): Tender[] {
-  const localById = new Map(localTenders.map((t) => [t.id, t]));
-  return cloudTenders.map((t) => {
-    const local = localById.get(t.id);
-    return {
-      ...t,
-      attachments: mergeCloudAttachmentsWithLocal(t.attachments, local?.attachments),
-    };
-  });
+  const currentById = new Map(currentTenders.map((t) => [t.id, t]));
+  return cloudTenders.map((t) => ({
+    ...t,
+    attachments: mergeAttachmentMapWithItems(
+      t.attachments,
+      fileDataMap,
+      currentById.get(t.id)?.attachments,
+    ),
+  }));
 }
 
-export function mergeCloudEmdWithLocal(
+export function mergeCloudEmdWithFiles(
   cloudEmd: EmdBgRecord[],
-  localEmd: EmdBgRecord[],
+  fileDataMap: ReadonlyMap<string, string>,
+  currentEmd: EmdBgRecord[],
 ): EmdBgRecord[] {
-  const localById = new Map(localEmd.map((r) => [r.id, r]));
-  return cloudEmd.map((r) => {
-    const local = localById.get(r.id);
-    return {
-      ...r,
-      attachments: mergeCloudAttachmentsWithLocal(r.attachments, local?.attachments),
-    };
-  });
+  const currentById = new Map(currentEmd.map((r) => [r.id, r]));
+  return cloudEmd.map((r) => ({
+    ...r,
+    attachments: mergeAttachmentMapWithItems(
+      r.attachments,
+      fileDataMap,
+      currentById.get(r.id)?.attachments,
+    ),
+  }));
 }

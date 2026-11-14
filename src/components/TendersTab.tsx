@@ -17,7 +17,14 @@ interface TendersTabProps {
   onOpenTender: (tender: Tender) => void;
 }
 
-type QuickFilterKey = 'ALL' | 'DUE_WEEK' | 'SUBMITTED' | 'UNDER_EVAL' | 'WON' | 'LOST';
+type QuickFilterKey =
+  | 'ALL'
+  | 'DUE_WEEK'
+  | 'SUBMITTED'
+  | 'UNDER_EVAL'
+  | 'WON'
+  | 'LOST'
+  | 'NOT_FILLED';
 
 const QUICK_FILTERS: { key: QuickFilterKey; label: string }[] = [
   { key: 'ALL', label: 'All' },
@@ -26,6 +33,7 @@ const QUICK_FILTERS: { key: QuickFilterKey; label: string }[] = [
   { key: 'UNDER_EVAL', label: 'Under Eval' },
   { key: 'WON', label: 'L1 / Won' },
   { key: 'LOST', label: 'Lost' },
+  { key: 'NOT_FILLED', label: 'Not Filled' },
 ];
 
 function getStageBadgeClass(stage: TenderStage): string {
@@ -39,6 +47,8 @@ function getStageBadgeClass(stage: TenderStage): string {
       return 'bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400';
     case 'Submitted':
       return 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-400';
+    case 'Tender Not Filled':
+      return 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-200';
     case 'Cancelled / Retendered':
       return 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400';
     default:
@@ -87,6 +97,8 @@ export function TendersTab({
             return t.stage === 'L1 / Won';
           case 'LOST':
             return t.stage === 'Lost (L2/L3)';
+          case 'NOT_FILLED':
+            return t.stage === 'Tender Not Filled';
           default:
             return true;
         }

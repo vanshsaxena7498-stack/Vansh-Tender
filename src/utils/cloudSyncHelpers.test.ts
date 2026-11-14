@@ -2,13 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EmdBgRecord, FirmProfile, Tender } from '../types/crm';
 import {
+  buildCloudAttachmentFilePayload,
   buildCloudEmdPayload,
+  buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudTenderPayload,
   CLOUD_LIMITS,
-  mergeCloudEmdWithLocal,
+  mergeCloudEmdWithFiles,
   mergeCloudProfileWithLocal,
-  mergeCloudTendersWithLocal,
+  mergeCloudTendersWithFiles,
   sanitizeDocId,
 } from './cloudSyncHelpers';
 
@@ -20,7 +22,7 @@ test('sanitizeDocId normalizes unsafe characters and enforces length bounds', ()
   assert.match(sanitizeDocId(''), /^doc_\d+$/);
 });
 
-test('buildCloudProfilePayload strips oversized adminPhotoUrl while enforcing blueprint keys', () => {
+test('buildCloudProfilePayload enforces blueprint keys and strips oversized photo', () => {
   const profile: FirmProfile = {
     firmName: 'Saxena Infra & Tech Pvt Ltd',
     gstin: '07AABCU9603R1ZM',
@@ -46,8 +48,18 @@ test('buildCloudProfilePayload strips oversized adminPhotoUrl while enforcing bl
   ]);
 });
 
-test('buildCloudTenderPayload strips oversized attachment dataUrl and preserves local dataUrl on merge', () => {
-  const largeDataUrl = 'data:application/pdf;base64,' + 'B'.repeat(180000);
+test('buildCloudPreferencesPayload validates 4-digit PIN and darkMode boolean', () => {
+  const valid = buildCloudPreferencesPayload({ adminPin: '4321', darkMode: true }, 'uid-1', TOKEN);
+  assert.equal(valid.adminPin, '4321');
+  assert.equal(valid.darkMode, true);
+
+  const fallback = buildCloudPreferencesPayload({ adminPin: 'abc', darkMode: false }, 'uid-1', TOKEN);
+  assert.equal(fallback.adminPin, '1234');
+  assert.equal(fallback.darkMode, false);
+});
+
+test('buildCloudTenderPayload strips inline dataUrl while buildCloudAttachmentFilePayload stores payload separately', () => {
+  const validDataUrl = 'data:application/pdf;base64,' + 'B'.repeat(120000);
   const tender: Tender = {
     id: 'tender-1',
     tenderId: 'GEM/2026/B/999',
@@ -62,19 +74,19 @@ test('buildCloudTenderPayload strips oversized attachment dataUrl and preserves 
     quotedValue: 4850000,
     emdStatus: 'EMD Paid',
     emdAmount: 100000,
-    stage: 'Submitted',
+    stage: 'Tender Not Filled',
     resultInfo: '',
     checklist: [{ id: 'c1', label: 'GST', checked: true }],
-    remarks: [{ id: 'r1', timestamp: '2026-04-02T10:00:00Z', text: 'Uploaded' }],
+    remarks: [{ id: 'r1', timestamp: '2026-04-02T10:00:00Z', text: 'Reviewed' }],
     attachments: [
       {
         id: 'att-1',
         slotLabel: 'NIT / Bid Document',
         fileName: 'nit.pdf',
         fileType: 'application/pdf',
-        fileSize: 180000,
+        fileSize: 90000,
         uploadedAt: '2026-04-02T10:00:00Z',
-        dataUrl: largeDataUrl,
+        dataUrl: validDataUrl,
       },
     ],
     createdAt: '2026-04-01T09:00:00Z',
@@ -85,17 +97,19 @@ test('buildCloudTenderPayload strips oversized attachment dataUrl and preserves 
   const cloudAtts = payload.attachments as Tender['attachments'];
   assert.equal(cloudAtts?.[0]?.dataUrl, '');
   assert.equal(cloudAtts?.[0]?.fileName, 'nit.pdf');
+  assert.equal(payload.stage, 'Tender Not Filled');
 
-  const cloudDocAsTender: Tender = {
-    ...tender,
-    attachments: cloudAtts,
-  };
-  const merged = mergeCloudTendersWithLocal([cloudDocAsTender], [tender]);
-  assert.equal(merged[0]?.attachments?.[0]?.dataUrl, largeDataUrl);
+  const attFilePayload = buildCloudAttachmentFilePayload(tender.attachments![0], 'uid-1', TOKEN);
+  assert.ok(attFilePayload !== null);
+  assert.equal(attFilePayload?.dataUrl, validDataUrl);
+
+  const fileMap = new Map<string, string>([['att-1', validDataUrl]]);
+  const merged = mergeCloudTendersWithFiles([{ ...tender, attachments: cloudAtts }], fileMap, []);
+  assert.equal(merged[0]?.attachments?.[0]?.dataUrl, validDataUrl);
 });
 
-test('buildCloudEmdPayload and mergeCloudEmdWithLocal enforce schema and preserve local files', () => {
-  const largeDataUrl = 'data:image/png;base64,' + 'C'.repeat(160000);
+test('buildCloudEmdPayload and mergeCloudEmdWithFiles rehydrate attachment files from Firestore map', () => {
+  const dataUrl = 'data:image/jpeg;base64,' + 'C'.repeat(60000);
   const emd: EmdBgRecord = {
     id: 'emd-1',
     tenderRefId: 'tender-1',
@@ -114,11 +128,11 @@ test('buildCloudEmdPayload and mergeCloudEmdWithLocal enforce schema and preserv
       {
         id: 'att-e1',
         slotLabel: 'BG Copy',
-        fileName: 'bg.png',
-        fileType: 'image/png',
-        fileSize: 160000,
+        fileName: 'bg.jpg',
+        fileType: 'image/jpeg',
+        fileSize: 45000,
         uploadedAt: '2026-04-01T12:00:00Z',
-        dataUrl: largeDataUrl,
+        dataUrl,
       },
     ],
   };
@@ -127,8 +141,9 @@ test('buildCloudEmdPayload and mergeCloudEmdWithLocal enforce schema and preserv
   const cloudAtts = payload.attachments as EmdBgRecord['attachments'];
   assert.equal(cloudAtts?.[0]?.dataUrl, '');
 
-  const merged = mergeCloudEmdWithLocal([{ ...emd, attachments: cloudAtts }], [emd]);
-  assert.equal(merged[0]?.attachments?.[0]?.dataUrl, largeDataUrl);
+  const fileMap = new Map<string, string>([['att-e1', dataUrl]]);
+  const merged = mergeCloudEmdWithFiles([{ ...emd, attachments: cloudAtts }], fileMap, []);
+  assert.equal(merged[0]?.attachments?.[0]?.dataUrl, dataUrl);
 
   const mergedProfile = mergeCloudProfileWithLocal(
     {
@@ -143,9 +158,9 @@ test('buildCloudEmdPayload and mergeCloudEmdWithLocal enforce schema and preserv
       gstin: '',
       udyamNumber: '',
       adminName: 'Vansh Saxena',
-      adminPhotoUrl: 'data:image/png;base64,LOCALPHOTO',
+      adminPhotoUrl: 'data:image/jpeg;base64,PHOTO',
     },
   );
   assert.equal(mergedProfile.firmName, 'Saxena Corp');
-  assert.equal(mergedProfile.adminPhotoUrl, 'data:image/png;base64,LOCALPHOTO');
+  assert.equal(mergedProfile.adminPhotoUrl, 'data:image/jpeg;base64,PHOTO');
 });

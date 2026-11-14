@@ -2,7 +2,7 @@
   "entities": {
     "UserAccount": {
       "title": "UserAccount",
-      "description": "Root owner record for a verified Google-authenticated user backing up CRM data.",
+      "description": "Root owner record for a verified Google-authenticated user storing CRM data exclusively in Firestore.",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -20,13 +20,11 @@
         },
         "createdAt": {
           "type": "string",
-          "format": "date-time",
-          "description": "Server timestamp when cloud backup was initialized."
+          "format": "date-time"
         },
         "updatedAt": {
           "type": "string",
-          "format": "date-time",
-          "description": "Server timestamp of latest sync."
+          "format": "date-time"
         }
       },
       "required": ["ownerUid", "email", "createdAt", "updatedAt"]
@@ -54,9 +52,40 @@
       },
       "required": ["uid", "email", "createdAt"]
     },
+    "UserPreferences": {
+      "title": "UserPreferences",
+      "description": "Admin lock PIN and theme preferences persisted exclusively in Firestore.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "adminPin": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 4,
+          "pattern": "^[0-9]{4}$"
+        },
+        "darkMode": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "adminPin", "darkMode", "createdAt", "updatedAt"]
+    },
     "FirmProfile": {
       "title": "FirmProfile",
-      "description": "Company profile, GSTIN, Udyam number, and admin display metadata.",
+      "description": "Company profile, GSTIN, Udyam number, and compressed admin avatar.",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -85,8 +114,7 @@
         },
         "adminPhotoUrl": {
           "type": "string",
-          "maxLength": 150000,
-          "description": "Compact avatar URL or resized data URL kept well below the 1 MiB document ceiling."
+          "maxLength": 150000
         },
         "createdAt": {
           "type": "string",
@@ -108,9 +136,64 @@
         "updatedAt"
       ]
     },
+    "AttachmentFile": {
+      "title": "AttachmentFile",
+      "description": "Dedicated Firestore file payload for a tender or EMD/BG attachment (kept < 1 MiB).",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "fileType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "fileSize": {
+          "type": "number"
+        },
+        "dataUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 950000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "id",
+        "fileName",
+        "fileType",
+        "fileSize",
+        "dataUrl",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
     "Tender": {
       "title": "Tender",
-      "description": "Individual tender/bid record tracked in Daily Tender Operations.",
+      "description": "Individual tender/bid record stored exclusively in Firestore.",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -190,7 +273,8 @@
             "Financial / BOQ Eval",
             "L1 / Won",
             "Lost (L2/L3)",
-            "Cancelled / Retendered"
+            "Cancelled / Retendered",
+            "Tender Not Filled"
           ],
           "maxLength": 40
         },
@@ -203,16 +287,13 @@
           "maxLength": 32
         },
         "checklist": {
-          "type": "array",
-          "description": "Bounded document readiness checklist items (max 30)."
+          "type": "array"
         },
         "remarks": {
-          "type": "array",
-          "description": "Bounded timestamped follow-up notes (max 100)."
+          "type": "array"
         },
         "attachments": {
-          "type": "array",
-          "description": "Bounded attachment metadata list (max 10; oversized binary payloads stripped before cloud write)."
+          "type": "array"
         },
         "clientCreatedAt": {
           "type": "string",
@@ -350,8 +431,7 @@
           "maxLength": 1000
         },
         "attachments": {
-          "type": "array",
-          "description": "Bounded attachment metadata list (max 10; oversized binary payloads stripped before cloud write)."
+          "type": "array"
         },
         "createdAt": {
           "type": "string",
@@ -396,25 +476,37 @@
       "schema": {
         "$ref": "#/entities/UserAccount"
       },
-      "description": "Private root document for each authenticated user's cloud backup space."
+      "description": "Private root document for each authenticated user's Firestore workspace."
     },
     "/users/{userId}/profile/{profileId}": {
       "schema": {
         "$ref": "#/entities/FirmProfile"
       },
-      "description": "Firm profile and admin configuration synced to Google Cloud."
+      "description": "Firm profile and admin metadata stored in Firestore."
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": {
+        "$ref": "#/entities/UserPreferences"
+      },
+      "description": "User security PIN and UI theme preferences stored in Firestore."
     },
     "/users/{userId}/tenders/{tenderDocId}": {
       "schema": {
         "$ref": "#/entities/Tender"
       },
-      "description": "User's backed-up tender records."
+      "description": "User's tender records stored exclusively in Firestore."
     },
     "/users/{userId}/emdRecords/{emdDocId}": {
       "schema": {
         "$ref": "#/entities/EmdBgRecord"
       },
-      "description": "User's backed-up EMD and Bank Guarantee records."
+      "description": "User's EMD and Bank Guarantee records stored exclusively in Firestore."
+    },
+    "/users/{userId}/attachmentFiles/{attachmentId}": {
+      "schema": {
+        "$ref": "#/entities/AttachmentFile"
+      },
+      "description": "Per-attachment binary/dataUrl documents kept under 1 MiB in Firestore."
     }
   }
 }

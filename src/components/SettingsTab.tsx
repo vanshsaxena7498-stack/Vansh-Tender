@@ -16,7 +16,7 @@ import {
   User,
 } from 'lucide-react';
 import type { CrmBackupPayload, EmdBgRecord, FirmProfile, Tender } from '../types/crm';
-import { readFileAsDataUrl, validateAttachmentFileSize } from '../utils/attachments';
+import { compressProfilePhotoDataUrl } from '../utils/attachments';
 import { buildCsvContent, downloadTextFile } from '../utils/formatters';
 import type { CloudUserSummary } from './Header';
 
@@ -91,17 +91,8 @@ export function SettingsTab({
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setPhotoError('Please choose a valid image file (PNG, JPG, WEBP).');
-      return;
-    }
-    const sizeErr = validateAttachmentFileSize(file.size);
-    if (sizeErr) {
-      setPhotoError(sizeErr);
-      return;
-    }
     try {
-      const dataUrl = await readFileAsDataUrl(file);
+      const dataUrl = await compressProfilePhotoDataUrl(file);
       setPhotoError('');
       setAdminPhotoUrl(dataUrl);
       onSaveProfile({
@@ -111,10 +102,12 @@ export function SettingsTab({
         adminName: adminName.trim() || 'Vansh Saxena',
         adminPhotoUrl: dataUrl,
       });
-      setProfileSavedMsg('Admin photo updated on sidebar logo.');
+      setProfileSavedMsg('Admin photo compressed and saved.');
       setTimeout(() => setProfileSavedMsg(''), 3000);
-    } catch {
-      setPhotoError('Could not read the selected image.');
+    } catch (err) {
+      setPhotoError(
+        err instanceof Error ? err.message : 'Could not read the selected image.',
+      );
     }
   };
 
@@ -663,7 +656,7 @@ export function SettingsTab({
               Data Backup, CSV Reports & Demo Reset
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Real-time browser persistence active · Export JSON before clearing cache or switching browsers
+              All data, preferences, and attachments persist exclusively via Firebase Firestore · Export CSV or JSON snapshots anytime
             </p>
           </div>
         </div>

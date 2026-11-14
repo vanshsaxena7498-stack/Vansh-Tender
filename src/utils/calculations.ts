@@ -64,6 +64,7 @@ export const COMPLETED_TENDER_STAGES: TenderStage[] = [
   'L1 / Won',
   'Lost (L2/L3)',
   'Cancelled / Retendered',
+  'Tender Not Filled',
 ];
 
 export const ACTIVE_LOCKED_STATUSES = [
@@ -187,6 +188,7 @@ export function buildStatusDistribution(tenders: Tender[]): StatusSlice[] {
     { label: 'L1 / Won', stages: ['L1 / Won'], color: '#16A34A' },
     { label: 'Lost', stages: ['Lost (L2/L3)'], color: '#DC2626' },
     { label: 'Cancelled', stages: ['Cancelled / Retendered'], color: '#94A3B8' },
+    { label: 'Not Filled', stages: ['Tender Not Filled'], color: '#475569' },
   ];
 
   return buckets

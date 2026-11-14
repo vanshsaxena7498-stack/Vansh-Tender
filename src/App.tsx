@@ -1,4 +1,5 @@
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import { Cloud, CloudUpload } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { DashboardTab } from './components/DashboardTab';
 import { EmdBgFormModal } from './components/EmdBgFormModal';
@@ -23,6 +24,7 @@ import type {
   NotificationItem,
   TabKey,
   Tender,
+  UserPreferences,
 } from './types/crm';
 import { computeNotifications } from './utils/calculations';
 import {
@@ -33,33 +35,15 @@ import {
   replaceCloudDataset,
   subscribeToUserCloudData,
   syncEmdRecordToCloud,
+  syncPreferencesToCloud,
   syncProfileToCloud,
   syncTenderToCloud,
 } from './utils/cloudSync';
 import {
-  mergeCloudEmdWithLocal,
+  mergeCloudEmdWithFiles,
   mergeCloudProfileWithLocal,
-  mergeCloudTendersWithLocal,
+  mergeCloudTendersWithFiles,
 } from './utils/cloudSyncHelpers';
-
-const STORAGE_KEYS = {
-  TENDERS: 'bidledger_tenders_v1',
-  EMD: 'bidledger_emd_records_v1',
-  PROFILE: 'bidledger_firm_profile_v1',
-  PIN: 'bidledger_admin_pin_v1',
-  DARK_MODE: 'bidledger_dark_mode_v1',
-  LAST_CLOUD_SYNC: 'bidledger_last_cloud_sync_v1',
-} as const;
-
-function readStorage<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
-}
 
 function formatCloudErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -75,37 +59,25 @@ function formatCloudErrorMessage(err: unknown): string {
   if (raw.includes('auth/popup-blocked')) {
     return 'Sign-In popup was blocked by your browser. Please allow popups for this site.';
   }
-  return 'Could not sync with Google Cloud. Your data remains safely saved locally.';
+  return 'Could not sync with Firebase Firestore. Please check your connection and try again.';
 }
 
 export default function App() {
-  const [tenders, setTenders] = useState<Tender[]>(() =>
-    readStorage(STORAGE_KEYS.TENDERS, SEED_TENDERS),
-  );
-  const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(() =>
-    readStorage(STORAGE_KEYS.EMD, SEED_EMD_RECORDS),
-  );
-  const [firmProfile, setFirmProfile] = useState<FirmProfile>(() =>
-    readStorage(STORAGE_KEYS.PROFILE, DEFAULT_FIRM_PROFILE),
-  );
-  const [adminPin, setAdminPin] = useState<string>(() =>
-    readStorage(STORAGE_KEYS.PIN, '1234'),
-  );
-  const [darkMode, setDarkMode] = useState<boolean>(() =>
-    readStorage(STORAGE_KEYS.DARK_MODE, false),
-  );
+  const [tenders, setTenders] = useState<Tender[]>(SEED_TENDERS);
+  const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(SEED_EMD_RECORDS);
+  const [firmProfile, setFirmProfile] = useState<FirmProfile>(DEFAULT_FIRM_PROFILE);
+  const [adminPin, setAdminPin] = useState<string>('1234');
+  const [darkMode, setDarkMode] = useState<boolean>(false);
 
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [isLocked, setIsLocked] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  // Firebase Cloud Backup state
+  // Firebase Firestore State
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [cloudSyncing, setCloudSyncing] = useState(false);
-  const [lastCloudSyncAt, setLastCloudSyncAt] = useState<string | null>(() =>
-    readStorage<string | null>(STORAGE_KEYS.LAST_CLOUD_SYNC, null),
-  );
+  const [lastCloudSyncAt, setLastCloudSyncAt] = useState<string | null>(null);
   const [cloudFeedback, setCloudFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(
     null,
   );
@@ -119,39 +91,21 @@ export default function App() {
     undefined,
   );
 
-  // Keep fresh state refs for async cloud listeners & initial handshake
-  const stateRef = useRef({ tenders, emdRecords, firmProfile });
+  // In-memory refs for async Firestore listeners and attachment payloads
+  const attachmentFilesRef = useRef<Map<string, string>>(new Map());
+  const stateRef = useRef({ tenders, emdRecords, firmProfile, adminPin, darkMode });
   useEffect(() => {
-    stateRef.current = { tenders, emdRecords, firmProfile };
-  }, [tenders, emdRecords, firmProfile]);
+    stateRef.current = { tenders, emdRecords, firmProfile, adminPin, darkMode };
+  }, [tenders, emdRecords, firmProfile, adminPin, darkMode]);
 
-  const markSyncedNow = () => {
-    const iso = new Date().toISOString();
-    setLastCloudSyncAt(iso);
-    localStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, JSON.stringify(iso));
-  };
-
-  // Persist to localStorage automatically
+  // Apply Dark Mode class on root element (no localStorage)
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.TENDERS, JSON.stringify(tenders));
-  }, [tenders]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.EMD, JSON.stringify(emdRecords));
-  }, [emdRecords]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.PROFILE, JSON.stringify(firmProfile));
-  }, [firmProfile]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.PIN, JSON.stringify(adminPin));
-  }, [adminPin]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.DARK_MODE, JSON.stringify(darkMode));
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+
+  const markSyncedNow = () => {
+    setLastCloudSyncAt(new Date().toISOString());
+  };
 
   // Listen for Firebase Auth state
   useEffect(() => {
@@ -162,43 +116,58 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Initial cloud handshake + real-time Firestore subscription when authenticated
+  // Initial Firestore load/seed + real-time Firestore subscription when authenticated
   useEffect(() => {
     if (!authReady || !firebaseUser) return;
 
     let cancelled = false;
     let unsubCloud: (() => void) | null = null;
 
-    const initializeCloudSync = async () => {
+    const initializeFirestoreSession = async () => {
       setCloudSyncing(true);
       try {
         const cloud = await fetchAllFromCloud(firebaseUser.uid);
         if (cancelled) return;
 
+        attachmentFilesRef.current = cloud.attachmentFiles;
+
         const cloudIsEmpty =
-          !cloud.profile && cloud.tenders.length === 0 && cloud.emdRecords.length === 0;
+          !cloud.profile &&
+          !cloud.preferences &&
+          cloud.tenders.length === 0 &&
+          cloud.emdRecords.length === 0;
 
         if (cloudIsEmpty) {
-          const { firmProfile: curProfile, tenders: curTenders, emdRecords: curEmd } =
-            stateRef.current;
-          await backupAllToCloud(firebaseUser, curProfile, curTenders, curEmd);
+          const {
+            firmProfile: curProfile,
+            tenders: curTenders,
+            emdRecords: curEmd,
+            adminPin: curPin,
+            darkMode: curDark,
+          } = stateRef.current;
+          const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
+          await backupAllToCloud(firebaseUser, curProfile, prefs, curTenders, curEmd);
           if (!cancelled) {
             markSyncedNow();
             setCloudFeedback({
               type: 'ok',
-              msg: `Connected as ${firebaseUser.email} and backed up ${curTenders.length} tenders & ${curEmd.length} EMD/BG records to Google Cloud.`,
+              msg: `Connected as ${firebaseUser.email}. All data is now stored exclusively in Firebase Firestore.`,
             });
           }
         } else {
           if (cloud.profile) {
             setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
           }
-          if (cloud.tenders.length > 0) {
-            setTenders((prev) => mergeCloudTendersWithLocal(cloud.tenders, prev));
+          if (cloud.preferences) {
+            setAdminPin(cloud.preferences.adminPin);
+            setDarkMode(cloud.preferences.darkMode);
           }
-          if (cloud.emdRecords.length > 0) {
-            setEmdRecords((prev) => mergeCloudEmdWithLocal(cloud.emdRecords, prev));
-          }
+          setTenders((prev) =>
+            mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
+          );
+          setEmdRecords((prev) =>
+            mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
+          );
           markSyncedNow();
         }
 
@@ -209,12 +178,27 @@ export default function App() {
             setFirmProfile((prev) => mergeCloudProfileWithLocal(remoteProfile, prev));
             markSyncedNow();
           },
+          onPreferences: (remotePrefs) => {
+            setAdminPin(remotePrefs.adminPin);
+            setDarkMode(remotePrefs.darkMode);
+            markSyncedNow();
+          },
           onTenders: (remoteTenders) => {
-            setTenders((prev) => mergeCloudTendersWithLocal(remoteTenders, prev));
+            setTenders((prev) =>
+              mergeCloudTendersWithFiles(remoteTenders, attachmentFilesRef.current, prev),
+            );
             markSyncedNow();
           },
           onEmdRecords: (remoteEmd) => {
-            setEmdRecords((prev) => mergeCloudEmdWithLocal(remoteEmd, prev));
+            setEmdRecords((prev) =>
+              mergeCloudEmdWithFiles(remoteEmd, attachmentFilesRef.current, prev),
+            );
+            markSyncedNow();
+          },
+          onAttachmentFiles: (remoteFiles) => {
+            attachmentFilesRef.current = remoteFiles;
+            setTenders((prev) => mergeCloudTendersWithFiles(prev, remoteFiles, prev));
+            setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, remoteFiles, prev));
             markSyncedNow();
           },
           onError: (err) => {
@@ -232,7 +216,7 @@ export default function App() {
       }
     };
 
-    void initializeCloudSync();
+    void initializeFirestoreSession();
 
     return () => {
       cancelled = true;
@@ -274,7 +258,7 @@ export default function App() {
       await signOut(auth);
       setCloudFeedback({
         type: 'ok',
-        msg: 'Google Cloud disconnected. Local browser saving remains active.',
+        msg: 'Signed out of Google Cloud. Sign back in anytime to read & save data in Firestore.',
       });
     } catch (err) {
       setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
@@ -284,23 +268,38 @@ export default function App() {
   };
 
   const handleBackupToCloudNow = () => {
-    const { firmProfile: curProfile, tenders: curTenders, emdRecords: curEmd } =
-      stateRef.current;
+    const {
+      firmProfile: curProfile,
+      tenders: curTenders,
+      emdRecords: curEmd,
+      adminPin: curPin,
+      darkMode: curDark,
+    } = stateRef.current;
+    const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
     void runCloudTask(
-      (user) => replaceCloudDataset(user, curProfile, curTenders, curEmd),
-      `Backed up ${curTenders.length} tenders, ${curEmd.length} EMD/BG records & firm profile to Google Cloud.`,
+      (user) => replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd),
+      `Synced ${curTenders.length} tenders, ${curEmd.length} EMD/BG records & firm settings to Firebase Firestore.`,
     );
   };
 
   const handleRestoreFromCloud = () => {
     void runCloudTask(async (user) => {
       const cloud = await fetchAllFromCloud(user.uid);
+      attachmentFilesRef.current = cloud.attachmentFiles;
       if (cloud.profile) {
         setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
       }
-      setTenders((prev) => mergeCloudTendersWithLocal(cloud.tenders, prev));
-      setEmdRecords((prev) => mergeCloudEmdWithLocal(cloud.emdRecords, prev));
-    }, 'Restored latest data from Google Cloud.');
+      if (cloud.preferences) {
+        setAdminPin(cloud.preferences.adminPin);
+        setDarkMode(cloud.preferences.darkMode);
+      }
+      setTenders((prev) =>
+        mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
+      );
+      setEmdRecords((prev) =>
+        mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
+      );
+    }, 'Reloaded latest data from Firebase Firestore.');
   };
 
   const cloudUserSummary: CloudUserSummary | null = firebaseUser
@@ -348,7 +347,16 @@ export default function App() {
     };
   };
 
+  const cacheAttachmentPayloads = (items?: { id: string; dataUrl: string }[]) => {
+    for (const att of items ?? []) {
+      if (att.dataUrl) {
+        attachmentFilesRef.current.set(att.id, att.dataUrl);
+      }
+    }
+  };
+
   const handleSaveTender = (saved: Tender, syncToEmd: boolean) => {
+    cacheAttachmentPayloads(saved.attachments);
     setTenders((prev) => {
       const exists = prev.some((t) => t.id === saved.id);
       if (exists) {
@@ -379,6 +387,7 @@ export default function App() {
   };
 
   const handleUpdateTenderInline = (updated: Tender) => {
+    cacheAttachmentPayloads(updated.attachments);
     setTenders((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
     void runCloudTask((user) => syncTenderToCloud(user, updated));
   };
@@ -403,6 +412,7 @@ export default function App() {
   };
 
   const handleSaveEmdRecord = (saved: EmdBgRecord) => {
+    cacheAttachmentPayloads(saved.attachments);
     setEmdRecords((prev) => {
       const exists = prev.some((r) => r.id === saved.id);
       if (exists) {
@@ -424,6 +434,23 @@ export default function App() {
     void runCloudTask((user) => syncProfileToCloud(user, nextProfile));
   };
 
+  const handleToggleDarkMode = () => {
+    setDarkMode((prev) => {
+      const next = !prev;
+      void runCloudTask((user) =>
+        syncPreferencesToCloud(user, { adminPin: stateRef.current.adminPin, darkMode: next }),
+      );
+      return next;
+    });
+  };
+
+  const handleUpdatePin = (newPin: string) => {
+    setAdminPin(newPin);
+    void runCloudTask((user) =>
+      syncPreferencesToCloud(user, { adminPin: newPin, darkMode: stateRef.current.darkMode }),
+    );
+  };
+
   const handleNavigateFromNotification = (item: NotificationItem) => {
     setActiveTab(item.targetTab);
     if (item.targetTab === 'tenders') {
@@ -432,11 +459,17 @@ export default function App() {
   };
 
   const handleImportBackup = (payload: CrmBackupPayload) => {
+    for (const t of payload.tenders) cacheAttachmentPayloads(t.attachments);
+    for (const r of payload.emdRecords) cacheAttachmentPayloads(r.attachments);
     setFirmProfile(payload.profile);
     setTenders(payload.tenders);
     setEmdRecords(payload.emdRecords);
+    const prefs: UserPreferences = {
+      adminPin: stateRef.current.adminPin,
+      darkMode: stateRef.current.darkMode,
+    };
     void runCloudTask((user) =>
-      replaceCloudDataset(user, payload.profile, payload.tenders, payload.emdRecords),
+      replaceCloudDataset(user, payload.profile, prefs, payload.tenders, payload.emdRecords),
     );
   };
 
@@ -445,17 +478,26 @@ export default function App() {
     setTenders(SEED_TENDERS);
     setEmdRecords(SEED_EMD_RECORDS);
     setSelectedTenderId(null);
+    const prefs: UserPreferences = {
+      adminPin: stateRef.current.adminPin,
+      darkMode: stateRef.current.darkMode,
+    };
     void runCloudTask((user) =>
-      replaceCloudDataset(user, DEFAULT_FIRM_PROFILE, SEED_TENDERS, SEED_EMD_RECORDS),
+      replaceCloudDataset(user, DEFAULT_FIRM_PROFILE, prefs, SEED_TENDERS, SEED_EMD_RECORDS),
     );
   };
 
   const handleClearAllData = () => {
+    attachmentFilesRef.current.clear();
     setTenders([]);
     setEmdRecords([]);
     setSelectedTenderId(null);
+    const prefs: UserPreferences = {
+      adminPin: stateRef.current.adminPin,
+      darkMode: stateRef.current.darkMode,
+    };
     void runCloudTask((user) =>
-      replaceCloudDataset(user, stateRef.current.firmProfile, [], []),
+      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], []),
     );
   };
 
@@ -476,7 +518,7 @@ export default function App() {
           activeTab={activeTab}
           firmProfile={firmProfile}
           darkMode={darkMode}
-          onToggleDarkMode={() => setDarkMode((prev) => !prev)}
+          onToggleDarkMode={handleToggleDarkMode}
           onLockScreen={() => setIsLocked(true)}
           notifications={notifications}
           onNavigateFromNotification={handleNavigateFromNotification}
@@ -487,7 +529,27 @@ export default function App() {
           onOpenCloudSettings={() => setActiveTab('settings')}
         />
 
-        <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto">
+        <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto space-y-4">
+          {authReady && !firebaseUser && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-blue-200 dark:border-blue-900/70 bg-blue-50/80 dark:bg-blue-950/30 px-4 py-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Cloud className="h-4 w-4 text-[#1E3A8A] dark:text-blue-400 shrink-0" aria-hidden="true" />
+                <p className="text-xs text-slate-800 dark:text-slate-200">
+                  <span className="font-semibold">Firestore Cloud Mode:</span> Browser storage is disabled. Sign in with Google to save and load all tenders, EMD/BG records, and attachments in Firebase Firestore.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleConnectCloud}
+                disabled={cloudSyncing}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium whitespace-nowrap shrink-0"
+              >
+                <CloudUpload className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>{cloudSyncing ? 'Connecting...' : 'Sign in with Google'}</span>
+              </button>
+            </div>
+          )}
+
           {activeTab === 'dashboard' && (
             <DashboardTab
               tenders={tenders}
@@ -529,7 +591,7 @@ export default function App() {
               tenders={tenders}
               emdRecords={emdRecords}
               onSaveProfile={handleSaveProfile}
-              onUpdatePin={setAdminPin}
+              onUpdatePin={handleUpdatePin}
               onImportBackup={handleImportBackup}
               onResetDemoData={handleResetDemoData}
               onClearAllData={handleClearAllData}

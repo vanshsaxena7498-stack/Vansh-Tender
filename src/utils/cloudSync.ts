@@ -13,9 +13,17 @@ import {
   type Unsubscribe,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import type { EmdBgRecord, FirmProfile, Tender } from '../types/crm';
+import type {
+  AttachmentItem,
+  EmdBgRecord,
+  FirmProfile,
+  Tender,
+  UserPreferences,
+} from '../types/crm';
 import {
+  buildCloudAttachmentFilePayload,
   buildCloudEmdPayload,
+  buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudTenderPayload,
   sanitizeDocId,
@@ -25,6 +33,7 @@ const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'L1 / Won',
   'Lost (L2/L3)',
   'Cancelled / Retendered',
+  'Tender Not Filled',
 ]);
 
 const TERMINAL_FINANCIAL_STATUS = new Set<EmdBgRecord['status']>([
@@ -98,6 +107,14 @@ function docToProfile(data: Record<string, unknown>): FirmProfile {
   };
 }
 
+function docToPreferences(data: Record<string, unknown>): UserPreferences {
+  const pin = String(data.adminPin ?? '1234');
+  return {
+    adminPin: /^\d{4}$/.test(pin) ? pin : '1234',
+    darkMode: Boolean(data.darkMode),
+  };
+}
+
 export async function ensureUserRootDocument(user: User): Promise<void> {
   const userPath = `users/${user.uid}`;
   const userRef = doc(db, 'users', user.uid);
@@ -124,6 +141,25 @@ export async function ensureUserRootDocument(user: User): Promise<void> {
   }
 }
 
+export async function syncPreferencesToCloud(user: User, prefs: UserPreferences): Promise<void> {
+  await ensureUserRootDocument(user);
+  const path = `users/${user.uid}/settings/preferences`;
+  const ref = doc(db, 'users', user.uid, 'settings', 'preferences');
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const payload = buildCloudPreferencesPayload(
+      prefs,
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    await setDoc(ref, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
 export async function syncProfileToCloud(user: User, profile: FirmProfile): Promise<void> {
   await ensureUserRootDocument(user);
   const path = `users/${user.uid}/profile/firm`;
@@ -138,8 +174,38 @@ export async function syncProfileToCloud(user: User, profile: FirmProfile): Prom
   }
 }
 
+export async function syncAttachmentFilesToCloud(
+  user: User,
+  attachments: AttachmentItem[] | undefined,
+): Promise<void> {
+  const list = attachments ?? [];
+  for (const att of list) {
+    if (!att.dataUrl) continue;
+    const safeId = sanitizeDocId(att.id);
+    const path = `users/${user.uid}/attachmentFiles/${safeId}`;
+    const ref = doc(db, 'users', user.uid, 'attachmentFiles', safeId);
+    try {
+      const snap = await getDoc(ref);
+      const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+      const payload = buildCloudAttachmentFilePayload(
+        att,
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      );
+      if (payload) {
+        await setDoc(ref, payload);
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+}
+
 export async function syncTenderToCloud(user: User, tender: Tender): Promise<void> {
   await ensureUserRootDocument(user);
+  await syncAttachmentFilesToCloud(user, tender.attachments);
+
   const safeId = sanitizeDocId(tender.id);
   const path = `users/${user.uid}/tenders/${safeId}`;
   const ref = doc(db, 'users', user.uid, 'tenders', safeId);
@@ -176,6 +242,8 @@ export async function deleteTenderFromCloud(user: User, tenderId: string): Promi
 
 export async function syncEmdRecordToCloud(user: User, record: EmdBgRecord): Promise<void> {
   await ensureUserRootDocument(user);
+  await syncAttachmentFilesToCloud(user, record.attachments);
+
   const safeId = sanitizeDocId(record.id);
   const path = `users/${user.uid}/emdRecords/${safeId}`;
   const ref = doc(db, 'users', user.uid, 'emdRecords', safeId);
@@ -210,18 +278,40 @@ export async function deleteEmdRecordFromCloud(user: User, recordId: string): Pr
   }
 }
 
+export async function fetchAttachmentFileDataUrl(
+  uid: string,
+  attachmentId: string,
+): Promise<string | null> {
+  const safeId = sanitizeDocId(attachmentId);
+  const path = `users/${uid}/attachmentFiles/${safeId}`;
+  try {
+    const snap = await getDoc(doc(db, 'users', uid, 'attachmentFiles', safeId));
+    if (!snap.exists()) return null;
+    const dataUrl = snap.data().dataUrl;
+    return typeof dataUrl === 'string' && dataUrl.length > 0 ? dataUrl : null;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+}
+
 export async function fetchAllFromCloud(uid: string): Promise<{
   profile: FirmProfile | null;
+  preferences: UserPreferences | null;
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
+  attachmentFiles: Map<string, string>;
 }> {
   const profilePath = `users/${uid}/profile/firm`;
+  const prefsPath = `users/${uid}/settings/preferences`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
+  const filesPath = `users/${uid}/attachmentFiles`;
 
   let profile: FirmProfile | null = null;
+  let preferences: UserPreferences | null = null;
   let tenders: Tender[] = [];
   let emdRecords: EmdBgRecord[] = [];
+  const attachmentFiles = new Map<string, string>();
 
   try {
     const profileSnap = await getDoc(doc(db, 'users', uid, 'profile', 'firm'));
@@ -230,6 +320,15 @@ export async function fetchAllFromCloud(uid: string): Promise<{
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, profilePath);
+  }
+
+  try {
+    const prefsSnap = await getDoc(doc(db, 'users', uid, 'settings', 'preferences'));
+    if (prefsSnap.exists()) {
+      preferences = docToPreferences(prefsSnap.data());
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, prefsPath);
   }
 
   try {
@@ -248,17 +347,35 @@ export async function fetchAllFromCloud(uid: string): Promise<{
     handleFirestoreError(error, OperationType.LIST, emdPath);
   }
 
-  return { profile, tenders, emdRecords };
+  try {
+    const fQuery = query(
+      collection(db, 'users', uid, 'attachmentFiles'),
+      where('ownerUid', '==', uid),
+    );
+    const fSnap = await getDocs(fQuery);
+    for (const d of fSnap.docs) {
+      const data = d.data();
+      if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
+        attachmentFiles.set(String(data.id ?? d.id), data.dataUrl);
+      }
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, filesPath);
+  }
+
+  return { profile, preferences, tenders, emdRecords, attachmentFiles };
 }
 
 export async function backupAllToCloud(
   user: User,
   profile: FirmProfile,
+  preferences: UserPreferences,
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
 ): Promise<void> {
   await ensureUserRootDocument(user);
   await syncProfileToCloud(user, profile);
+  await syncPreferencesToCloud(user, preferences);
 
   for (const tender of tenders) {
     await syncTenderToCloud(user, tender);
@@ -272,12 +389,21 @@ export async function backupAllToCloud(
 export async function replaceCloudDataset(
   user: User,
   profile: FirmProfile,
+  preferences: UserPreferences,
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
 ): Promise<void> {
   const existing = await fetchAllFromCloud(user.uid);
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
+  const nextAttachmentIds = new Set<string>();
+
+  for (const t of tenders) {
+    for (const a of t.attachments ?? []) nextAttachmentIds.add(sanitizeDocId(a.id));
+  }
+  for (const r of emdRecords) {
+    for (const a of r.attachments ?? []) nextAttachmentIds.add(sanitizeDocId(a.id));
+  }
 
   for (const oldTender of existing.tenders) {
     if (!nextTenderIds.has(sanitizeDocId(oldTender.id))) {
@@ -291,21 +417,37 @@ export async function replaceCloudDataset(
     }
   }
 
-  await backupAllToCloud(user, profile, tenders, emdRecords);
+  for (const oldAttId of existing.attachmentFiles.keys()) {
+    if (!nextAttachmentIds.has(sanitizeDocId(oldAttId))) {
+      const safeId = sanitizeDocId(oldAttId);
+      const path = `users/${user.uid}/attachmentFiles/${safeId}`;
+      try {
+        await deleteDoc(doc(db, 'users', user.uid, 'attachmentFiles', safeId));
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, path);
+      }
+    }
+  }
+
+  await backupAllToCloud(user, profile, preferences, tenders, emdRecords);
 }
 
 export function subscribeToUserCloudData(
   uid: string,
   callbacks: {
     onProfile: (profile: FirmProfile) => void;
+    onPreferences: (prefs: UserPreferences) => void;
     onTenders: (tenders: Tender[]) => void;
     onEmdRecords: (records: EmdBgRecord[]) => void;
+    onAttachmentFiles: (fileMap: Map<string, string>) => void;
     onError: (err: Error) => void;
   },
 ): Unsubscribe {
   const profilePath = `users/${uid}/profile/firm`;
+  const prefsPath = `users/${uid}/settings/preferences`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
+  const filesPath = `users/${uid}/attachmentFiles`;
 
   const unsubProfile = onSnapshot(
     doc(db, 'users', uid, 'profile', 'firm'),
@@ -317,6 +459,22 @@ export function subscribeToUserCloudData(
     (error) => {
       try {
         handleFirestoreError(error, OperationType.GET, profilePath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
+  const unsubPrefs = onSnapshot(
+    doc(db, 'users', uid, 'settings', 'preferences'),
+    (snap) => {
+      if (snap.exists()) {
+        callbacks.onPreferences(docToPreferences(snap.data()));
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, prefsPath);
       } catch (wrapped) {
         callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
       }
@@ -351,9 +509,32 @@ export function subscribeToUserCloudData(
     },
   );
 
+  const unsubFiles = onSnapshot(
+    query(collection(db, 'users', uid, 'attachmentFiles'), where('ownerUid', '==', uid)),
+    (snap) => {
+      const map = new Map<string, string>();
+      for (const d of snap.docs) {
+        const data = d.data();
+        if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
+          map.set(String(data.id ?? d.id), data.dataUrl);
+        }
+      }
+      callbacks.onAttachmentFiles(map);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, filesPath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
   return () => {
     unsubProfile();
+    unsubPrefs();
     unsubTenders();
     unsubEmd();
+    unsubFiles();
   };
 }

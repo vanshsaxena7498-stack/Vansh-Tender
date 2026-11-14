@@ -1,13 +1,13 @@
 # Firestore Security Specification — Vansh Saxena Tender & Bid Management CRM
 
 ## 1. Data Invariants
-1. **Strict Ownership Isolation**: Every cloud backup document (`UserAccount`, `FirmProfile`, `Tender`, `EmdBgRecord`) belongs to a single verified Google-authenticated user (`ownerUid == request.auth.uid`) stored under `/users/{userId}/...` where `userId == request.auth.uid`.
-2. **Master Gate Integrity**: Subcollection documents under `/users/{userId}/profile/*`, `/users/{userId}/tenders/*`, and `/users/{userId}/emdRecords/*` cannot be read (`get`), created, updated, or deleted unless the parent `/users/{userId}` document exists and its `ownerUid` equals `userId`.
+1. **Strict Ownership Isolation**: Every CRM document (`UserAccount`, `UserPreferences`, `FirmProfile`, `Tender`, `EmdBgRecord`, `AttachmentFile`) belongs to a single verified Google-authenticated user (`ownerUid == request.auth.uid`) stored exclusively in Firestore under `/users/{userId}/...` where `userId == request.auth.uid`.
+2. **Master Gate Integrity**: Subcollection documents under `/users/{userId}/profile/*`, `/users/{userId}/settings/*`, `/users/{userId}/attachmentFiles/*`, `/users/{userId}/tenders/*`, and `/users/{userId}/emdRecords/*` cannot be read (`get`), created, updated, or deleted unless the parent `/users/{userId}` document exists and its `ownerUid` equals `userId`.
 3. **Verified Email Requirement**: Unverified accounts (`request.auth.token.email_verified != true`) are denied all read and write access.
 4. **Bootstrapped Admin Privilege**: `vanshsaxena7498@gmail.com` (with `email_verified == true`) or UIDs present in `/admins/{uid}` act as system admin for state corrections; non-admin users cannot escalate roles or write to `/admins/{uid}`.
 5. **Temporal & Identity Immutability**: `ownerUid` and `createdAt` (`== request.time` on create) are strictly immutable on update; `updatedAt` must always equal `request.time`.
-6. **Volumetric & Schema Guardrails**: All document IDs match `^[a-zA-Z0-9_\-]+$` (1..128 chars), every string has an explicit `.size()` bound, every array is strictly bounded (`checklist <= 30`, `remarks <= 100`, `attachments <= 10`), numeric amounts are `>= 0`, and no shadow/ghost fields are accepted (`hasAll` + `hasOnly` + `affectedKeys().hasOnly()`).
-7. **Terminal State Locking**: Once a `Tender.stage` reaches `'L1 / Won'`, `'Lost (L2/L3)'`, or `'Cancelled / Retendered'`, or an `EmdBgRecord.status` reaches `'Refunded / Released'` or `'Forfeited'`, non-admin updates are blocked unless overridden by `isAdmin()`.
+6. **Volumetric & Schema Guardrails**: All document IDs match `^[a-zA-Z0-9_\-]+$` (1..128 chars), every string has an explicit `.size()` bound (`AttachmentFile.dataUrl <= 950000`, `FirmProfile.adminPhotoUrl <= 150000`), every array is strictly bounded (`checklist <= 30`, `remarks <= 100`, `attachments <= 10`), numeric amounts are `>= 0`, and no shadow/ghost fields are accepted (`hasAll` + `hasOnly` + `affectedKeys().hasOnly()`).
+7. **Terminal State Locking**: Once a `Tender.stage` reaches `'L1 / Won'`, `'Lost (L2/L3)'`, `'Cancelled / Retendered'`, or `'Tender Not Filled'`, or an `EmdBgRecord.status` reaches `'Refunded / Released'` or `'Forfeited'`, non-admin updates are blocked unless overridden by `isAdmin()`.
 8. **Query Enforcer**: All `allow list` rules explicitly enforce `resource.data.ownerUid == request.auth.uid` with zero `get()` or `exists()` calls.
 
 ---

@@ -66,12 +66,13 @@ service cloud.firestore {
         'Financial / BOQ Eval',
         'L1 / Won',
         'Lost (L2/L3)',
-        'Cancelled / Retendered'
+        'Cancelled / Retendered',
+        'Tender Not Filled'
       ];
     }
 
     function isTerminalTenderStage(stage) {
-      return stage in ['L1 / Won', 'Lost (L2/L3)', 'Cancelled / Retendered'];
+      return stage in ['L1 / Won', 'Lost (L2/L3)', 'Cancelled / Retendered', 'Tender Not Filled'];
     }
 
     function isValidInstrumentType(instrumentType) {
@@ -124,6 +125,20 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
+    function isValidUserPreferences(data, userId) {
+      return data.keys().hasAll(['ownerUid', 'adminPin', 'darkMode', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerUid', 'adminPin', 'darkMode', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        data.adminPin is string &&
+        data.adminPin.size() == 4 &&
+        data.adminPin.matches('^[0-9]{4}$') &&
+        data.darkMode is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     function isValidFirmProfile(data, userId) {
       return data.keys().hasAll([
           'ownerUid',
@@ -160,6 +175,47 @@ service cloud.firestore {
         data.adminName.size() <= 100 &&
         data.adminPhotoUrl is string &&
         data.adminPhotoUrl.size() <= 150000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAttachmentFile(data, userId, attachmentId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'id',
+          'fileName',
+          'fileType',
+          'fileSize',
+          'dataUrl',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'id',
+          'fileName',
+          'fileType',
+          'fileSize',
+          'dataUrl',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        isValidId(data.id) &&
+        data.id == attachmentId &&
+        data.fileName is string &&
+        data.fileName.size() >= 1 &&
+        data.fileName.size() <= 200 &&
+        data.fileType is string &&
+        data.fileType.size() >= 1 &&
+        data.fileType.size() <= 120 &&
+        data.fileSize is number &&
+        data.fileSize >= 0 &&
+        data.dataUrl is string &&
+        data.dataUrl.size() >= 1 &&
+        data.dataUrl.size() <= 950000 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -457,6 +513,97 @@ service cloud.firestore {
         allow delete: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(profileId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /settings/{settingId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(settingId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(settingId) &&
+          settingId == 'preferences' &&
+          isOwner(userId) &&
+          isValidUserPreferences(incoming(), userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(settingId) &&
+          settingId == 'preferences' &&
+          isValidUserPreferences(incoming(), userId) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'adminPin',
+                'darkMode',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(settingId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /attachmentFiles/{attachmentId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(attachmentId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(attachmentId) &&
+          isOwner(userId) &&
+          isValidAttachmentFile(incoming(), userId, attachmentId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(attachmentId) &&
+          isValidAttachmentFile(incoming(), userId, attachmentId) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'fileName',
+                'fileType',
+                'fileSize',
+                'dataUrl',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(attachmentId) &&
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
       }

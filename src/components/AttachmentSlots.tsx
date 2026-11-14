@@ -3,8 +3,7 @@ import { Download, FileText, Paperclip, Plus, Trash2, Upload } from 'lucide-reac
 import type { AttachmentItem } from '../types/crm';
 import {
   formatFileSize,
-  readFileAsDataUrl,
-  validateAttachmentFileSize,
+  readAttachmentForFirestore,
   type AttachmentSlotState,
 } from '../utils/attachments';
 
@@ -16,26 +15,22 @@ interface AttachmentSlotsProps {
 
 export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps) {
   const [slotError, setSlotError] = useState<string>('');
+  const [readingSlot, setReadingSlot] = useState<number | null>(null);
 
   const handleFilePick = async (slotIndex: number, e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
 
-    const sizeErr = validateAttachmentFileSize(file.size);
-    if (sizeErr) {
-      setSlotError(sizeErr);
-      return;
-    }
-
+    setReadingSlot(slotIndex);
     try {
-      const dataUrl = await readFileAsDataUrl(file);
+      const { dataUrl, fileSize, fileType } = await readAttachmentForFirestore(file);
       const item: AttachmentItem = {
         id: `att-${Date.now()}-${slotIndex}`,
         slotLabel: slots[slotIndex].slotLabel,
         fileName: file.name,
-        fileType: file.type || 'application/octet-stream',
-        fileSize: file.size,
+        fileType,
+        fileSize,
         uploadedAt: new Date().toISOString().slice(0, 10),
         dataUrl,
       };
@@ -43,8 +38,12 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
       onChange(
         slots.map((slot, idx) => (idx === slotIndex ? { ...slot, attachment: item } : slot)),
       );
-    } catch {
-      setSlotError('Unable to read the selected file.');
+    } catch (err) {
+      setSlotError(
+        err instanceof Error ? err.message : 'Unable to process the selected file.',
+      );
+    } finally {
+      setReadingSlot(null);
     }
   };
 
@@ -81,7 +80,7 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
             {title}
           </h3>
           <span className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400">
-            ({attachedCount}/{slots.length} attached · max 2 MB/file)
+            ({attachedCount}/{slots.length} attached · max 650 KB/file, images auto-compressed)
           </span>
         </div>
 
@@ -108,6 +107,7 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
         {slots.map((slot, idx) => {
           const inputId = `att-input-${slot.slotId}`;
           const file = slot.attachment;
+          const isBusy = readingSlot === idx;
           return (
             <div
               key={slot.slotId}
@@ -137,15 +137,19 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
               <div className="flex items-center gap-1.5 shrink-0">
                 {file && (
                   <>
-                    <a
-                      href={file.dataUrl}
-                      download={file.fileName}
-                      aria-label={`Download ${file.fileName}`}
-                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
-                    >
-                      <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span>Download</span>
-                    </a>
+                    {file.dataUrl ? (
+                      <a
+                        href={file.dataUrl}
+                        download={file.fileName}
+                        aria-label={`Download ${file.fileName}`}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                      >
+                        <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>Download</span>
+                      </a>
+                    ) : (
+                      <span className="text-[11px] text-slate-400 px-2">Syncing file…</span>
+                    )}
                     <button
                       type="button"
                       onClick={() => handleRemoveFile(idx)}
@@ -162,11 +166,12 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-[11px] font-medium text-[#1E3A8A] dark:text-blue-400 cursor-pointer whitespace-nowrap"
                 >
                   <Upload className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>{file ? 'Replace' : 'Attach File'}</span>
+                  <span>{isBusy ? 'Processing…' : file ? 'Replace' : 'Attach File'}</span>
                   <input
                     id={inputId}
                     type="file"
                     accept=".pdf,.png,.jpg,.jpeg,.webp,.xls,.xlsx,.csv,.doc,.docx"
+                    disabled={isBusy}
                     onChange={(e) => handleFilePick(idx, e)}
                     className="sr-only"
                   />

@@ -19,7 +19,8 @@ export type TenderStage =
   | 'Financial / BOQ Eval'
   | 'L1 / Won'
   | 'Lost (L2/L3)'
-  | 'Cancelled / Retendered';
+  | 'Cancelled / Retendered'
+  | 'Tender Not Filled';
 
 export interface ChecklistItem {
   id: string;
@@ -107,6 +108,11 @@ export interface FirmProfile {
   udyamNumber: string;
   adminName: string;
   adminPhotoUrl?: string;
+}
+
+export interface UserPreferences {
+  adminPin: string;
+  darkMode: boolean;
 }
 
 export type TabKey = 'dashboard' | 'tenders' | 'emdbg' | 'settings';

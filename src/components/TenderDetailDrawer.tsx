@@ -39,6 +39,7 @@ const STAGE_OPTIONS: TenderStage[] = [
   'L1 / Won',
   'Lost (L2/L3)',
   'Cancelled / Retendered',
+  'Tender Not Filled',
 ];
 
 export function TenderDetailDrawer({
