@@ -12,7 +12,7 @@ import { DashboardTab } from './components/DashboardTab';
 import { EmdBgFormModal } from './components/EmdBgFormModal';
 import { EmdBgTab } from './components/EmdBgTab';
 import { Header, type CloudUserSummary } from './components/Header';
-import { LockScreen } from './components/LockScreen';
+import { LoginPage } from './components/LoginPage';
 import { MafItemModal } from './components/MafItemModal';
 import { MafStatusTab } from './components/MafStatusTab';
 import { MafTrackerFormModal } from './components/MafTrackerFormModal';
@@ -39,6 +39,9 @@ import type {
   TabKey,
   Tender,
   UserPreferences,
+  WhatsAppAlertLog,
+  WhatsAppMilestone,
+  WhatsAppSettings,
 } from './types/crm';
 import { computeNotifications } from './utils/calculations';
 import {
@@ -56,6 +59,8 @@ import {
   syncPreferencesToCloud,
   syncProfileToCloud,
   syncTenderToCloud,
+  syncWhatsAppAlertLogToCloud,
+  syncWhatsAppConfigToCloud,
   uploadMafDocumentFile,
 } from './utils/cloudSync';
 import {
@@ -65,6 +70,13 @@ import {
   mergeCloudTendersWithFiles,
 } from './utils/cloudSyncHelpers';
 import { findMatchingDailyTender } from './utils/mafCalculations';
+import {
+  buildTenderWhatsAppMessage,
+  buildWhatsAppMilestoneKey,
+  computePendingWhatsAppAlerts,
+  DEFAULT_WHATSAPP_SETTINGS,
+  normalizeIndianWhatsAppPhone,
+} from './utils/whatsappAlerts';
 
 interface ToastNotice {
   id: string;
@@ -131,9 +143,17 @@ export default function App() {
   const [firmProfile, setFirmProfile] = useState<FirmProfile>(DEFAULT_FIRM_PROFILE);
   const [adminPin, setAdminPin] = useState<string>('1234');
   const [darkMode, setDarkMode] = useState<boolean>(false);
+  const [whatsappSettings, setWhatsappSettings] = useState<WhatsAppSettings>(
+    DEFAULT_WHATSAPP_SETTINGS,
+  );
+  const [whatsappLogs, setWhatsappLogs] = useState<WhatsAppAlertLog[]>([]);
+  const [whatsappGatewayInfo, setWhatsappGatewayInfo] = useState<{
+    automatedConfigured: boolean;
+    provider: string;
+  }>({ automatedConfigured: false, provider: 'none' });
 
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
-  const [isLocked, setIsLocked] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   // Firebase Firestore State
@@ -164,6 +184,7 @@ export default function App() {
 
   // In-memory refs for async Firestore listeners and attachment payloads
   const attachmentFilesRef = useRef<Map<string, string>>(new Map());
+  const dispatchedWaKeysRef = useRef<Set<string>>(new Set());
   const stateRef = useRef({
     tenders,
     emdRecords,
@@ -171,6 +192,8 @@ export default function App() {
     firmProfile,
     adminPin,
     darkMode,
+    whatsappSettings,
+    firebaseUser,
   });
   useEffect(() => {
     stateRef.current = {
@@ -180,13 +203,55 @@ export default function App() {
       firmProfile,
       adminPin,
       darkMode,
+      whatsappSettings,
+      firebaseUser,
     };
-  }, [tenders, emdRecords, mafTrackers, firmProfile, adminPin, darkMode]);
+  }, [
+    tenders,
+    emdRecords,
+    mafTrackers,
+    firmProfile,
+    adminPin,
+    darkMode,
+    whatsappSettings,
+    firebaseUser,
+  ]);
+
+  const mergeWhatsappLogs = (
+    incoming: WhatsAppAlertLog[],
+    existing: WhatsAppAlertLog[],
+  ): WhatsAppAlertLog[] => {
+    const byKey = new Map<string, WhatsAppAlertLog>();
+    for (const item of [...incoming, ...existing]) {
+      if (item.milestone !== 'test' && item.milestoneKey) {
+        dispatchedWaKeysRef.current.add(item.milestoneKey);
+      }
+      const dedupeKey =
+        item.milestone === 'test' ? `id:${item.id}` : `mk:${item.milestoneKey || item.id}`;
+      if (!byKey.has(dedupeKey)) {
+        byKey.set(dedupeKey, item);
+      }
+    }
+    return Array.from(byKey.values())
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 200);
+  };
 
   // Apply Dark Mode class on root element (no localStorage)
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+
+  // Require fresh login if browser restores page from bfcache (tab reopen/back-forward cache)
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        setIsAuthenticated(false);
+      }
+    };
+    window.addEventListener('pageshow', handlePageShow);
+    return () => window.removeEventListener('pageshow', handlePageShow);
+  }, []);
 
   const showToast = (type: 'ok' | 'err', msg: string) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -242,9 +307,11 @@ export default function App() {
             mafTrackers: curMaf,
             adminPin: curPin,
             darkMode: curDark,
+            whatsappSettings: curWaSettings,
           } = stateRef.current;
           const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
           await backupAllToCloud(firebaseUser, curProfile, prefs, curTenders, curEmd, curMaf);
+          await syncWhatsAppConfigToCloud(firebaseUser, curWaSettings);
           if (!cancelled) {
             markSyncedNow();
             setCloudFeedback({
@@ -259,6 +326,12 @@ export default function App() {
           if (cloud.preferences) {
             setAdminPin(cloud.preferences.adminPin);
             setDarkMode(cloud.preferences.darkMode);
+          }
+          if (cloud.whatsappConfig) {
+            setWhatsappSettings(cloud.whatsappConfig);
+          }
+          if (cloud.whatsappAlerts.length > 0) {
+            setWhatsappLogs((prev) => mergeWhatsappLogs(cloud.whatsappAlerts, prev));
           }
           setTenders((prev) =>
             mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
@@ -285,6 +358,14 @@ export default function App() {
           onPreferences: (remotePrefs) => {
             setAdminPin(remotePrefs.adminPin);
             setDarkMode(remotePrefs.darkMode);
+            markSyncedNow();
+          },
+          onWhatsAppConfig: (remoteConfig) => {
+            setWhatsappSettings(remoteConfig);
+            markSyncedNow();
+          },
+          onWhatsAppAlerts: (remoteLogs) => {
+            setWhatsappLogs((prev) => mergeWhatsappLogs(remoteLogs, prev));
             markSyncedNow();
           },
           onTenders: (remoteTenders) => {
@@ -429,6 +510,143 @@ export default function App() {
         photoURL: firebaseUser.photoURL,
       }
     : null;
+
+  const dispatchWhatsAppMilestone = async (
+    tender: Tender,
+    milestone: WhatsAppMilestone | 'test',
+    explicitMilestoneKey?: string,
+  ): Promise<void> => {
+    const { whatsappSettings: curSettings, firebaseUser: curUser } = stateRef.current;
+    const milestoneKey =
+      explicitMilestoneKey ||
+      (milestone === 'test'
+        ? `wa_test_${Date.now()}`
+        : buildWhatsAppMilestoneKey(tender, milestone));
+
+    if (milestone !== 'test') {
+      dispatchedWaKeysRef.current.add(milestoneKey);
+    }
+
+    const message = buildTenderWhatsAppMessage(tender, milestone, curSettings.recipientName);
+    const normalizedPhone = normalizeIndianWhatsAppPhone(curSettings.recipientPhone);
+
+    let logEntry: WhatsAppAlertLog = {
+      id: milestone === 'test' ? milestoneKey : milestoneKey,
+      milestoneKey,
+      tenderRefId: tender.id,
+      tenderId: tender.tenderId,
+      milestone,
+      recipientName: curSettings.recipientName,
+      recipientPhone: normalizedPhone,
+      dueDateIso: tender.submissionDueDate,
+      status: 'manual_ready',
+      provider: 'manual_ready',
+      message,
+      createdAt: new Date().toISOString(),
+    };
+
+    try {
+      const res = await fetch('/api/notifications/whatsapp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          milestoneKey,
+          tenderRefId: tender.id,
+          tenderId: tender.tenderId,
+          milestone,
+          recipientName: curSettings.recipientName,
+          recipientPhone: curSettings.recipientPhone,
+          dueDateIso: tender.submissionDueDate,
+          message,
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          ok?: boolean;
+          deduplicated?: boolean;
+          delivered?: boolean;
+          logEntry?: WhatsAppAlertLog;
+        };
+        if (data.logEntry) {
+          logEntry = data.logEntry;
+        }
+        if (!data.deduplicated) {
+          const milestoneLabel =
+            milestone === 'urgent_4h'
+              ? '4h Urgent Reminder'
+              : milestone === 'test'
+                ? 'Test WhatsApp Alert'
+                : 'Alerts Entry (48h)';
+          showToast(
+            'ok',
+            data.delivered
+              ? `WhatsApp ${milestoneLabel} sent to ${curSettings.recipientName} (+${normalizedPhone}) for ${tender.tenderId}.`
+              : `WhatsApp ${milestoneLabel} prepared for ${curSettings.recipientName} (${tender.tenderId}). Open Alerts or Admin Settings to launch WhatsApp.`,
+          );
+        }
+      }
+    } catch {
+      // Keep local logEntry fallback if network temporarily interrupted
+    }
+
+    setWhatsappLogs((prev) => mergeWhatsappLogs([logEntry], prev));
+    if (curUser) {
+      void syncWhatsAppAlertLogToCloud(curUser, logEntry).catch(() => {
+        // Handled cleanly via subsequent cloud sync
+      });
+    }
+  };
+
+  // Load initial server WhatsApp gateway capabilities & persisted logs on authentication
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    const loadWhatsappStatus = async () => {
+      try {
+        const res = await fetch('/api/notifications/whatsapp/status');
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          provider?: string;
+          automatedConfigured?: boolean;
+          logs?: WhatsAppAlertLog[];
+        };
+        if (cancelled) return;
+        setWhatsappGatewayInfo({
+          automatedConfigured: Boolean(data.automatedConfigured),
+          provider: data.provider || 'none',
+        });
+        if (Array.isArray(data.logs) && data.logs.length > 0) {
+          setWhatsappLogs((prev) => mergeWhatsappLogs(data.logs!, prev));
+        }
+      } catch {
+        // Ignore transient network errors
+      }
+    };
+    void loadWhatsappStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated]);
+
+  // 2-Milestone WhatsApp Tender Alert Scheduler (checks immediately and every 30 seconds)
+  useEffect(() => {
+    if (!isAuthenticated || !whatsappSettings.enabled) return;
+
+    const evaluateAndDispatch = () => {
+      const pending = computePendingWhatsAppAlerts(
+        stateRef.current.tenders,
+        dispatchedWaKeysRef.current,
+        new Date(),
+      );
+      for (const item of pending) {
+        void dispatchWhatsAppMilestone(item.tender, item.milestone, item.milestoneKey);
+      }
+    };
+
+    evaluateAndDispatch();
+    const timer = window.setInterval(evaluateAndDispatch, 30_000);
+    return () => window.clearInterval(timer);
+  }, [isAuthenticated, whatsappSettings.enabled, tenders]);
 
   const notifications = useMemo(
     () => computeNotifications(tenders, emdRecords),
@@ -847,6 +1065,23 @@ export default function App() {
     void runCloudTask((user) => syncProfileToCloud(user, nextProfile));
   };
 
+  const handleSaveWhatsAppSettings = (nextSettings: WhatsAppSettings) => {
+    setWhatsappSettings(nextSettings);
+    void runCloudTask((user) => syncWhatsAppConfigToCloud(user, nextSettings));
+  };
+
+  const handleTriggerTestWhatsApp = async () => {
+    const sampleTender =
+      stateRef.current.tenders.find(
+        (t) => t.stage === 'Identified / Reviewing' || t.stage === 'Doc Preparation',
+      ) ?? stateRef.current.tenders[0];
+    if (!sampleTender) {
+      showToast('err', 'Add at least one tender first to generate a WhatsApp tender alert.');
+      return;
+    }
+    await dispatchWhatsAppMilestone(sampleTender, 'test');
+  };
+
   const handleToggleDarkMode = () => {
     setDarkMode((prev) => {
       const next = !prev;
@@ -857,11 +1092,14 @@ export default function App() {
     });
   };
 
-  const handleUpdatePin = (newPin: string) => {
-    setAdminPin(newPin);
-    void runCloudTask((user) =>
-      syncPreferencesToCloud(user, { adminPin: newPin, darkMode: stateRef.current.darkMode }),
-    );
+  const handleLogout = () => {
+    setIsAuthenticated(false);
+    setMobileMenuOpen(false);
+    setTenderModalTarget(undefined);
+    setSelectedTenderId(null);
+    setEmdModalTarget(undefined);
+    setMafTrackerModalTarget(undefined);
+    setMafItemModalTarget(null);
   };
 
   const handleNavigateFromNotification = (item: NotificationItem) => {
@@ -935,6 +1173,16 @@ export default function App() {
     );
   };
 
+  if (!isAuthenticated) {
+    return (
+      <LoginPage
+        onLoginSuccess={() => {
+          setIsAuthenticated(true);
+        }}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen flex bg-[#F8FAFC] dark:bg-[#0B1120] text-slate-900 dark:text-slate-100">
       <Sidebar
@@ -946,6 +1194,7 @@ export default function App() {
         emdCount={emdRecords.length}
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
+        onLogout={handleLogout}
       />
 
       <div className="flex-1 flex flex-col min-w-0">
@@ -954,8 +1203,11 @@ export default function App() {
           firmProfile={firmProfile}
           darkMode={darkMode}
           onToggleDarkMode={handleToggleDarkMode}
-          onLockScreen={() => setIsLocked(true)}
+          onLogout={handleLogout}
           notifications={notifications}
+          tenders={tenders}
+          whatsappSettings={whatsappSettings}
+          whatsappLogs={whatsappLogs}
           onNavigateFromNotification={handleNavigateFromNotification}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           cloudUser={cloudUserSummary}
@@ -1078,12 +1330,11 @@ export default function App() {
           {activeTab === 'settings' && (
             <SettingsTab
               profile={firmProfile}
-              currentPin={adminPin}
               tenders={tenders}
               emdRecords={emdRecords}
               mafTrackers={mafTrackers}
               onSaveProfile={handleSaveProfile}
-              onUpdatePin={handleUpdatePin}
+              onLogout={handleLogout}
               onImportBackup={handleImportBackup}
               onResetDemoData={handleResetDemoData}
               onClearAllData={handleClearAllData}
@@ -1095,6 +1346,11 @@ export default function App() {
               onDisconnectCloud={handleDisconnectCloud}
               onBackupToCloudNow={handleBackupToCloudNow}
               onRestoreFromCloud={handleRestoreFromCloud}
+              whatsappSettings={whatsappSettings}
+              whatsappLogs={whatsappLogs}
+              whatsappGatewayInfo={whatsappGatewayInfo}
+              onSaveWhatsAppSettings={handleSaveWhatsAppSettings}
+              onTriggerTestWhatsApp={handleTriggerTestWhatsApp}
             />
           )}
         </main>
@@ -1156,14 +1412,6 @@ export default function App() {
           onClose={() => setMafItemModalTarget(null)}
           onSave={(savedItem) => handleSaveMafItem(mafItemModalTarget.tracker.id, savedItem)}
           onUploadFile={handleUploadMafFile}
-        />
-      )}
-
-      {isLocked && (
-        <LockScreen
-          expectedPin={adminPin}
-          firmProfile={firmProfile}
-          onUnlock={() => setIsLocked(false)}
         />
       )}
 

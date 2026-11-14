@@ -99,6 +99,14 @@ service cloud.firestore {
       return status in ['Refunded / Released', 'Forfeited'];
     }
 
+    function isValidWhatsAppMilestone(milestone) {
+      return milestone in ['alert_48h', 'urgent_4h', 'test'];
+    }
+
+    function isValidWhatsAppStatus(status) {
+      return status in ['sent', 'manual_ready', 'failed'];
+    }
+
     // -------------------------------------------------------------------------
     // Entity Validation Blueprints (No existing()/diff() inside helpers!)
     // -------------------------------------------------------------------------
@@ -477,6 +485,107 @@ service cloud.firestore {
         data.clientCreatedAt.size() <= 40 &&
         data.clientUpdatedAt is string &&
         data.clientUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWhatsAppConfig(data, userId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'enabled',
+          'recipientName',
+          'recipientPhone',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'enabled',
+          'recipientName',
+          'recipientPhone',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        data.enabled is bool &&
+        data.recipientName is string &&
+        data.recipientName.size() >= 1 &&
+        data.recipientName.size() <= 100 &&
+        data.recipientPhone is string &&
+        data.recipientPhone.size() >= 10 &&
+        data.recipientPhone.size() <= 20 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWhatsAppAlertLog(data, userId, alertId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'id',
+          'milestoneKey',
+          'tenderRefId',
+          'tenderId',
+          'milestone',
+          'recipientName',
+          'recipientPhone',
+          'dueDateIso',
+          'status',
+          'provider',
+          'message',
+          'clientCreatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'id',
+          'milestoneKey',
+          'tenderRefId',
+          'tenderId',
+          'milestone',
+          'recipientName',
+          'recipientPhone',
+          'dueDateIso',
+          'status',
+          'provider',
+          'message',
+          'clientCreatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        isValidId(data.id) &&
+        data.id == alertId &&
+        data.milestoneKey is string &&
+        data.milestoneKey.size() >= 1 &&
+        data.milestoneKey.size() <= 150 &&
+        data.tenderRefId is string &&
+        data.tenderRefId.size() <= 128 &&
+        data.tenderId is string &&
+        data.tenderId.size() >= 1 &&
+        data.tenderId.size() <= 120 &&
+        data.milestone is string &&
+        data.milestone.size() <= 24 &&
+        isValidWhatsAppMilestone(data.milestone) &&
+        data.recipientName is string &&
+        data.recipientName.size() <= 100 &&
+        data.recipientPhone is string &&
+        data.recipientPhone.size() <= 24 &&
+        data.dueDateIso is string &&
+        data.dueDateIso.size() <= 40 &&
+        data.status is string &&
+        data.status.size() <= 24 &&
+        isValidWhatsAppStatus(data.status) &&
+        data.provider is string &&
+        data.provider.size() <= 40 &&
+        data.message is string &&
+        data.message.size() <= 3000 &&
+        data.clientCreatedAt is string &&
+        data.clientCreatedAt.size() <= 40 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -861,6 +970,98 @@ service cloud.firestore {
         allow delete: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(mafDocId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /whatsappConfig/{configId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          configId == 'default' &&
+          isOwner(userId) &&
+          isValidWhatsAppConfig(incoming(), userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          configId == 'default' &&
+          isValidWhatsAppConfig(incoming(), userId) &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'ownerUid',
+                'enabled',
+                'recipientName',
+                'recipientPhone',
+                'createdAt',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /whatsappAlerts/{alertId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(alertId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(alertId) &&
+          isOwner(userId) &&
+          isValidWhatsAppAlertLog(incoming(), userId, alertId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(alertId) &&
+          isValidWhatsAppAlertLog(incoming(), userId, alertId) &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'status',
+                'provider',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(alertId) &&
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
       }

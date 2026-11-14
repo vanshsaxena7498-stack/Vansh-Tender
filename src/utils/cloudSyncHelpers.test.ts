@@ -218,3 +218,40 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
   assert.equal(merged[0].itemsMAF[1].mafDocumentUrl, 'https://drive.google.com/file/d/abc/view');
 });
 
+test('buildCloudWhatsAppConfigPayload and buildCloudWhatsAppAlertLogPayload validate blueprint fields', async () => {
+  const { buildCloudWhatsAppConfigPayload, buildCloudWhatsAppAlertLogPayload } = await import(
+    './cloudSyncHelpers'
+  );
+  const cfgPayload = buildCloudWhatsAppConfigPayload(
+    { enabled: true, recipientName: 'Vansh', recipientPhone: '9717690890' },
+    'uid-1',
+    TOKEN,
+  );
+  assert.equal(cfgPayload.ownerUid, 'uid-1');
+  assert.equal(cfgPayload.enabled, true);
+  assert.equal(cfgPayload.recipientName, 'Vansh');
+  assert.equal(cfgPayload.recipientPhone, '9717690890');
+
+  const logPayload = buildCloudWhatsAppAlertLogPayload(
+    {
+      id: 'wa_tnd1_urgent_4h',
+      milestoneKey: 'wa_tnd1_urgent_4h',
+      tenderRefId: 'tnd-1',
+      tenderId: 'GEM/2026/B/123',
+      milestone: 'urgent_4h',
+      recipientName: 'Vansh',
+      recipientPhone: '919717690890',
+      dueDateIso: '2026-11-15T14:00',
+      status: 'manual_ready',
+      provider: 'manual_ready',
+      message: 'URGENT TENDER REMINDER',
+      createdAt: '2026-11-15T10:05:00.000Z',
+    },
+    'uid-1',
+    TOKEN,
+  );
+  assert.equal(logPayload.ownerUid, 'uid-1');
+  assert.equal(logPayload.milestone, 'urgent_4h');
+  assert.equal(logPayload.recipientPhone, '919717690890');
+});
+

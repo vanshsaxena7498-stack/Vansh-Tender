@@ -536,6 +536,140 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "WhatsAppConfig": {
+      "title": "WhatsAppConfig",
+      "description": "WhatsApp recipient and automated tender alert notification settings.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "recipientName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "recipientPhone": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 20
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "enabled",
+        "recipientName",
+        "recipientPhone",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WhatsAppAlertLog": {
+      "title": "WhatsAppAlertLog",
+      "description": "Deduplicated WhatsApp milestone dispatch records (48h alert entry and 4h urgent reminder) per tender.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "milestoneKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "tenderRefId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "tenderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "milestone": {
+          "type": "string",
+          "enum": ["alert_48h", "urgent_4h", "test"],
+          "maxLength": 24
+        },
+        "recipientName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "recipientPhone": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "dueDateIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "status": {
+          "type": "string",
+          "enum": ["sent", "manual_ready", "failed"],
+          "maxLength": 24
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 3000
+        },
+        "clientCreatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "id",
+        "milestoneKey",
+        "tenderRefId",
+        "tenderId",
+        "milestone",
+        "recipientName",
+        "recipientPhone",
+        "dueDateIso",
+        "status",
+        "provider",
+        "message",
+        "clientCreatedAt",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -586,6 +720,18 @@
         "$ref": "#/entities/MafTracker"
       },
       "description": "Tender-OEM MAF tracker records with nested itemsMAF line items stored exclusively in Firestore."
+    },
+    "/users/{userId}/whatsappConfig/{configId}": {
+      "schema": {
+        "$ref": "#/entities/WhatsAppConfig"
+      },
+      "description": "User WhatsApp recipient and auto-alert settings."
+    },
+    "/users/{userId}/whatsappAlerts/{alertId}": {
+      "schema": {
+        "$ref": "#/entities/WhatsAppAlertLog"
+      },
+      "description": "Deduplicated 48h and 4h tender WhatsApp notification logs."
     }
   }
 }

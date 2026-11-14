@@ -3,6 +3,7 @@ import {
   BarChart3,
   FileSpreadsheet,
   Landmark,
+  LogOut,
   Settings,
   ShieldCheck,
   User,
@@ -19,6 +20,7 @@ interface SidebarProps {
   emdCount: number;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  onLogout?: () => void;
 }
 
 const NAV_ITEMS: { key: TabKey; label: string; icon: typeof BarChart3 }[] = [
@@ -38,6 +40,7 @@ export function Sidebar({
   emdCount,
   mobileOpen,
   onCloseMobile,
+  onLogout,
 }: SidebarProps) {
   const [imgError, setImgError] = useState(false);
   const hasPhoto = Boolean(firmProfile.adminPhotoUrl) && !imgError;
@@ -119,16 +122,31 @@ export function Sidebar({
         })}
       </nav>
 
-      <div className="px-4 py-4 border-t border-slate-800 text-xs text-slate-400 space-y-1">
-        <p className="font-medium text-slate-200 truncate" title={firmProfile.firmName}>
-          {firmProfile.firmName}
-        </p>
-        <p className="font-mono-num text-slate-400 truncate">
-          GSTIN: {firmProfile.gstin || 'Not Set'}
-        </p>
-        <p className="text-slate-500 truncate">
-          Admin: {firmProfile.adminName || 'Tender Desk'}
-        </p>
+      <div className="px-4 py-4 border-t border-slate-800 text-xs text-slate-400 space-y-2.5">
+        <div className="space-y-1">
+          <p className="font-medium text-slate-200 truncate" title={firmProfile.firmName}>
+            {firmProfile.firmName}
+          </p>
+          <p className="font-mono-num text-slate-400 truncate">
+            GSTIN: {firmProfile.gstin || 'Not Set'}
+          </p>
+          <p className="text-slate-500 truncate">
+            Admin: {firmProfile.adminName || 'Tender Desk'}
+          </p>
+        </div>
+        {onLogout && (
+          <button
+            type="button"
+            onClick={() => {
+              onCloseMobile();
+              onLogout();
+            }}
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-700 bg-slate-800/70 hover:bg-slate-800 text-slate-200 text-xs font-medium transition-colors"
+          >
+            <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Logout</span>
+          </button>
+        )}
       </div>
     </div>
   );

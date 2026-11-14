@@ -6,6 +6,8 @@ import type {
   MafTrackerRecord,
   Tender,
   UserPreferences,
+  WhatsAppAlertLog,
+  WhatsAppSettings,
 } from '../types/crm';
 
 export const CLOUD_LIMITS = {
@@ -350,4 +352,47 @@ export function mergeCloudMafTrackersWithFiles(
     };
   });
 }
+
+export function buildCloudWhatsAppConfigPayload<TTime>(
+  config: WhatsAppSettings,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    enabled: Boolean(config.enabled),
+    recipientName: clampStr(config.recipientName.trim() || 'Vansh', 100),
+    recipientPhone: clampStr(config.recipientPhone.trim() || '9717690890', 20),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
+
+export function buildCloudWhatsAppAlertLogPayload<TTime>(
+  log: WhatsAppAlertLog,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  const safeId = sanitizeDocId(log.id);
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    id: safeId,
+    milestoneKey: clampStr(log.milestoneKey || safeId, 150),
+    tenderRefId: clampStr(log.tenderRefId, 128),
+    tenderId: clampStr(log.tenderId || safeId, 120),
+    milestone: log.milestone,
+    recipientName: clampStr(log.recipientName || 'Vansh', 100),
+    recipientPhone: clampStr(log.recipientPhone || '919717690890', 24),
+    dueDateIso: clampStr(log.dueDateIso, 40),
+    status: log.status,
+    provider: clampStr(log.provider || 'manual_ready', 40),
+    message: clampStr(log.message, 3000),
+    clientCreatedAt: clampStr(log.createdAt || new Date().toISOString(), 40),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
+
 

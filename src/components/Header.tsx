@@ -6,13 +6,26 @@ import {
   Cloud,
   CloudAlert,
   CloudCheck,
-  Lock,
+  LogOut,
   Menu,
+  MessageCircle,
   Moon,
   RefreshCw,
   Sun,
 } from 'lucide-react';
-import type { FirmProfile, NotificationItem, TabKey } from '../types/crm';
+import type {
+  FirmProfile,
+  NotificationItem,
+  TabKey,
+  Tender,
+  WhatsAppAlertLog,
+  WhatsAppSettings,
+} from '../types/crm';
+import {
+  buildTenderWhatsAppMessage,
+  buildWhatsAppWebUrl,
+  DEFAULT_WHATSAPP_SETTINGS,
+} from '../utils/whatsappAlerts';
 
 export interface CloudUserSummary {
   uid: string;
@@ -26,7 +39,7 @@ interface HeaderProps {
   firmProfile: FirmProfile;
   darkMode: boolean;
   onToggleDarkMode: () => void;
-  onLockScreen: () => void;
+  onLogout: () => void;
   notifications: NotificationItem[];
   onNavigateFromNotification: (item: NotificationItem) => void;
   onOpenMobileMenu: () => void;
@@ -35,6 +48,9 @@ interface HeaderProps {
   cloudError?: boolean;
   onConnectCloud: () => void;
   onOpenCloudSettings: () => void;
+  tenders?: Tender[];
+  whatsappSettings?: WhatsAppSettings;
+  whatsappLogs?: WhatsAppAlertLog[];
 }
 
 const TAB_TITLES: Record<TabKey, string> = {
@@ -50,7 +66,7 @@ export function Header({
   firmProfile,
   darkMode,
   onToggleDarkMode,
-  onLockScreen,
+  onLogout,
   notifications,
   onNavigateFromNotification,
   onOpenMobileMenu,
@@ -59,6 +75,9 @@ export function Header({
   cloudError = false,
   onConnectCloud,
   onOpenCloudSettings,
+  tenders = [],
+  whatsappSettings = DEFAULT_WHATSAPP_SETTINGS,
+  whatsappLogs = [],
 }: HeaderProps) {
   const [notifOpen, setNotifOpen] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -177,43 +196,86 @@ export function Header({
                 </div>
               ) : (
                 <ul className="max-h-80 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
-                  {notifications.map((item) => (
-                    <li key={item.id}>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onNavigateFromNotification(item);
-                          setNotifOpen(false);
-                        }}
-                        className="w-full text-left px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/70 transition-colors flex items-start justify-between gap-3"
-                      >
-                        <div className="flex items-start gap-2.5 min-w-0">
-                          {item.category === 'deadline_48h' ? (
-                            <Clock className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
-                          ) : (
-                            <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-                          )}
-                          <div className="min-w-0">
-                            <p className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
-                              {item.title}
-                            </p>
-                            <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
-                              {item.subtitle}
-                            </p>
-                          </div>
-                        </div>
-                        <span
-                          className={`font-mono-num text-[11px] font-medium whitespace-nowrap shrink-0 ${
-                            item.category === 'deadline_48h'
-                              ? 'text-amber-700 dark:text-amber-400'
-                              : 'text-red-600 dark:text-red-400'
-                          }`}
+                  {notifications.map((item) => {
+                    const linkedTender =
+                      item.category === 'deadline_48h'
+                        ? tenders.find((t) => t.id === item.targetId)
+                        : undefined;
+                    const tenderWaLogs = linkedTender
+                      ? whatsappLogs.filter((l) => l.tenderRefId === linkedTender.id)
+                      : [];
+                    const has4h = tenderWaLogs.some((l) => l.milestone === 'urgent_4h');
+                    const has48h = tenderWaLogs.some((l) => l.milestone === 'alert_48h');
+                    const waUrl = linkedTender
+                      ? buildWhatsAppWebUrl(
+                          whatsappSettings.recipientPhone,
+                          buildTenderWhatsAppMessage(
+                            linkedTender,
+                            has4h ? 'urgent_4h' : 'alert_48h',
+                            whatsappSettings.recipientName,
+                          ),
+                        )
+                      : null;
+
+                    return (
+                      <li key={item.id} className="px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/70 transition-colors">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onNavigateFromNotification(item);
+                            setNotifOpen(false);
+                          }}
+                          className="w-full text-left flex items-start justify-between gap-3"
                         >
-                          {item.daysOrHoursLabel}
-                        </span>
-                      </button>
-                    </li>
-                  ))}
+                          <div className="flex items-start gap-2.5 min-w-0">
+                            {item.category === 'deadline_48h' ? (
+                              <Clock className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                            ) : (
+                              <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
+                            )}
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                {item.title}
+                              </p>
+                              <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                                {item.subtitle}
+                              </p>
+                            </div>
+                          </div>
+                          <span
+                            className={`font-mono-num text-[11px] font-medium whitespace-nowrap shrink-0 ${
+                              item.category === 'deadline_48h'
+                                ? 'text-amber-700 dark:text-amber-400'
+                                : 'text-red-600 dark:text-red-400'
+                            }`}
+                          >
+                            {item.daysOrHoursLabel}
+                          </span>
+                        </button>
+
+                        {linkedTender && waUrl && (
+                          <div className="mt-2 pl-6 flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                              {has4h
+                                ? 'WhatsApp 2/2 (4h Urgent Triggered)'
+                                : has48h
+                                  ? 'WhatsApp 1/2 (48h Alert Triggered)'
+                                  : 'WhatsApp Alert Ready'}
+                            </span>
+                            <a
+                              href={waUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 rounded-md border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60"
+                            >
+                              <MessageCircle className="h-3 w-3" aria-hidden="true" />
+                              <span>WhatsApp {whatsappSettings.recipientName}</span>
+                            </a>
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>
@@ -241,11 +303,11 @@ export function Header({
 
         <button
           type="button"
-          onClick={onLockScreen}
-          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium whitespace-nowrap shrink-0 transition-colors"
+          onClick={onLogout}
+          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
         >
-          <Lock className="h-3.5 w-3.5" aria-hidden="true" />
-          <span>Lock Screen</span>
+          <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+          <span>Log Out</span>
         </button>
       </div>
     </header>

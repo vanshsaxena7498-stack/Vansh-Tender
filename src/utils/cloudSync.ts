@@ -21,6 +21,8 @@ import type {
   MafTrackerRecord,
   Tender,
   UserPreferences,
+  WhatsAppAlertLog,
+  WhatsAppSettings,
 } from '../types/crm';
 import { MAX_ATTACHMENT_BYTES, readAttachmentForFirestore } from './attachments';
 import {
@@ -30,6 +32,8 @@ import {
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudTenderPayload,
+  buildCloudWhatsAppAlertLogPayload,
+  buildCloudWhatsAppConfigPayload,
   sanitizeDocId,
 } from './cloudSyncHelpers';
 import { validateMafUploadFile } from './mafCalculations';
@@ -143,6 +147,31 @@ function docToPreferences(data: Record<string, unknown>): UserPreferences {
   };
 }
 
+function docToWhatsAppConfig(data: Record<string, unknown>): WhatsAppSettings {
+  return {
+    enabled: data.enabled !== false,
+    recipientName: String(data.recipientName ?? 'Vansh'),
+    recipientPhone: String(data.recipientPhone ?? '9717690890'),
+  };
+}
+
+function docToWhatsAppAlertLog(data: Record<string, unknown>): WhatsAppAlertLog {
+  return {
+    id: String(data.id ?? ''),
+    milestoneKey: String(data.milestoneKey ?? data.id ?? ''),
+    tenderRefId: String(data.tenderRefId ?? ''),
+    tenderId: String(data.tenderId ?? ''),
+    milestone: (data.milestone as WhatsAppAlertLog['milestone']) || 'alert_48h',
+    recipientName: String(data.recipientName ?? 'Vansh'),
+    recipientPhone: String(data.recipientPhone ?? '919717690890'),
+    dueDateIso: String(data.dueDateIso ?? ''),
+    status: (data.status as WhatsAppAlertLog['status']) || 'manual_ready',
+    provider: String(data.provider ?? 'manual_ready'),
+    message: String(data.message ?? ''),
+    createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
+  };
+}
+
 export async function ensureUserRootDocument(user: User): Promise<void> {
   if (ensuredUserUids.has(user.uid)) return;
   const userPath = `users/${user.uid}`;
@@ -208,6 +237,51 @@ export async function syncProfileToCloud(user: User, profile: FirmProfile): Prom
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
     const payload = buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt);
+    await setDoc(ref, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function syncWhatsAppConfigToCloud(
+  user: User,
+  config: WhatsAppSettings,
+): Promise<void> {
+  await ensureUserRootDocument(user);
+  const path = `users/${user.uid}/whatsappConfig/default`;
+  const ref = doc(db, 'users', user.uid, 'whatsappConfig', 'default');
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const payload = buildCloudWhatsAppConfigPayload(
+      config,
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    await setDoc(ref, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function syncWhatsAppAlertLogToCloud(
+  user: User,
+  log: WhatsAppAlertLog,
+): Promise<void> {
+  await ensureUserRootDocument(user);
+  const safeId = sanitizeDocId(log.id);
+  const path = `users/${user.uid}/whatsappAlerts/${safeId}`;
+  const ref = doc(db, 'users', user.uid, 'whatsappAlerts', safeId);
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const payload = buildCloudWhatsAppAlertLogPayload(
+      { ...log, id: safeId },
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
     await setDoc(ref, payload);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
@@ -476,6 +550,8 @@ export async function fetchAttachmentFileDataUrl(
 export async function fetchAllFromCloud(uid: string): Promise<{
   profile: FirmProfile | null;
   preferences: UserPreferences | null;
+  whatsappConfig: WhatsAppSettings | null;
+  whatsappAlerts: WhatsAppAlertLog[];
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
@@ -483,6 +559,8 @@ export async function fetchAllFromCloud(uid: string): Promise<{
 }> {
   const profilePath = `users/${uid}/profile/firm`;
   const prefsPath = `users/${uid}/settings/preferences`;
+  const waConfigPath = `users/${uid}/whatsappConfig/default`;
+  const waAlertsPath = `users/${uid}/whatsappAlerts`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
   const mafPath = `users/${uid}/maf_tracker`;
@@ -490,6 +568,8 @@ export async function fetchAllFromCloud(uid: string): Promise<{
 
   let profile: FirmProfile | null = null;
   let preferences: UserPreferences | null = null;
+  let whatsappConfig: WhatsAppSettings | null = null;
+  let whatsappAlerts: WhatsAppAlertLog[] = [];
   let tenders: Tender[] = [];
   let emdRecords: EmdBgRecord[] = [];
   let mafTrackers: MafTrackerRecord[] = [];
@@ -553,7 +633,38 @@ export async function fetchAllFromCloud(uid: string): Promise<{
     handleFirestoreError(error, OperationType.LIST, filesPath);
   }
 
-  return { profile, preferences, tenders, emdRecords, mafTrackers, attachmentFiles };
+  try {
+    const waConfigSnap = await getDoc(doc(db, 'users', uid, 'whatsappConfig', 'default'));
+    if (waConfigSnap.exists()) {
+      whatsappConfig = docToWhatsAppConfig(waConfigSnap.data());
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, waConfigPath);
+  }
+
+  try {
+    const waAlertsQuery = query(
+      collection(db, 'users', uid, 'whatsappAlerts'),
+      where('ownerUid', '==', uid),
+    );
+    const waSnap = await getDocs(waAlertsQuery);
+    whatsappAlerts = waSnap.docs
+      .map((d) => docToWhatsAppAlertLog(d.data()))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, waAlertsPath);
+  }
+
+  return {
+    profile,
+    preferences,
+    whatsappConfig,
+    whatsappAlerts,
+    tenders,
+    emdRecords,
+    mafTrackers,
+    attachmentFiles,
+  };
 }
 
 export async function backupAllToCloud(
@@ -648,6 +759,8 @@ export function subscribeToUserCloudData(
   callbacks: {
     onProfile: (profile: FirmProfile) => void;
     onPreferences: (prefs: UserPreferences) => void;
+    onWhatsAppConfig?: (config: WhatsAppSettings) => void;
+    onWhatsAppAlerts?: (logs: WhatsAppAlertLog[]) => void;
     onTenders: (tenders: Tender[]) => void;
     onEmdRecords: (records: EmdBgRecord[]) => void;
     onMafTrackers: (trackers: MafTrackerRecord[]) => void;
@@ -657,6 +770,8 @@ export function subscribeToUserCloudData(
 ): Unsubscribe {
   const profilePath = `users/${uid}/profile/firm`;
   const prefsPath = `users/${uid}/settings/preferences`;
+  const waConfigPath = `users/${uid}/whatsappConfig/default`;
+  const waAlertsPath = `users/${uid}/whatsappAlerts`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
   const mafPath = `users/${uid}/maf_tracker`;
@@ -757,9 +872,46 @@ export function subscribeToUserCloudData(
     },
   );
 
+  const unsubWaConfig = onSnapshot(
+    doc(db, 'users', uid, 'whatsappConfig', 'default'),
+    (snap) => {
+      if (snap.exists() && callbacks.onWhatsAppConfig) {
+        callbacks.onWhatsAppConfig(docToWhatsAppConfig(snap.data()));
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, waConfigPath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
+  const unsubWaAlerts = onSnapshot(
+    query(collection(db, 'users', uid, 'whatsappAlerts'), where('ownerUid', '==', uid)),
+    (snap) => {
+      if (callbacks.onWhatsAppAlerts) {
+        const sorted = snap.docs
+          .map((d) => docToWhatsAppAlertLog(d.data()))
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        callbacks.onWhatsAppAlerts(sorted);
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, waAlertsPath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
   return () => {
     unsubProfile();
     unsubPrefs();
+    unsubWaConfig();
+    unsubWaAlerts();
     unsubTenders();
     unsubEmd();
     unsubMaf();

@@ -377,3 +377,91 @@ test('MafTracker Firestore rules enforce ownership, bounded itemsMAF (<= 50), an
   );
 });
 
+const VALID_WA_MILESTONES = new Set(['alert_48h', 'urgent_4h', 'test']);
+const VALID_WA_STATUS = new Set(['sent', 'manual_ready', 'failed']);
+
+function isValidWhatsAppAlertLog(
+  data: Record<string, unknown>,
+  auth: AuthContext,
+  userId: string,
+  alertId: string,
+): boolean {
+  const keys = [
+    'ownerUid',
+    'id',
+    'milestoneKey',
+    'tenderRefId',
+    'tenderId',
+    'milestone',
+    'recipientName',
+    'recipientPhone',
+    'dueDateIso',
+    'status',
+    'provider',
+    'message',
+    'clientCreatedAt',
+    'createdAt',
+    'updatedAt',
+  ];
+  if (!hasExactKeys(data, keys, keys)) return false;
+  return (
+    isValidId(data.ownerUid) &&
+    data.ownerUid === userId &&
+    data.ownerUid === auth.uid &&
+    isValidId(data.id) &&
+    data.id === alertId &&
+    typeof data.milestoneKey === 'string' &&
+    data.milestoneKey.length >= 1 &&
+    data.milestoneKey.length <= 150 &&
+    typeof data.tenderId === 'string' &&
+    data.tenderId.length >= 1 &&
+    data.tenderId.length <= 120 &&
+    typeof data.milestone === 'string' &&
+    VALID_WA_MILESTONES.has(data.milestone) &&
+    typeof data.status === 'string' &&
+    VALID_WA_STATUS.has(data.status) &&
+    typeof data.message === 'string' &&
+    data.message.length <= 3000 &&
+    data.createdAt === SERVER_TIME &&
+    data.updatedAt === SERVER_TIME
+  );
+}
+
+test('WhatsAppAlertLog Firestore rules enforce ownership, milestone/status enums, and reject shadow fields', () => {
+  const verifiedUser: AuthContext = {
+    uid: 'u2',
+    token: { email: 'user@example.com', email_verified: true },
+  };
+  const validLog: Record<string, unknown> = {
+    ownerUid: 'u2',
+    id: 'wa_t1_urgent_4h',
+    milestoneKey: 'wa_t1_urgent_4h',
+    tenderRefId: 't1',
+    tenderId: 'GEM/2026/B/1001',
+    milestone: 'urgent_4h',
+    recipientName: 'Vansh',
+    recipientPhone: '919717690890',
+    dueDateIso: '2026-11-15T15:00',
+    status: 'manual_ready',
+    provider: 'manual_ready',
+    message: 'Urgent reminder',
+    clientCreatedAt: '2026-11-15T11:30:00Z',
+    createdAt: SERVER_TIME,
+    updatedAt: SERVER_TIME,
+  };
+  assert.equal(isValidWhatsAppAlertLog(validLog, verifiedUser, 'u2', 'wa_t1_urgent_4h'), true);
+  assert.equal(
+    isValidWhatsAppAlertLog({ ...validLog, milestone: 'spam' }, verifiedUser, 'u2', 'wa_t1_urgent_4h'),
+    false,
+  );
+  assert.equal(
+    isValidWhatsAppAlertLog({ ...validLog, extraFlag: true }, verifiedUser, 'u2', 'wa_t1_urgent_4h'),
+    false,
+  );
+  assert.equal(
+    isValidWhatsAppAlertLog({ ...validLog, ownerUid: 'victim' }, verifiedUser, 'u2', 'wa_t1_urgent_4h'),
+    false,
+  );
+});
+
+

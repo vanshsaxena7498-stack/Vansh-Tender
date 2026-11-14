@@ -5,12 +5,16 @@ import {
   Cloud,
   CloudDownload,
   CloudUpload,
+  Copy,
   Database,
   Download,
-  KeyRound,
+  ExternalLink,
   LogOut,
+  MessageCircle,
   RefreshCw,
   RotateCcw,
+  Send,
+  ShieldCheck,
   Trash2,
   Upload,
   User,
@@ -21,19 +25,21 @@ import type {
   FirmProfile,
   MafTrackerRecord,
   Tender,
+  WhatsAppAlertLog,
+  WhatsAppSettings,
 } from '../types/crm';
 import { compressProfilePhotoDataUrl } from '../utils/attachments';
-import { buildCsvContent, downloadTextFile } from '../utils/formatters';
+import { buildCsvContent, downloadTextFile, formatDateTime } from '../utils/formatters';
+import { buildWhatsAppWebUrl, normalizeIndianWhatsAppPhone } from '../utils/whatsappAlerts';
 import type { CloudUserSummary } from './Header';
 
 interface SettingsTabProps {
   profile: FirmProfile;
-  currentPin: string;
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
   onSaveProfile: (profile: FirmProfile) => void;
-  onUpdatePin: (newPin: string) => void;
+  onLogout: () => void;
   onImportBackup: (payload: CrmBackupPayload) => void;
   onResetDemoData: () => void;
   onClearAllData: () => void;
@@ -45,16 +51,20 @@ interface SettingsTabProps {
   onDisconnectCloud: () => void;
   onBackupToCloudNow: () => void;
   onRestoreFromCloud: () => void;
+  whatsappSettings: WhatsAppSettings;
+  whatsappLogs: WhatsAppAlertLog[];
+  whatsappGatewayInfo: { automatedConfigured: boolean; provider: string };
+  onSaveWhatsAppSettings: (settings: WhatsAppSettings) => void;
+  onTriggerTestWhatsApp: () => Promise<void> | void;
 }
 
 export function SettingsTab({
   profile,
-  currentPin,
   tenders,
   emdRecords,
   mafTrackers,
   onSaveProfile,
-  onUpdatePin,
+  onLogout,
   onImportBackup,
   onResetDemoData,
   onClearAllData,
@@ -66,6 +76,11 @@ export function SettingsTab({
   onDisconnectCloud,
   onBackupToCloudNow,
   onRestoreFromCloud,
+  whatsappSettings,
+  whatsappLogs,
+  whatsappGatewayInfo,
+  onSaveWhatsAppSettings,
+  onTriggerTestWhatsApp,
 }: SettingsTabProps) {
   const [firmName, setFirmName] = useState(profile.firmName);
   const [gstin, setGstin] = useState(profile.gstin);
@@ -83,17 +98,61 @@ export function SettingsTab({
     setAdminPhotoUrl(profile.adminPhotoUrl ?? '');
   }, [profile]);
 
-  const [oldPin, setOldPin] = useState('');
-  const [newPin, setNewPin] = useState('');
-  const [confirmPin, setConfirmPin] = useState('');
-  const [pinFeedback, setPinFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(
-    null,
-  );
-
   const [backupMsg, setBackupMsg] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
   const [confirmAction, setConfirmAction] = useState<'reset' | 'clear' | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
+
+  const [waEnabled, setWaEnabled] = useState(whatsappSettings.enabled);
+  const [waName, setWaName] = useState(whatsappSettings.recipientName);
+  const [waPhone, setWaPhone] = useState(whatsappSettings.recipientPhone);
+  const [waSavedMsg, setWaSavedMsg] = useState('');
+  const [waErrorMsg, setWaErrorMsg] = useState('');
+  const [waTesting, setWaTesting] = useState(false);
+  const [copiedLogId, setCopiedLogId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setWaEnabled(whatsappSettings.enabled);
+    setWaName(whatsappSettings.recipientName);
+    setWaPhone(whatsappSettings.recipientPhone);
+  }, [whatsappSettings]);
+
+  const handleSaveWhatsAppForm = (e: FormEvent) => {
+    e.preventDefault();
+    const digits = normalizeIndianWhatsAppPhone(waPhone);
+    if (digits.length < 10) {
+      setWaErrorMsg('Please enter a valid 10-digit WhatsApp mobile number.');
+      return;
+    }
+    setWaErrorMsg('');
+    onSaveWhatsAppSettings({
+      enabled: waEnabled,
+      recipientName: waName.trim() || 'Vansh',
+      recipientPhone: waPhone.trim() || '9717690890',
+    });
+    setWaSavedMsg('WhatsApp alert settings saved & synced.');
+    setTimeout(() => setWaSavedMsg(''), 3000);
+  };
+
+  const handleSendTestAlert = async () => {
+    setWaErrorMsg('');
+    setWaTesting(true);
+    try {
+      await onTriggerTestWhatsApp();
+    } finally {
+      setWaTesting(false);
+    }
+  };
+
+  const handleCopyMessage = async (logId: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedLogId(logId);
+      setTimeout(() => setCopiedLogId((prev) => (prev === logId ? null : prev)), 2200);
+    } catch {
+      // Clipboard blocked in restricted context
+    }
+  };
 
   const handlePhotoUpload = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -144,28 +203,6 @@ export function SettingsTab({
     });
     setProfileSavedMsg('Firm profile updated and persisted.');
     setTimeout(() => setProfileSavedMsg(''), 3000);
-  };
-
-  const handlePinSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    if (oldPin !== currentPin) {
-      setPinFeedback({ type: 'err', msg: 'Current Admin PIN does not match.' });
-      return;
-    }
-    if (!/^\d{4}$/.test(newPin)) {
-      setPinFeedback({ type: 'err', msg: 'New PIN must be exactly 4 numeric digits.' });
-      return;
-    }
-    if (newPin !== confirmPin) {
-      setPinFeedback({ type: 'err', msg: 'New PIN and confirmation do not match.' });
-      return;
-    }
-    onUpdatePin(newPin);
-    setOldPin('');
-    setNewPin('');
-    setConfirmPin('');
-    setPinFeedback({ type: 'ok', msg: 'Admin Lock Screen PIN updated successfully.' });
-    setTimeout(() => setPinFeedback(null), 3500);
   };
 
   const handleDownloadJsonBackup = () => {
@@ -561,102 +598,292 @@ export function SettingsTab({
         </form>
       </section>
 
-      {/* Security Settings */}
-      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
-        <div className="flex items-center gap-2.5 pb-3 border-b border-slate-200 dark:border-slate-800">
-          <KeyRound className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
-          <div>
-            <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
-              Security Lock PIN
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Customize your 4-digit Lock Screen PIN (default is 1234)
+      {/* Session Access & Auto-Logout Security */}
+      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 flex flex-col justify-between space-y-5">
+        <div className="space-y-5">
+          <div className="flex items-center gap-2.5 pb-3 border-b border-slate-200 dark:border-slate-800">
+            <ShieldCheck className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                CRM Login &amp; Session Security
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Strict per-tab authentication for Vansh Tender Software
+              </p>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 p-4 space-y-3 text-xs">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-slate-500 dark:text-slate-400">Authorized CRM Username</span>
+              <span className="font-mono-num font-semibold text-slate-900 dark:text-slate-100">
+                VanshSales
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-slate-500 dark:text-slate-400">Tab Close / Reopen Policy</span>
+              <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
+                Login Required Every Session
+              </span>
+            </div>
+            <p className="text-slate-600 dark:text-slate-400 leading-relaxed pt-1">
+              Session access is kept strictly in memory (zero browser storage). Closing the CRM tab or clicking Log Out immediately requires signing in again on the Vansh Tender Software login screen.
             </p>
           </div>
         </div>
 
-        <form onSubmit={handlePinSubmit} className="space-y-4">
-          <div>
-            <label
-              htmlFor="set-old-pin"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
-            >
-              Current 4-Digit PIN
-            </label>
-            <input
-              id="set-old-pin"
-              type="password"
-              inputMode="numeric"
-              maxLength={4}
-              required
-              value={oldPin}
-              onChange={(e) => setOldPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-              className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+        <div className="flex items-center justify-end pt-2">
+          <button
+            type="button"
+            onClick={onLogout}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium cursor-pointer"
+          >
+            <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Log Out to Login Screen</span>
+          </button>
+        </div>
+      </section>
+
+      {/* WhatsApp Tender Alert Dispatch (2-Milestone Notifications) */}
+      <section className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
+          <div className="flex items-center gap-2.5">
+            <MessageCircle
+              className="h-5 w-5 text-emerald-600 dark:text-emerald-400"
+              aria-hidden="true"
             />
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                WhatsApp Tender Alert Dispatch ({waName.trim() || 'Vansh'} · {waPhone.trim() || '9717690890'})
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Sends complete tender details &amp; filing deadline twice per alert tender: (1) on Alerts entry (&le;48h), and (2) 4 hours before deadline
+              </p>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <span
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-medium ${
+              whatsappGatewayInfo.automatedConfigured
+                ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                : 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300'
+            }`}
+          >
+            {whatsappGatewayInfo.automatedConfigured
+              ? `Automated Gateway: ${whatsappGatewayInfo.provider.toUpperCase()}`
+              : 'Manual WhatsApp Link Mode (Configure Meta/Twilio/Webhook in .env)'}
+          </span>
+        </div>
+
+        <form onSubmit={handleSaveWhatsAppForm} className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
             <div>
               <label
-                htmlFor="set-new-pin"
+                htmlFor="wa-recipient-name"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                New 4-Digit PIN
+                Recipient Name
               </label>
               <input
-                id="set-new-pin"
-                type="password"
-                inputMode="numeric"
-                maxLength={4}
+                id="wa-recipient-name"
+                type="text"
                 required
-                value={newPin}
-                onChange={(e) => setNewPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                value={waName}
+                onChange={(e) => setWaName(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
               />
             </div>
 
             <div>
               <label
-                htmlFor="set-confirm-pin"
+                htmlFor="wa-recipient-phone"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                Confirm New PIN
+                WhatsApp Mobile Number
               </label>
               <input
-                id="set-confirm-pin"
-                type="password"
-                inputMode="numeric"
-                maxLength={4}
+                id="wa-recipient-phone"
+                type="tel"
                 required
-                value={confirmPin}
-                onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                value={waPhone}
+                onChange={(e) => setWaPhone(e.target.value)}
+                placeholder="9717690890"
                 className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 px-3.5 py-2">
+              <label
+                htmlFor="wa-auto-dispatch"
+                className="text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer select-none"
+              >
+                Auto-Dispatch on Milestones
+              </label>
+              <input
+                id="wa-auto-dispatch"
+                type="checkbox"
+                checked={waEnabled}
+                onChange={(e) => setWaEnabled(e.target.checked)}
+                className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-600 cursor-pointer"
               />
             </div>
           </div>
 
-          {pinFeedback && (
-            <p
-              role="alert"
-              className={`text-xs font-medium ${
-                pinFeedback.type === 'ok'
-                  ? 'text-emerald-700 dark:text-emerald-400'
-                  : 'text-red-600 dark:text-red-400'
-              }`}
-            >
-              {pinFeedback.msg}
+          {waErrorMsg && (
+            <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+              {waErrorMsg}
             </p>
           )}
 
-          <div className="flex justify-end pt-2">
-            <button
-              type="submit"
-              className="px-4 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium"
-            >
-              Update Admin PIN
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              {waSavedMsg ? (
+                <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
+                  <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+                  {waSavedMsg}
+                </span>
+              ) : (
+                <span>
+                  Normalized WhatsApp Target: +{normalizeIndianWhatsAppPhone(waPhone || '9717690890')}
+                </span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => void handleSendTestAlert()}
+                disabled={waTesting}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 disabled:opacity-60 text-emerald-800 dark:text-emerald-300 text-xs font-medium cursor-pointer"
+              >
+                <Send className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>{waTesting ? 'Sending Test...' : 'Send Test WhatsApp Alert'}</span>
+              </button>
+
+              <button
+                type="submit"
+                className="px-4 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium cursor-pointer"
+              >
+                Save WhatsApp Settings
+              </button>
+            </div>
           </div>
         </form>
+
+        {/* Milestone Dispatch History */}
+        <div className="space-y-2.5 pt-2">
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+              Milestone Dispatch Log ({whatsappLogs.length})
+            </h3>
+            <span className="text-[11px] text-slate-500 dark:text-slate-400">
+              Deduplicated by Tender + Due Date + Milestone (48h Entry &amp; 4h Urgent)
+            </span>
+          </div>
+
+          {whatsappLogs.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 px-4 py-6 text-center text-xs text-slate-500 dark:text-slate-400">
+              No WhatsApp tender alerts dispatched yet. Active pre-submission tenders due within 48 hours automatically generate 1st Alert Entry &amp; 2nd Final 4h Urgent dispatches here.
+            </div>
+          ) : (
+            <div className="overflow-x-auto max-h-72 overflow-y-auto rounded-lg border border-slate-200 dark:border-slate-800">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead className="sticky top-0 bg-slate-50 dark:bg-slate-800/90 text-[11px] uppercase tracking-wider text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-700">
+                  <tr>
+                    <th className="py-2.5 px-3 font-semibold">Milestone</th>
+                    <th className="py-2.5 px-3 font-semibold">Tender ID &amp; Filing Due</th>
+                    <th className="py-2.5 px-3 font-semibold">Recipient</th>
+                    <th className="py-2.5 px-3 font-semibold">Status</th>
+                    <th className="py-2.5 px-3 font-semibold">Triggered At</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {whatsappLogs.map((log) => (
+                    <tr key={log.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                      <td className="py-2.5 px-3 whitespace-nowrap">
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded font-medium text-[11px] ${
+                            log.milestone === 'urgent_4h'
+                              ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
+                              : log.milestone === 'test'
+                                ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
+                                : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                          }`}
+                        >
+                          {log.milestone === 'urgent_4h'
+                            ? '2/2 · Final 4h Urgent'
+                            : log.milestone === 'test'
+                              ? 'Test Dispatch'
+                              : '1/2 · Alert Entry (48h)'}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <p className="font-mono-num font-semibold text-slate-900 dark:text-slate-100">
+                          {log.tenderId}
+                        </p>
+                        {log.dueDateIso && (
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Due: {formatDateTime(log.dueDateIso)}
+                          </p>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 whitespace-nowrap">
+                        <p className="font-medium text-slate-800 dark:text-slate-200">
+                          {log.recipientName}
+                        </p>
+                        <p className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400">
+                          +{log.recipientPhone}
+                        </p>
+                      </td>
+                      <td className="py-2.5 px-3 whitespace-nowrap">
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded font-medium text-[11px] ${
+                            log.status === 'sent'
+                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                              : log.status === 'failed'
+                                ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
+                                : 'bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300'
+                          }`}
+                        >
+                          {log.status === 'sent'
+                            ? 'Sent via Gateway'
+                            : log.status === 'failed'
+                              ? 'Gateway Failed'
+                              : 'Ready for WhatsApp'}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 whitespace-nowrap text-slate-600 dark:text-slate-400">
+                        {new Date(log.createdAt).toLocaleString('en-IN')}
+                      </td>
+                      <td className="py-2.5 px-3 whitespace-nowrap text-right">
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyMessage(log.id, log.message)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200"
+                          >
+                            <Copy className="h-3 w-3" aria-hidden="true" />
+                            <span>{copiedLogId === log.id ? 'Copied' : 'Copy'}</span>
+                          </button>
+                          <a
+                            href={buildWhatsAppWebUrl(log.recipientPhone, log.message)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-medium"
+                          >
+                            <span>Open WhatsApp</span>
+                            <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                          </a>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </section>
 
       {/* Data Management, Backup & Restore */}

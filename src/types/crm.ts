@@ -163,6 +163,29 @@ export interface NotificationItem {
   targetId: string;
 }
 
+export type WhatsAppMilestone = 'alert_48h' | 'urgent_4h';
+
+export interface WhatsAppSettings {
+  enabled: boolean;
+  recipientName: string;
+  recipientPhone: string;
+}
+
+export interface WhatsAppAlertLog {
+  id: string;
+  milestoneKey: string;
+  tenderRefId: string;
+  tenderId: string;
+  milestone: WhatsAppMilestone | 'test';
+  recipientName: string;
+  recipientPhone: string;
+  dueDateIso: string;
+  status: 'sent' | 'manual_ready' | 'failed';
+  provider: string;
+  message: string;
+  createdAt: string;
+}
+
 export interface CrmBackupPayload {
   version: number;
   exportedAt: string;
@@ -171,3 +194,4 @@ export interface CrmBackupPayload {
   emdRecords: EmdBgRecord[];
   mafTrackers?: MafTrackerRecord[];
 }
+
