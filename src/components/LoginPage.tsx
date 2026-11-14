@@ -24,6 +24,17 @@ import {
   User,
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
+import { validateLoginCredentials } from '../utils/authCredentials';
+
+async function safeParseJsonResponse<T>(res: Response): Promise<T | null> {
+  try {
+    const text = await res.text();
+    if (!text) return null;
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
 
 interface LoginPageProps {
   onLoginSuccess: (rememberMe: boolean) => void;
@@ -91,6 +102,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
   const [resetError, setResetError] = useState('');
   const [smtpUnconfiguredNotice, setSmtpUnconfiguredNotice] = useState(false);
   const [otpInput, setOtpInput] = useState('');
+  const [otpToken, setOtpToken] = useState('');
   const [googleIdToken, setGoogleIdToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -117,7 +129,19 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: trimmedUser, password }),
       });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
+      const data = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+      if (res.status === 404 || !data) {
+        const localCheck = validateLoginCredentials(trimmedUser, password);
+        if (localCheck.ok) {
+          onLoginSuccess(rememberMe);
+        } else {
+          setErrorMsg(
+            localCheck.error ||
+              'Invalid username or password. Please check your credentials and try again.',
+          );
+        }
+        return;
+      }
       if (!res.ok || !data.ok) {
         setErrorMsg(
           data.error || 'Invalid username or password. Please check your credentials and try again.',
@@ -126,7 +150,14 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
       }
       onLoginSuccess(rememberMe);
     } catch {
-      setErrorMsg('Unable to reach authentication server. Please retry.');
+      const localCheck = validateLoginCredentials(trimmedUser, password);
+      if (localCheck.ok) {
+        onLoginSuccess(rememberMe);
+      } else {
+        setErrorMsg(
+          localCheck.error || 'Unable to reach authentication server. Please retry.',
+        );
+      }
     } finally {
       setSubmitting(false);
     }
@@ -140,6 +171,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
     setResetNotice('');
     setSmtpUnconfiguredNotice(false);
     setOtpInput('');
+    setOtpToken('');
     setGoogleIdToken('');
     setNewPassword('');
     setConfirmNewPassword('');
@@ -156,16 +188,26 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ targetEmail: RECOVERY_EMAIL }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJsonResponse<{
         ok?: boolean;
         emailSent?: boolean;
         providerConfigured?: boolean;
+        otpToken?: string;
         message?: string;
         error?: string;
-      };
+      }>(res);
+      if (res.status === 404 || !data) {
+        setResetError(
+          'Password reset API endpoint (/api/auth/forgot-password) returned 404 on this host. Please redeploy with Vercel Serverless API enabled or verify locally.',
+        );
+        return;
+      }
       if (!res.ok || !data.ok) {
         setResetError(data.error || `Could not send verification email to ${RECOVERY_EMAIL}.`);
         return;
+      }
+      if (data.otpToken) {
+        setOtpToken(data.otpToken);
       }
       if (data.emailSent) {
         setResetNotice(data.message || `6-digit reset code sent to ${RECOVERY_EMAIL}.`);
@@ -234,12 +276,14 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         body: JSON.stringify(
           resetMode === 'verify_google'
             ? { mode: 'google', firebaseIdToken: googleIdToken, newPassword }
-            : { mode: 'otp', otp: otpInput.trim(), newPassword },
+            : { mode: 'otp', otp: otpInput.trim(), otpToken, newPassword },
         ),
       });
-      const data = (await res.json()) as { ok?: boolean; message?: string; error?: string };
-      if (!res.ok || !data.ok) {
-        setResetError(data.error || 'Could not reset password.');
+      const data = await safeParseJsonResponse<{ ok?: boolean; message?: string; error?: string }>(
+        res,
+      );
+      if (!res.ok || !data?.ok) {
+        setResetError(data?.error || 'Could not reset password.');
         return;
       }
       setResetMode('none');
