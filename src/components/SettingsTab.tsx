@@ -5,10 +5,12 @@ import {
   Cloud,
   CloudDownload,
   CloudUpload,
+  Code2,
   Copy,
   Database,
   Download,
   ExternalLink,
+  FileSpreadsheet,
   LogOut,
   MessageCircle,
   RefreshCw,
@@ -23,13 +25,19 @@ import type {
   CrmBackupPayload,
   EmdBgRecord,
   FirmProfile,
+  GoogleSheetSettings,
   MafTrackerRecord,
+  SheetSyncStatus,
   Tender,
   WhatsAppAlertLog,
   WhatsAppSettings,
 } from '../types/crm';
 import { compressProfilePhotoDataUrl } from '../utils/attachments';
 import { buildCsvContent, downloadTextFile, formatDateTime } from '../utils/formatters';
+import {
+  GOOGLE_APPS_SCRIPT_CODE_GS,
+  isValidAppsScriptWebhookUrl,
+} from '../utils/googleSheetSync';
 import { buildWhatsAppWebUrl, normalizeIndianWhatsAppPhone } from '../utils/whatsappAlerts';
 import type { CloudUserSummary } from './Header';
 
@@ -56,6 +64,12 @@ interface SettingsTabProps {
   whatsappGatewayInfo: { automatedConfigured: boolean; provider: string };
   onSaveWhatsAppSettings: (settings: WhatsAppSettings) => void;
   onTriggerTestWhatsApp: () => Promise<void> | void;
+  sheetSettings: GoogleSheetSettings;
+  sheetSyncStatus: SheetSyncStatus;
+  sheetSyncError: string | null;
+  onSaveSheetSettings: (settings: GoogleSheetSettings) => Promise<void> | void;
+  onTestSheetWebhook: (settingsOverride?: GoogleSheetSettings) => Promise<void>;
+  onFullSyncToSheet: (settingsOverride?: GoogleSheetSettings) => Promise<void>;
 }
 
 export function SettingsTab({
@@ -81,6 +95,12 @@ export function SettingsTab({
   whatsappGatewayInfo,
   onSaveWhatsAppSettings,
   onTriggerTestWhatsApp,
+  sheetSettings,
+  sheetSyncStatus,
+  sheetSyncError,
+  onSaveSheetSettings,
+  onTestSheetWebhook,
+  onFullSyncToSheet,
 }: SettingsTabProps) {
   const [firmName, setFirmName] = useState(profile.firmName);
   const [gstin, setGstin] = useState(profile.gstin);
@@ -149,6 +169,57 @@ export function SettingsTab({
       await navigator.clipboard.writeText(text);
       setCopiedLogId(logId);
       setTimeout(() => setCopiedLogId((prev) => (prev === logId ? null : prev)), 2200);
+    } catch {
+      // Clipboard blocked in restricted context
+    }
+  };
+
+  const [sheetEnabled, setSheetEnabled] = useState(sheetSettings.enabled);
+  const [sheetUrl, setSheetUrl] = useState(sheetSettings.webhookUrl);
+  const [sheetNameInput, setSheetNameInput] = useState(
+    sheetSettings.sheetName || 'MIS Monthly Report',
+  );
+  const [sheetSavedMsg, setSheetSavedMsg] = useState('');
+  const [sheetFormError, setSheetFormError] = useState('');
+  const [showCodeGs, setShowCodeGs] = useState(false);
+  const [copiedCodeGs, setCopiedCodeGs] = useState(false);
+
+  useEffect(() => {
+    setSheetEnabled(sheetSettings.enabled);
+    setSheetUrl(sheetSettings.webhookUrl);
+    setSheetNameInput(sheetSettings.sheetName || 'MIS Monthly Report');
+  }, [sheetSettings]);
+
+  const handleSaveSheetForm = async (e: FormEvent) => {
+    e.preventDefault();
+    const trimmedUrl = sheetUrl.trim();
+    if (trimmedUrl && !isValidAppsScriptWebhookUrl(trimmedUrl)) {
+      setSheetFormError(
+        'Enter a valid Google Apps Script Web App URL (https://script.google.com/macros/s/.../exec).',
+      );
+      return;
+    }
+    setSheetFormError('');
+    const nextConfig: GoogleSheetSettings = {
+      enabled: sheetEnabled,
+      webhookUrl: trimmedUrl,
+      sheetName: sheetNameInput.trim() || 'MIS Monthly Report',
+      lastSyncedAt: sheetSettings.lastSyncedAt || '',
+    };
+    await onSaveSheetSettings(nextConfig);
+    setSheetSavedMsg(
+      trimmedUrl
+        ? 'Webhook saved! Triggering initial sync check...'
+        : 'Google Sheet webhook cleared.',
+    );
+    setTimeout(() => setSheetSavedMsg(''), 3500);
+  };
+
+  const handleCopyCodeGs = async () => {
+    try {
+      await navigator.clipboard.writeText(GOOGLE_APPS_SCRIPT_CODE_GS);
+      setCopiedCodeGs(true);
+      setTimeout(() => setCopiedCodeGs(false), 2400);
     } catch {
       // Clipboard blocked in restricted context
     }
@@ -882,6 +953,250 @@ export function SettingsTab({
                 </tbody>
               </table>
             </div>
+          )}
+        </div>
+      </section>
+
+      {/* Google Sheet ("MIS Monthly Report") Real-Time Webhook Sync */}
+      <section
+        id="google-sheet-sync-section"
+        className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
+          <div className="flex items-center gap-2.5">
+            <FileSpreadsheet
+              className="h-5 w-5 text-emerald-600 dark:text-emerald-400"
+              aria-hidden="true"
+            />
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Google Sheet Real-Time Sync (&ldquo;{sheetNameInput.trim() || 'MIS Monthly Report'}&rdquo;)
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Pushes CREATE, UPDATE &amp; DELETE events for Daily Tenders, Executive MIS Summary counts, and EMD/BG Tracker rows to your Google Apps Script Web App
+              </p>
+            </div>
+          </div>
+
+          <span
+            data-testid="settings-sheet-status-pill"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-medium ${
+              sheetSyncStatus === 'error'
+                ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                : sheetSyncStatus === 'synced' || sheetSyncStatus === 'idle'
+                  ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                  : sheetSyncStatus === 'syncing'
+                    ? 'bg-blue-50 dark:bg-blue-950/40 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                    : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+            }`}
+          >
+            {sheetSyncStatus === 'syncing'
+              ? 'Syncing to Google Sheet...'
+              : sheetSyncStatus === 'synced'
+                ? `Sheet Synced${sheetSettings.lastSyncedAt ? ` · ${new Date(sheetSettings.lastSyncedAt).toLocaleTimeString('en-IN')}` : ''}`
+                : sheetSyncStatus === 'idle'
+                  ? 'Webhook Ready (Auto-Sync On)'
+                  : sheetSyncStatus === 'error'
+                    ? 'Sheet Webhook Issue'
+                    : 'Not Connected Yet'}
+          </span>
+        </div>
+
+        <form onSubmit={(e) => void handleSaveSheetForm(e)} className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+            <div className="md:col-span-2">
+              <label
+                htmlFor="sheet-webhook-url"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Google Apps Script Webhook URL
+              </label>
+              <input
+                id="sheet-webhook-url"
+                type="url"
+                value={sheetUrl}
+                onChange={(e) => setSheetUrl(e.target.value)}
+                placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+                className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="sheet-name-label"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Connected Sheet Name
+              </label>
+              <input
+                id="sheet-name-label"
+                type="text"
+                value={sheetNameInput}
+                onChange={(e) => setSheetNameInput(e.target.value)}
+                placeholder="MIS Monthly Report"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 px-3.5 py-2.5">
+              <label
+                htmlFor="sheet-auto-sync"
+                className="text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer select-none"
+              >
+                Auto-Sync CRM Changes
+              </label>
+              <input
+                id="sheet-auto-sync"
+                type="checkbox"
+                checked={sheetEnabled}
+                onChange={(e) => setSheetEnabled(e.target.checked)}
+                className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-600 cursor-pointer"
+              />
+            </div>
+          </div>
+
+          {(sheetFormError || sheetSyncError) && (
+            <div
+              role="alert"
+              className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-3.5 py-2.5 text-xs text-red-700 dark:text-red-300"
+            >
+              {sheetFormError || sheetSyncError}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              {sheetSavedMsg ? (
+                <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
+                  <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+                  {sheetSavedMsg}
+                </span>
+              ) : sheetSettings.lastSyncedAt ? (
+                <span>
+                  Last successful Sheet push: {formatDateTime(sheetSettings.lastSyncedAt)}
+                </span>
+              ) : (
+                <span>
+                  Deploy <code className="font-mono-num">Code.gs</code> as Web App (Access: Anyone) and paste the URL above.
+                </span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  const candidate: GoogleSheetSettings = {
+                    enabled: sheetEnabled,
+                    webhookUrl: sheetUrl.trim(),
+                    sheetName: sheetNameInput.trim() || 'MIS Monthly Report',
+                    lastSyncedAt: sheetSettings.lastSyncedAt || '',
+                  };
+                  if (!isValidAppsScriptWebhookUrl(candidate.webhookUrl)) {
+                    setSheetFormError(
+                      'Enter a valid Google Apps Script URL (https://script.google.com/macros/s/.../exec) before testing.',
+                    );
+                    return;
+                  }
+                  setSheetFormError('');
+                  void onTestSheetWebhook(candidate);
+                }}
+                disabled={sheetSyncStatus === 'syncing'}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-60 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+              >
+                <Send className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Test Webhook</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const candidate: GoogleSheetSettings = {
+                    enabled: sheetEnabled,
+                    webhookUrl: sheetUrl.trim(),
+                    sheetName: sheetNameInput.trim() || 'MIS Monthly Report',
+                    lastSyncedAt: sheetSettings.lastSyncedAt || '',
+                  };
+                  if (!isValidAppsScriptWebhookUrl(candidate.webhookUrl)) {
+                    setSheetFormError(
+                      'Enter a valid Google Apps Script URL (https://script.google.com/macros/s/.../exec) before syncing.',
+                    );
+                    return;
+                  }
+                  setSheetFormError('');
+                  void onFullSyncToSheet(candidate);
+                }}
+                disabled={sheetSyncStatus === 'syncing'}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 disabled:opacity-60 text-xs font-medium text-emerald-800 dark:text-emerald-300 cursor-pointer"
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 ${sheetSyncStatus === 'syncing' ? 'animate-spin' : ''}`}
+                  aria-hidden="true"
+                />
+                <span>Sync All to Sheet Now</span>
+              </button>
+
+              <button
+                type="submit"
+                disabled={sheetSyncStatus === 'syncing'}
+                className="px-4 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-medium cursor-pointer"
+              >
+                Save Webhook Settings
+              </button>
+            </div>
+          </div>
+        </form>
+
+        {/* Apps Script Code.gs Snippet Panel */}
+        <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/60 overflow-hidden">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-b border-slate-200 dark:border-slate-800">
+            <button
+              type="button"
+              onClick={() => setShowCodeGs((prev) => !prev)}
+              className="inline-flex items-center gap-2 text-xs font-semibold text-slate-800 dark:text-slate-200 cursor-pointer"
+            >
+              <Code2 className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+              <span>
+                {showCodeGs
+                  ? 'Hide Google Apps Script (Code.gs) Snippet'
+                  : 'View Google Apps Script (Code.gs) Setup Snippet'}
+              </span>
+            </button>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleCopyCodeGs()}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-[11px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+              >
+                <Copy className="h-3 w-3" aria-hidden="true" />
+                <span>{copiedCodeGs ? 'Copied Code.gs' : 'Copy Code.gs'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  downloadTextFile('Code.gs', GOOGLE_APPS_SCRIPT_CODE_GS, 'text/plain;charset=utf-8')
+                }
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-[11px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+              >
+                <Download className="h-3 w-3" aria-hidden="true" />
+                <span>Download Code.gs</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="px-4 py-2.5 text-[11px] text-slate-600 dark:text-slate-400 flex flex-wrap gap-x-4 gap-y-1 border-b border-slate-200/70 dark:border-slate-800/70">
+            <span>1. Open your Google Sheet (&ldquo;MIS Monthly Report&rdquo;)</span>
+            <span>2. Extensions &rarr; Apps Script &rarr; Paste Code.gs</span>
+            <span>3. Deploy &rarr; New deployment &rarr; Web app (Execute as: Me, Access: Anyone)</span>
+            <span>4. Paste the /exec URL above &amp; click Save</span>
+          </div>
+
+          {showCodeGs && (
+            <pre className="p-4 max-h-80 overflow-auto text-[11px] leading-relaxed font-mono-num text-slate-800 dark:text-slate-200 bg-white dark:bg-slate-950">
+              <code>{GOOGLE_APPS_SCRIPT_CODE_GS}</code>
+            </pre>
           )}
         </div>
       </section>

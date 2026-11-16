@@ -142,12 +142,17 @@ export function resolveAndFilterMafTrackers(
 
     const items = tracker.itemsMAF ?? [];
     const matchedItems = iq
-      ? items.filter(
-          (item) =>
+      ? items.filter((item) => {
+          const contact = getMafContactDetails(item);
+          return (
             item.itemName.toLowerCase().includes(iq) ||
             item.oemName.toLowerCase().includes(iq) ||
-            (item.oemContact ?? '').toLowerCase().includes(iq),
-        )
+            contact.concernedPersonName.toLowerCase().includes(iq) ||
+            contact.contactNo.toLowerCase().includes(iq) ||
+            contact.mailId.toLowerCase().includes(iq) ||
+            (item.oemContact ?? '').toLowerCase().includes(iq)
+          );
+        })
       : items;
 
     if (iq && matchedItems.length === 0) {
@@ -236,4 +241,40 @@ export function findMatchingDailyTender(
 
 export function createMafItemId(seedIndex = 0): string {
   return `mafitem-${Date.now()}-${seedIndex}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+export function getMafRequestedDate(
+  item: Pick<MafLineItem, 'mafRequestedDate' | 'validityDate'>,
+): string {
+  return (item.mafRequestedDate?.trim() || item.validityDate?.trim() || '');
+}
+
+export function getMafContactDetails(
+  item: Pick<MafLineItem, 'concernedPersonName' | 'contactNo' | 'mailId' | 'oemContact'>,
+): {
+  concernedPersonName: string;
+  contactNo: string;
+  mailId: string;
+} {
+  let concernedPersonName = (item.concernedPersonName ?? '').trim();
+  let contactNo = (item.contactNo ?? '').trim();
+  const mailId = (item.mailId ?? '').trim();
+
+  if (!concernedPersonName && !contactNo && item.oemContact?.trim()) {
+    const raw = item.oemContact.trim();
+    const parts = raw
+      .split('·')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parts.length >= 2) {
+      concernedPersonName = parts[0];
+      contactNo = parts.slice(1).join(' · ');
+    } else if (/^[\d+\s()-]{6,}$/.test(raw)) {
+      contactNo = raw;
+    } else {
+      concernedPersonName = raw;
+    }
+  }
+
+  return { concernedPersonName, contactNo, mailId };
 }

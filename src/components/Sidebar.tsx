@@ -4,6 +4,7 @@ import {
   FileSpreadsheet,
   Landmark,
   LogOut,
+  ScanSearch,
   Settings,
   ShieldCheck,
   User,
@@ -25,6 +26,7 @@ interface SidebarProps {
 
 const NAV_ITEMS: { key: TabKey; label: string; icon: typeof BarChart3 }[] = [
   { key: 'dashboard', label: 'Executive Dashboard', icon: BarChart3 },
+  { key: 'bidsearch', label: 'Bid Search', icon: ScanSearch },
   { key: 'tenders', label: 'Daily Tender Data', icon: FileSpreadsheet },
   { key: 'maf', label: 'MAF Status', icon: ShieldCheck },
   { key: 'emdbg', label: 'EMD & BG Tracker', icon: Landmark },

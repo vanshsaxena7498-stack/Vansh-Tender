@@ -6,6 +6,7 @@ import {
   Cloud,
   CloudAlert,
   CloudCheck,
+  FileSpreadsheet,
   LogOut,
   Menu,
   MessageCircle,
@@ -16,6 +17,7 @@ import {
 import type {
   FirmProfile,
   NotificationItem,
+  SheetSyncStatus,
   TabKey,
   Tender,
   WhatsAppAlertLog,
@@ -48,6 +50,9 @@ interface HeaderProps {
   cloudError?: boolean;
   onConnectCloud: () => void;
   onOpenCloudSettings: () => void;
+  sheetSyncStatus?: SheetSyncStatus;
+  sheetSyncError?: string | null;
+  onOpenSheetSettings?: () => void;
   tenders?: Tender[];
   whatsappSettings?: WhatsAppSettings;
   whatsappLogs?: WhatsAppAlertLog[];
@@ -55,6 +60,7 @@ interface HeaderProps {
 
 const TAB_TITLES: Record<TabKey, string> = {
   dashboard: 'Monthly Executive Dashboard',
+  bidsearch: 'Bid Search · GeM PDF Scanner',
   tenders: 'Daily Tender Operations',
   maf: 'MAF Status',
   emdbg: 'EMD & Bank Guarantee Tracker',
@@ -75,6 +81,9 @@ export function Header({
   cloudError = false,
   onConnectCloud,
   onOpenCloudSettings,
+  sheetSyncStatus = 'unconfigured',
+  sheetSyncError = null,
+  onOpenSheetSettings,
   tenders = [],
   whatsappSettings = DEFAULT_WHATSAPP_SETTINGS,
   whatsappLogs = [],
@@ -154,6 +163,80 @@ export function Header({
             <>
               <Cloud className="h-4 w-4 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
               <span className="hidden sm:inline">Cloud Backup</span>
+            </>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenSheetSettings ?? onOpenCloudSettings}
+          title={
+            sheetSyncStatus === 'error'
+              ? sheetSyncError || 'Google Sheet sync error - open settings'
+              : sheetSyncStatus === 'synced'
+                ? 'MIS Monthly Report Google Sheet synced'
+                : sheetSyncStatus === 'idle'
+                  ? 'Google Sheet webhook configured and ready'
+                  : 'Configure Google Sheet MIS Monthly Report webhook'
+          }
+          aria-label={
+            sheetSyncStatus === 'error'
+              ? 'Google Sheet sync issue'
+              : sheetSyncStatus === 'synced'
+                ? 'Sheet Synced'
+                : sheetSyncStatus === 'syncing'
+                  ? 'Sheet Syncing'
+                  : sheetSyncStatus === 'idle'
+                    ? 'Google Sheet Ready'
+                    : 'Configure Google Sheet Sync'
+          }
+          data-testid="sheet-sync-badge"
+          className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+            sheetSyncStatus === 'error'
+              ? 'border-red-200 dark:border-red-800 bg-red-50/80 dark:bg-red-950/40 text-red-700 dark:text-red-300 hover:bg-red-100/70 dark:hover:bg-red-950/60'
+              : sheetSyncStatus === 'synced' || sheetSyncStatus === 'idle'
+                ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/50'
+                : sheetSyncStatus === 'syncing'
+                  ? 'border-blue-200 dark:border-blue-800 bg-blue-50/70 dark:bg-blue-950/30 text-blue-800 dark:text-blue-300'
+                  : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'
+          }`}
+        >
+          {sheetSyncStatus === 'syncing' ? (
+            <>
+              <RefreshCw
+                className="h-4 w-4 animate-spin text-blue-600 dark:text-blue-400"
+                aria-hidden="true"
+              />
+              <span className="hidden sm:inline">Sheet Syncing...</span>
+            </>
+          ) : sheetSyncStatus === 'error' ? (
+            <>
+              <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400" aria-hidden="true" />
+              <span className="hidden sm:inline">Sheet Error</span>
+            </>
+          ) : sheetSyncStatus === 'synced' ? (
+            <>
+              <FileSpreadsheet
+                className="h-4 w-4 text-emerald-600 dark:text-emerald-400"
+                aria-hidden="true"
+              />
+              <span className="hidden sm:inline">Sheet Synced</span>
+            </>
+          ) : sheetSyncStatus === 'idle' ? (
+            <>
+              <FileSpreadsheet
+                className="h-4 w-4 text-emerald-600 dark:text-emerald-400"
+                aria-hidden="true"
+              />
+              <span className="hidden sm:inline">Sheet Ready</span>
+            </>
+          ) : (
+            <>
+              <FileSpreadsheet
+                className="h-4 w-4 text-slate-500 dark:text-slate-400"
+                aria-hidden="true"
+              />
+              <span className="hidden sm:inline">Sheet Sync</span>
             </>
           )}
         </button>

@@ -2,6 +2,7 @@ import type {
   AttachmentItem,
   EmdBgRecord,
   FirmProfile,
+  GoogleSheetSettings,
   MafLineItem,
   MafTrackerRecord,
   Tender,
@@ -34,6 +35,9 @@ export const CLOUD_LIMITS = {
   MAF_ITEM_NAME_MAX: 220,
   MAF_OEM_NAME_MAX: 150,
   MAF_CONTACT_MAX: 120,
+  MAF_PERSON_NAME_MAX: 120,
+  MAF_PHONE_MAX: 40,
+  MAF_EMAIL_MAX: 160,
   MAF_QTY_MAX: 60,
   MAF_URL_MAX: 2000,
   MAF_REMARKS_MAX: 500,
@@ -280,14 +284,26 @@ export function mergeCloudEmdWithFiles(
 export function sanitizeMafLineItemForCloud(item: MafLineItem): MafLineItem {
   const rawUrl = typeof item.mafDocumentUrl === 'string' ? item.mafDocumentUrl.trim() : '';
   const safeUrl = rawUrl.startsWith('data:') ? '' : clampStr(rawUrl, CLOUD_LIMITS.MAF_URL_MAX);
+  const concernedPersonName = clampStr(item.concernedPersonName, CLOUD_LIMITS.MAF_PERSON_NAME_MAX);
+  const contactNo = clampStr(item.contactNo, CLOUD_LIMITS.MAF_PHONE_MAX);
+  const mailId = clampStr(item.mailId, CLOUD_LIMITS.MAF_EMAIL_MAX);
+  const fallbackOemContact =
+    item.oemContact ??
+    ([concernedPersonName, contactNo].filter(Boolean).join(' · ') || '');
   return {
     itemId: sanitizeDocId(item.itemId),
     itemName: clampStr(item.itemName.trim() || 'Item', CLOUD_LIMITS.MAF_ITEM_NAME_MAX),
     requiredQuantity: clampStr(item.requiredQuantity, CLOUD_LIMITS.MAF_QTY_MAX),
     oemName: clampStr(item.oemName.trim() || 'OEM', CLOUD_LIMITS.MAF_OEM_NAME_MAX),
-    oemContact: clampStr(item.oemContact, CLOUD_LIMITS.MAF_CONTACT_MAX),
+    concernedPersonName,
+    contactNo,
+    mailId,
+    oemContact: clampStr(fallbackOemContact, CLOUD_LIMITS.MAF_CONTACT_MAX),
     mafStatus: item.mafStatus,
-    validityDate: clampStr(item.validityDate, CLOUD_LIMITS.DATE_MAX),
+    mafRequestedDate: clampStr(
+      item.mafRequestedDate?.trim() || item.validityDate?.trim() || '',
+      CLOUD_LIMITS.DATE_MAX,
+    ),
     mafDocumentUrl: safeUrl,
     mafDocumentName: clampStr(item.mafDocumentName, 200),
     mafAttachmentId: item.mafAttachmentId ? sanitizeDocId(item.mafAttachmentId) : '',
@@ -394,5 +410,25 @@ export function buildCloudWhatsAppAlertLogPayload<TTime>(
     updatedAt: serverTimeToken,
   };
 }
+
+export function buildCloudSheetConfigPayload<TTime>(
+  config: GoogleSheetSettings,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  const rawUrl = (config.webhookUrl || '').trim();
+  const safeUrl = rawUrl.startsWith('https://') ? clampStr(rawUrl, 500) : '';
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    enabled: Boolean(config.enabled),
+    webhookUrl: safeUrl,
+    sheetName: clampStr((config.sheetName || '').trim() || 'MIS Monthly Report', 120),
+    lastSyncedAt: clampStr(config.lastSyncedAt, 40),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
+
 
 

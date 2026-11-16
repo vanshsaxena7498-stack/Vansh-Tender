@@ -182,8 +182,11 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
         itemName: 'Dome Cameras',
         requiredQuantity: '100 Nos',
         oemName: 'CP Plus',
+        concernedPersonName: 'Ravi Singh',
+        contactNo: '+91 98112 44019',
+        mailId: 'ravi.singh@cpplusworld.com',
         mafStatus: 'Received / Approved',
-        validityDate: '2026-12-22',
+        mafRequestedDate: '2026-11-02',
         mafDocumentUrl: dataUri,
         mafDocumentName: 'maf_signed.pdf',
         mafAttachmentId: 'maf-att-1',
@@ -194,8 +197,11 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
         itemName: 'PTZ Cameras',
         requiredQuantity: '20 Nos',
         oemName: 'Hikvision',
+        concernedPersonName: 'Amit Kumar',
+        contactNo: '+91 98730 11842',
+        mailId: 'amit.kumar@hikvision.in',
         mafStatus: 'Under Approval',
-        validityDate: '2026-12-21',
+        mafRequestedDate: '2026-11-04',
         mafDocumentUrl: 'https://drive.google.com/file/d/abc/view',
         mafDocumentName: 'Cloud link',
         remarks: 'Cloud drive draft',
@@ -210,6 +216,10 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
   assert.equal(cloudItems.length, 2);
   assert.equal(cloudItems[0].mafDocumentUrl, '');
   assert.equal(cloudItems[0].mafAttachmentId, 'maf-att-1');
+  assert.equal(cloudItems[0].concernedPersonName, 'Ravi Singh');
+  assert.equal(cloudItems[0].contactNo, '+91 98112 44019');
+  assert.equal(cloudItems[0].mailId, 'ravi.singh@cpplusworld.com');
+  assert.equal(cloudItems[0].mafRequestedDate, '2026-11-02');
   assert.equal(cloudItems[1].mafDocumentUrl, 'https://drive.google.com/file/d/abc/view');
 
   const fileMap = new Map<string, string>([['maf-att-1', dataUri]]);
@@ -254,4 +264,36 @@ test('buildCloudWhatsAppConfigPayload and buildCloudWhatsAppAlertLogPayload vali
   assert.equal(logPayload.milestone, 'urgent_4h');
   assert.equal(logPayload.recipientPhone, '919717690890');
 });
+
+test('buildCloudSheetConfigPayload enforces blueprint keys and HTTPS webhook URL constraint', async () => {
+  const { buildCloudSheetConfigPayload } = await import('./cloudSyncHelpers');
+  const valid = buildCloudSheetConfigPayload(
+    {
+      enabled: true,
+      webhookUrl: 'https://script.google.com/macros/s/AKfycbTest123/exec',
+      sheetName: 'MIS Monthly Report',
+      lastSyncedAt: '2026-11-16T08:30:00.000Z',
+    },
+    'uid-1',
+    TOKEN,
+  );
+  assert.equal(valid.ownerUid, 'uid-1');
+  assert.equal(valid.enabled, true);
+  assert.equal(valid.webhookUrl, 'https://script.google.com/macros/s/AKfycbTest123/exec');
+  assert.equal(valid.sheetName, 'MIS Monthly Report');
+  assert.equal(valid.lastSyncedAt, '2026-11-16T08:30:00.000Z');
+
+  const strippedHttp = buildCloudSheetConfigPayload(
+    {
+      enabled: false,
+      webhookUrl: 'http://insecure.example.com/hook',
+      sheetName: '',
+    },
+    'uid-1',
+    TOKEN,
+  );
+  assert.equal(strippedHttp.webhookUrl, '');
+  assert.equal(strippedHttp.sheetName, 'MIS Monthly Report');
+});
+
 

@@ -18,6 +18,7 @@ import type {
   AttachmentItem,
   EmdBgRecord,
   FirmProfile,
+  GoogleSheetSettings,
   MafTrackerRecord,
   Tender,
   UserPreferences,
@@ -31,12 +32,17 @@ import {
   buildCloudMafTrackerPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
+  buildCloudSheetConfigPayload,
   buildCloudTenderPayload,
   buildCloudWhatsAppAlertLogPayload,
   buildCloudWhatsAppConfigPayload,
   sanitizeDocId,
 } from './cloudSyncHelpers';
-import { validateMafUploadFile } from './mafCalculations';
+import {
+  getMafContactDetails,
+  getMafRequestedDate,
+  validateMafUploadFile,
+} from './mafCalculations';
 
 const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'L1 / Won',
@@ -114,6 +120,9 @@ function docToEmdRecord(data: Record<string, unknown>): EmdBgRecord {
 }
 
 function docToMafTracker(data: Record<string, unknown>): MafTrackerRecord {
+  const rawItems = Array.isArray(data.itemsMAF)
+    ? (data.itemsMAF as MafTrackerRecord['itemsMAF'])
+    : [];
   return {
     id: String(data.id ?? ''),
     tenderRefId: String(data.tenderRefId ?? ''),
@@ -121,9 +130,16 @@ function docToMafTracker(data: Record<string, unknown>): MafTrackerRecord {
     tenderTitle: String(data.tenderTitle ?? ''),
     department: String(data.department ?? ''),
     tenderDueDate: String(data.tenderDueDate ?? ''),
-    itemsMAF: Array.isArray(data.itemsMAF)
-      ? (data.itemsMAF as MafTrackerRecord['itemsMAF'])
-      : [],
+    itemsMAF: rawItems.map((item) => {
+      const contact = getMafContactDetails(item);
+      return {
+        ...item,
+        concernedPersonName: contact.concernedPersonName,
+        contactNo: contact.contactNo,
+        mailId: contact.mailId,
+        mafRequestedDate: getMafRequestedDate(item),
+      };
+    }),
     createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
     updatedAt: String(data.clientUpdatedAt ?? new Date().toISOString()),
   };
@@ -152,6 +168,15 @@ function docToWhatsAppConfig(data: Record<string, unknown>): WhatsAppSettings {
     enabled: data.enabled !== false,
     recipientName: String(data.recipientName ?? 'Vansh'),
     recipientPhone: String(data.recipientPhone ?? '9717690890'),
+  };
+}
+
+function docToSheetConfig(data: Record<string, unknown>): GoogleSheetSettings {
+  return {
+    enabled: data.enabled !== false,
+    webhookUrl: String(data.webhookUrl ?? ''),
+    sheetName: String(data.sheetName ?? 'MIS Monthly Report') || 'MIS Monthly Report',
+    lastSyncedAt: String(data.lastSyncedAt ?? ''),
   };
 }
 
@@ -254,6 +279,28 @@ export async function syncWhatsAppConfigToCloud(
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
     const payload = buildCloudWhatsAppConfigPayload(
+      config,
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    await setDoc(ref, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function syncSheetConfigToCloud(
+  user: User,
+  config: GoogleSheetSettings,
+): Promise<void> {
+  await ensureUserRootDocument(user);
+  const path = `users/${user.uid}/sheetConfig/default`;
+  const ref = doc(db, 'users', user.uid, 'sheetConfig', 'default');
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const payload = buildCloudSheetConfigPayload(
       config,
       user.uid,
       serverTimestamp(),
@@ -551,6 +598,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   profile: FirmProfile | null;
   preferences: UserPreferences | null;
   whatsappConfig: WhatsAppSettings | null;
+  sheetConfig: GoogleSheetSettings | null;
   whatsappAlerts: WhatsAppAlertLog[];
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
@@ -560,6 +608,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   const profilePath = `users/${uid}/profile/firm`;
   const prefsPath = `users/${uid}/settings/preferences`;
   const waConfigPath = `users/${uid}/whatsappConfig/default`;
+  const sheetConfigPath = `users/${uid}/sheetConfig/default`;
   const waAlertsPath = `users/${uid}/whatsappAlerts`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
@@ -569,6 +618,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   let profile: FirmProfile | null = null;
   let preferences: UserPreferences | null = null;
   let whatsappConfig: WhatsAppSettings | null = null;
+  let sheetConfig: GoogleSheetSettings | null = null;
   let whatsappAlerts: WhatsAppAlertLog[] = [];
   let tenders: Tender[] = [];
   let emdRecords: EmdBgRecord[] = [];
@@ -643,6 +693,15 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
+    const sheetConfigSnap = await getDoc(doc(db, 'users', uid, 'sheetConfig', 'default'));
+    if (sheetConfigSnap.exists()) {
+      sheetConfig = docToSheetConfig(sheetConfigSnap.data());
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, sheetConfigPath);
+  }
+
+  try {
     const waAlertsQuery = query(
       collection(db, 'users', uid, 'whatsappAlerts'),
       where('ownerUid', '==', uid),
@@ -659,6 +718,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
     profile,
     preferences,
     whatsappConfig,
+    sheetConfig,
     whatsappAlerts,
     tenders,
     emdRecords,
@@ -760,6 +820,7 @@ export function subscribeToUserCloudData(
     onProfile: (profile: FirmProfile) => void;
     onPreferences: (prefs: UserPreferences) => void;
     onWhatsAppConfig?: (config: WhatsAppSettings) => void;
+    onSheetConfig?: (config: GoogleSheetSettings) => void;
     onWhatsAppAlerts?: (logs: WhatsAppAlertLog[]) => void;
     onTenders: (tenders: Tender[]) => void;
     onEmdRecords: (records: EmdBgRecord[]) => void;
@@ -771,6 +832,7 @@ export function subscribeToUserCloudData(
   const profilePath = `users/${uid}/profile/firm`;
   const prefsPath = `users/${uid}/settings/preferences`;
   const waConfigPath = `users/${uid}/whatsappConfig/default`;
+  const sheetConfigPath = `users/${uid}/sheetConfig/default`;
   const waAlertsPath = `users/${uid}/whatsappAlerts`;
   const tendersPath = `users/${uid}/tenders`;
   const emdPath = `users/${uid}/emdRecords`;
@@ -907,10 +969,27 @@ export function subscribeToUserCloudData(
     },
   );
 
+  const unsubSheetConfig = onSnapshot(
+    doc(db, 'users', uid, 'sheetConfig', 'default'),
+    (snap) => {
+      if (snap.exists() && callbacks.onSheetConfig) {
+        callbacks.onSheetConfig(docToSheetConfig(snap.data()));
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, sheetConfigPath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
   return () => {
     unsubProfile();
     unsubPrefs();
     unsubWaConfig();
+    unsubSheetConfig();
     unsubWaAlerts();
     unsubTenders();
     unsubEmd();

@@ -7,6 +7,8 @@ import {
   computeMafSummaryMetrics,
   findDailyTenderByCode,
   findMatchingDailyTender,
+  getMafContactDetails,
+  getMafRequestedDate,
   resolveAndFilterMafTrackers,
   validateMafItemDraft,
   validateMafUploadFile,
@@ -18,8 +20,11 @@ function makeItem(partial: Partial<MafLineItem> = {}): MafLineItem {
     itemName: 'Dome Cameras',
     requiredQuantity: '20 Nos',
     oemName: 'CP Plus',
+    concernedPersonName: 'Ravi Singh',
+    contactNo: '+91 98112 44019',
+    mailId: 'ravi.singh@cpplusworld.com',
     mafStatus: 'Not Requested',
-    validityDate: '2026-12-22',
+    mafRequestedDate: '2026-11-05',
     mafDocumentUrl: '',
     remarks: '',
     ...partial,
@@ -170,5 +175,75 @@ test('validateMafItemDraft and validateMafUploadFile enforce required fields and
   );
   assert.ok(
     validateMafUploadFile({ name: 'script.exe', type: 'application/x-msdownload', size: 5000 }),
+  );
+});
+
+test('getMafRequestedDate and getMafContactDetails resolve structured fields and legacy fallbacks', () => {
+  assert.equal(
+    getMafRequestedDate({ mafRequestedDate: '2026-11-10', validityDate: '2026-12-22' }),
+    '2026-11-10',
+  );
+  assert.equal(
+    getMafRequestedDate({ mafRequestedDate: '', validityDate: '2026-12-22' } as MafLineItem),
+    '2026-12-22',
+  );
+
+  const legacyContact = getMafContactDetails({
+    oemContact: 'Amit Kumar · +91 98730 11842',
+  });
+  assert.deepEqual(legacyContact, {
+    concernedPersonName: 'Amit Kumar',
+    contactNo: '+91 98730 11842',
+    mailId: '',
+  });
+
+  const structuredContact = getMafContactDetails({
+    concernedPersonName: 'Neha Verma',
+    contactNo: '+91 98201 33490',
+    mailId: 'neha.verma@cisco.com',
+  });
+  assert.deepEqual(structuredContact, {
+    concernedPersonName: 'Neha Verma',
+    contactNo: '+91 98201 33490',
+    mailId: 'neha.verma@cisco.com',
+  });
+});
+
+test('resolveAndFilterMafTrackers matches Concerned Person Name, Contact No., and Mail ID', () => {
+  const trackers: MafTrackerRecord[] = [
+    {
+      id: 'maf-contact-1',
+      tenderRefId: SEED_TENDERS[0].id,
+      tenderId: SEED_TENDERS[0].tenderId,
+      itemsMAF: [
+        makeItem({
+          itemId: 'a',
+          itemName: 'Core Switches',
+          oemName: 'Cisco',
+          concernedPersonName: 'Neha Verma',
+          contactNo: '+91 98201 33490',
+          mailId: 'neha.verma@cisco.com',
+        }),
+      ],
+      createdAt: '2026-11-01T10:00:00Z',
+      updatedAt: '2026-11-12T10:00:00Z',
+    },
+  ];
+
+  assert.equal(
+    resolveAndFilterMafTrackers(trackers, SEED_TENDERS, {
+      tenderQuery: '',
+      itemOrOemQuery: 'neha.verma@cisco.com',
+      statusFilter: 'ALL',
+    }).length,
+    1,
+  );
+  assert.equal(
+    resolveAndFilterMafTrackers(trackers, SEED_TENDERS, {
+      tenderQuery: '',
+      itemOrOemQuery: '98201 33490',
+      statusFilter: 'ALL',
+    }).length,
+    1,
   );
 });

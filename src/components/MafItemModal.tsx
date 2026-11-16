@@ -4,6 +4,8 @@ import { COMMON_OEM_NAMES } from '../data/seedData';
 import type { MafItemStatus, MafLineItem } from '../types/crm';
 import {
   createMafItemId,
+  getMafContactDetails,
+  getMafRequestedDate,
   MAF_STATUS_OPTIONS,
   validateMafItemDraft,
   validateMafUploadFile,
@@ -37,15 +39,25 @@ export function MafItemModal({
   onUploadFile,
 }: MafItemModalProps) {
   const isEdit = Boolean(initialItem);
+  const initialContact = initialItem
+    ? getMafContactDetails(initialItem)
+    : { concernedPersonName: '', contactNo: '', mailId: '' };
+
   const [itemId] = useState(() => initialItem?.itemId ?? createMafItemId());
   const [itemName, setItemName] = useState(initialItem?.itemName ?? '');
   const [requiredQuantity, setRequiredQuantity] = useState(initialItem?.requiredQuantity ?? '');
   const [oemName, setOemName] = useState(initialItem?.oemName ?? '');
-  const [oemContact, setOemContact] = useState(initialItem?.oemContact ?? '');
+  const [concernedPersonName, setConcernedPersonName] = useState(
+    initialContact.concernedPersonName,
+  );
+  const [contactNo, setContactNo] = useState(initialContact.contactNo);
+  const [mailId, setMailId] = useState(initialContact.mailId);
   const [mafStatus, setMafStatus] = useState<MafItemStatus>(
     initialItem?.mafStatus ?? 'Not Requested',
   );
-  const [validityDate, setValidityDate] = useState(initialItem?.validityDate ?? '');
+  const [mafRequestedDate, setMafRequestedDate] = useState(
+    initialItem ? getMafRequestedDate(initialItem) : '',
+  );
   const [mafDocumentUrl, setMafDocumentUrl] = useState(initialItem?.mafDocumentUrl ?? '');
   const [mafDocumentName, setMafDocumentName] = useState(initialItem?.mafDocumentName ?? '');
   const [mafAttachmentId, setMafAttachmentId] = useState(initialItem?.mafAttachmentId ?? '');
@@ -100,14 +112,21 @@ export function MafItemModal({
       return;
     }
 
+    const cleanPerson = concernedPersonName.trim();
+    const cleanPhone = contactNo.trim();
+    const cleanMail = mailId.trim();
+
     const savedItem: MafLineItem = {
       itemId,
       itemName: itemName.trim(),
       requiredQuantity: requiredQuantity.trim(),
       oemName: oemName.trim(),
-      oemContact: oemContact.trim(),
+      concernedPersonName: cleanPerson,
+      contactNo: cleanPhone,
+      mailId: cleanMail,
+      oemContact: [cleanPerson, cleanPhone].filter(Boolean).join(' · '),
       mafStatus,
-      validityDate,
+      mafRequestedDate,
       mafDocumentUrl: mafDocumentUrl.trim(),
       mafDocumentName:
         mafDocumentName.trim() ||
@@ -221,23 +240,6 @@ export function MafItemModal({
 
             <div>
               <label
-                htmlFor="maf-oem-contact"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
-              >
-                OEM Desk Contact (Optional)
-              </label>
-              <input
-                id="maf-oem-contact"
-                type="text"
-                value={oemContact}
-                onChange={(e) => setOemContact(e.target.value)}
-                placeholder="e.g. Ravi Singh · +91 98112..."
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
-              />
-            </div>
-
-            <div>
-              <label
                 htmlFor="maf-item-status"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
@@ -259,21 +261,72 @@ export function MafItemModal({
 
             <div>
               <label
-                htmlFor="maf-validity-date"
+                htmlFor="maf-requested-date"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                MAF Validity Date
+                MAF Requested Date
               </label>
               <input
-                id="maf-validity-date"
+                id="maf-requested-date"
                 type="date"
-                value={validityDate}
-                onChange={(e) => setValidityDate(e.target.value)}
+                value={mafRequestedDate}
+                onChange={(e) => setMafRequestedDate(e.target.value)}
                 className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
               />
             </div>
 
-            <div className="sm:col-span-2">
+            <div>
+              <label
+                htmlFor="maf-concerned-person"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Concerned Person Name
+              </label>
+              <input
+                id="maf-concerned-person"
+                type="text"
+                value={concernedPersonName}
+                onChange={(e) => setConcernedPersonName(e.target.value)}
+                placeholder="e.g. Ravi Singh"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="maf-contact-no"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Contact No.
+              </label>
+              <input
+                id="maf-contact-no"
+                type="tel"
+                value={contactNo}
+                onChange={(e) => setContactNo(e.target.value)}
+                placeholder="e.g. +91 98112 44019"
+                className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="maf-mail-id"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Mail ID
+              </label>
+              <input
+                id="maf-mail-id"
+                type="email"
+                value={mailId}
+                onChange={(e) => setMailId(e.target.value)}
+                placeholder="e.g. ravi.singh@oem.com"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+            </div>
+
+            <div className="sm:col-span-3">
               <label
                 htmlFor="maf-doc-url"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"

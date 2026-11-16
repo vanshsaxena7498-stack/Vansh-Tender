@@ -590,6 +590,41 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidSheetConfig(data, userId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'enabled',
+          'webhookUrl',
+          'sheetName',
+          'lastSyncedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'enabled',
+          'webhookUrl',
+          'sheetName',
+          'lastSyncedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        data.enabled is bool &&
+        data.webhookUrl is string &&
+        data.webhookUrl.size() <= 500 &&
+        (data.webhookUrl == '' || data.webhookUrl.matches('^https://.*')) &&
+        data.sheetName is string &&
+        data.sheetName.size() >= 1 &&
+        data.sheetName.size() <= 120 &&
+        data.lastSyncedAt is string &&
+        data.lastSyncedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // -------------------------------------------------------------------------
     // Collection Rules
     // -------------------------------------------------------------------------
@@ -1062,6 +1097,55 @@ service cloud.firestore {
         allow delete: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(alertId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /sheetConfig/{configId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          configId == 'default' &&
+          isOwner(userId) &&
+          isValidSheetConfig(incoming(), userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
+          configId == 'default' &&
+          isValidSheetConfig(incoming(), userId) &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'ownerUid',
+                'enabled',
+                'webhookUrl',
+                'sheetName',
+                'lastSyncedAt',
+                'createdAt',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(configId) &&
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
       }

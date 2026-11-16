@@ -16,6 +16,8 @@ import {
   createMafItemId,
   findDailyTenderByCode,
   findMatchingDailyTender,
+  getMafContactDetails,
+  getMafRequestedDate,
   MAF_STATUS_OPTIONS,
   validateMafItemDraft,
   validateMafUploadFile,
@@ -44,13 +46,26 @@ function makeEmptyItem(index: number): MafLineItem {
     itemName: '',
     requiredQuantity: '',
     oemName: '',
-    oemContact: '',
+    concernedPersonName: '',
+    contactNo: '',
+    mailId: '',
     mafStatus: 'Not Requested',
-    validityDate: '',
+    mafRequestedDate: '',
     mafDocumentUrl: '',
     mafDocumentName: '',
     remarks: '',
     updatedAt: new Date().toISOString(),
+  };
+}
+
+function hydrateItemForForm(item: MafLineItem): MafLineItem {
+  const contact = getMafContactDetails(item);
+  return {
+    ...item,
+    concernedPersonName: contact.concernedPersonName,
+    contactNo: contact.contactNo,
+    mailId: contact.mailId,
+    mafRequestedDate: getMafRequestedDate(item),
   };
 }
 
@@ -86,7 +101,7 @@ export function MafTrackerFormModal({
   );
   const [itemsMAF, setItemsMAF] = useState<MafLineItem[]>(() =>
     initialTracker?.itemsMAF && initialTracker.itemsMAF.length > 0
-      ? initialTracker.itemsMAF
+      ? initialTracker.itemsMAF.map(hydrateItemForForm)
       : [makeEmptyItem(0)],
   );
   const [uploadingItemId, setUploadingItemId] = useState<string | null>(null);
@@ -234,17 +249,27 @@ export function MafTrackerFormModal({
       : undefined;
 
     const nowIso = new Date().toISOString();
-    const cleanedItems: MafLineItem[] = itemsMAF.map((item) => ({
-      ...item,
-      itemName: item.itemName.trim(),
-      requiredQuantity: item.requiredQuantity.trim(),
-      oemName: item.oemName.trim(),
-      oemContact: (item.oemContact ?? '').trim(),
-      mafDocumentUrl: item.mafDocumentUrl.trim(),
-      mafDocumentName: (item.mafDocumentName ?? '').trim(),
-      remarks: item.remarks.trim(),
-      updatedAt: item.updatedAt || nowIso,
-    }));
+    const cleanedItems: MafLineItem[] = itemsMAF.map((item) => {
+      const concernedPersonName = (item.concernedPersonName ?? '').trim();
+      const contactNo = (item.contactNo ?? '').trim();
+      const mailId = (item.mailId ?? '').trim();
+      const mafRequestedDate = getMafRequestedDate(item);
+      return {
+        ...item,
+        itemName: item.itemName.trim(),
+        requiredQuantity: item.requiredQuantity.trim(),
+        oemName: item.oemName.trim(),
+        concernedPersonName,
+        contactNo,
+        mailId,
+        oemContact: [concernedPersonName, contactNo].filter(Boolean).join(' · '),
+        mafRequestedDate,
+        mafDocumentUrl: item.mafDocumentUrl.trim(),
+        mafDocumentName: (item.mafDocumentName ?? '').trim(),
+        remarks: item.remarks.trim(),
+        updatedAt: item.updatedAt || nowIso,
+      };
+    });
 
     const finalTracker: MafTrackerRecord = existingForTender
       ? {
@@ -581,13 +606,41 @@ export function MafTrackerFormModal({
 
                         <div>
                           <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            OEM Contact
+                            Concerned Person Name
                           </label>
                           <input
                             type="text"
-                            value={item.oemContact ?? ''}
-                            onChange={(e) => handleUpdateRow(idx, { oemContact: e.target.value })}
-                            placeholder="Name / Phone"
+                            value={item.concernedPersonName ?? ''}
+                            onChange={(e) =>
+                              handleUpdateRow(idx, { concernedPersonName: e.target.value })
+                            }
+                            placeholder="e.g. Ravi Singh"
+                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            Contact No.
+                          </label>
+                          <input
+                            type="tel"
+                            value={item.contactNo ?? ''}
+                            onChange={(e) => handleUpdateRow(idx, { contactNo: e.target.value })}
+                            placeholder="e.g. +91 98112 44019"
+                            className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            Mail ID
+                          </label>
+                          <input
+                            type="email"
+                            value={item.mailId ?? ''}
+                            onChange={(e) => handleUpdateRow(idx, { mailId: e.target.value })}
+                            placeholder="e.g. ravi.singh@oem.com"
                             className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                           />
                         </div>
@@ -615,17 +668,19 @@ export function MafTrackerFormModal({
 
                         <div>
                           <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            Validity Date
+                            MAF Requested Date
                           </label>
                           <input
                             type="date"
-                            value={item.validityDate}
-                            onChange={(e) => handleUpdateRow(idx, { validityDate: e.target.value })}
+                            value={item.mafRequestedDate ?? ''}
+                            onChange={(e) =>
+                              handleUpdateRow(idx, { mafRequestedDate: e.target.value })
+                            }
                             className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                           />
                         </div>
 
-                        <div>
+                        <div className="sm:col-span-2 lg:col-span-3">
                           <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
                             Signed MAF PDF / Cloud Link
                           </label>

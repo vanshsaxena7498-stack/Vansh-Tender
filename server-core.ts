@@ -3,7 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import express, { type Request, type Response, type Router } from 'express';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import nodemailer from 'nodemailer';
+import {
+  normalizeExtractedBidDraft,
+  sanitizeDistrictStateLocation,
+  type RawGeminiBidExtraction,
+} from './src/utils/bidSearchParser.ts';
 
 const ADMIN_USERNAME = 'VanshSales';
 const DEFAULT_ADMIN_PASSWORD = process.env.CRM_INITIAL_PASSWORD || 'Vansh@2027';
@@ -735,5 +741,403 @@ export function createApiRouter(): Router {
     }
   });
 
+  router.post('/tenders/extract-pdf', async (req: Request, res: Response) => {
+    try {
+      const apiKey = process.env.GEMINI_API_KEY?.trim();
+      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+        res.status(500).json({
+          ok: false,
+          error:
+            'Gemini API key is not configured on the server. Add GEMINI_API_KEY in AI Studio Secrets or Vercel Environment Variables.',
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as {
+        fileName?: unknown;
+        mimeType?: unknown;
+        fileBase64?: unknown;
+      };
+      const fileName = typeof body.fileName === 'string' ? body.fileName.trim() : 'bid-document.pdf';
+      const mimeType =
+        typeof body.mimeType === 'string' && body.mimeType.trim()
+          ? body.mimeType.trim()
+          : 'application/pdf';
+      const rawBase64 = typeof body.fileBase64 === 'string' ? body.fileBase64.trim() : '';
+      const base64Data = rawBase64.replace(/^data:[^;]+;base64,/i, '');
+
+      if (!base64Data) {
+        res.status(400).json({
+          ok: false,
+          error: 'No PDF content received. Please upload a valid .pdf file.',
+        });
+        return;
+      }
+
+      if (mimeType !== 'application/pdf' && !fileName.toLowerCase().endsWith('.pdf')) {
+        res.status(400).json({
+          ok: false,
+          error: 'Only PDF (.pdf) bid documents are supported for Bid Search scanning.',
+        });
+        return;
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+
+      const promptText = [
+        'Analyze this Indian GeM / Government tender bid PDF document and extract every field accurately into JSON.',
+        'Extraction Rules:',
+        '1. tenderId: Exact Bid Number / Document Number (e.g., "GEM/2026/B/8153995").',
+        '2. portal: Return "GeM" if this is a Government e-Marketplace (GeM) bid document, otherwise "CPPP / eProcure", "State Portal", "PSU / Direct", or "Private".',
+        '3. stage: Always return "Identified / Reviewing".',
+        '4. department: Combine Ministry, Department, and Organisation Name cleanly (e.g., "Ministry Of Defence / Department Of Military Affairs (Indian Army)").',
+        '5. location: Extract District and State from Consignee / Reporting Officer Address or Pre-Bid Venue (e.g., "Panchkula, Haryana").',
+        '6. consigneeAddressRaw: Extract the complete verbatim Consignee / Reporting Officer / Delivery Address, PIN code, town/base, or Pre-Bid Venue from the PDF so District and State can be verified via Google Search.',
+        '7. title: Extract BOQ Title or primary scope of supply/work.',
+        '8. category: Extract Primary Product Category or main Item Category.',
+        '9. publishDate: Extract Bid "Dated" / Published Date strictly in YYYY-MM-DD format.',
+        '10. submissionDueDate: Extract "Bid End Date/Time" strictly in 24-hour YYYY-MM-DDTHH:mm format.',
+        '11. preBidDate: Extract Pre-Bid Date in YYYY-MM-DD format if available, otherwise "".',
+        '12. completionDate: Always return "".',
+        '13. estimatedValue: Numeric INR value if Estimated Bid Value is explicitly stated, otherwise 0.',
+        '14. quotedValue: Always return 0.',
+        '15. emdRequired: Return "Required" if EMD Amount > 0 (or "BG Submitted" if Bank Guarantee / e-PBG is specified), "Exempted - MSME/Startup" if MSE/Startup exemption applies and EMD is 0, or "Not Required" if EMD is No/Nil/Not Required.',
+        '16. emdAmount: Numeric EMD Amount in INR (e.g., 150000), or 0 if none.',
+        '17. resultInfo: Always return "".',
+      ].join('\n');
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: 'application/pdf',
+                data: base64Data,
+              },
+            },
+            {
+              text: promptText,
+            },
+          ],
+        },
+        config: {
+          systemInstruction:
+            'You are a precision Indian GeM and government tender PDF parser. Extract structured bid details strictly matching the JSON schema without inventing missing financial figures.',
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              tenderId: { type: Type.STRING, description: 'Exact Tender ID / Bid Number' },
+              portal: { type: Type.STRING, description: 'Portal source such as GeM' },
+              stage: { type: Type.STRING, description: 'Always Identified / Reviewing' },
+              department: {
+                type: Type.STRING,
+                description: 'Combined Ministry, Department, and Organisation Name',
+              },
+              location: {
+                type: Type.STRING,
+                description: 'District and State from Consignee Address or Pre-Bid Venue',
+              },
+              consigneeAddressRaw: {
+                type: Type.STRING,
+                description: 'Complete verbatim Consignee / Delivery Address or PIN code from PDF',
+              },
+              title: {
+                type: Type.STRING,
+                description: 'BOQ Title or primary scope of work',
+              },
+              category: {
+                type: Type.STRING,
+                description: 'Primary Product Category or main Item Category',
+              },
+              publishDate: {
+                type: Type.STRING,
+                description: 'Dated / Published Date in YYYY-MM-DD format',
+              },
+              submissionDueDate: {
+                type: Type.STRING,
+                description: 'Bid End Date/Time in YYYY-MM-DDTHH:mm format',
+              },
+              preBidDate: {
+                type: Type.STRING,
+                description: 'Pre-Bid Meeting Date in YYYY-MM-DD format or empty string',
+              },
+              completionDate: {
+                type: Type.STRING,
+                description: 'Leave blank empty string',
+              },
+              estimatedValue: {
+                type: Type.NUMBER,
+                description: 'Estimated Bid Value in INR if explicitly mentioned, else 0',
+              },
+              quotedValue: {
+                type: Type.NUMBER,
+                description: 'Leave 0',
+              },
+              emdRequired: {
+                type: Type.STRING,
+                description: 'Required, BG Submitted, Exempted - MSME/Startup, or Not Required',
+              },
+              emdAmount: {
+                type: Type.NUMBER,
+                description: 'Numeric EMD amount in INR or 0',
+              },
+              resultInfo: {
+                type: Type.STRING,
+                description: 'Leave blank empty string',
+              },
+            },
+            required: [
+              'tenderId',
+              'portal',
+              'stage',
+              'department',
+              'location',
+              'consigneeAddressRaw',
+              'title',
+              'category',
+              'publishDate',
+              'submissionDueDate',
+              'preBidDate',
+              'completionDate',
+              'estimatedValue',
+              'quotedValue',
+              'emdRequired',
+              'emdAmount',
+              'resultInfo',
+            ],
+          },
+        },
+      });
+
+      const rawText = (response.text ?? '{}').trim();
+      let parsed: RawGeminiBidExtraction = {};
+      try {
+        parsed = JSON.parse(rawText) as RawGeminiBidExtraction;
+      } catch {
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          parsed = JSON.parse(jsonMatch[0]) as RawGeminiBidExtraction;
+        }
+      }
+
+      const addressForSearch =
+        typeof parsed.consigneeAddressRaw === 'string' && parsed.consigneeAddressRaw.trim()
+          ? parsed.consigneeAddressRaw.trim()
+          : typeof parsed.location === 'string'
+            ? parsed.location.trim()
+            : '';
+
+      if (addressForSearch) {
+        try {
+          const geoResponse = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: [
+              'Using Google Search, find the exact Indian administrative District and State for the address below (lookup PIN code, locality, town, cantonment, or organisation campus if district is not explicitly stated).',
+              'Return ONLY "District, State" (for example: "Panchkula, Haryana" or "Lucknow, Uttar Pradesh") with no extra words, street address, or PIN code.',
+              '',
+              `Address from PDF: ${addressForSearch}`,
+              `Department / Organisation: ${typeof parsed.department === 'string' ? parsed.department : ''}`,
+              `Initial Extracted Location: ${typeof parsed.location === 'string' ? parsed.location : ''}`,
+            ].join('\n'),
+            config: {
+              tools: [{ googleSearch: {} }],
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              systemInstruction:
+                'Output strictly "District, State" for an Indian address. Never include street address, PIN code, office name, bullet points, or explanatory text.',
+            },
+          });
+
+          const groundedLocation = sanitizeDistrictStateLocation(geoResponse.text ?? '');
+          if (
+            groundedLocation &&
+            groundedLocation.includes(',') &&
+            !/cannot|unable|unknown|sorry|not found/i.test(groundedLocation)
+          ) {
+            parsed.location = groundedLocation;
+          }
+        } catch {
+          // Non-fatal fallback: keep normalized PDF location if Search Grounding fails
+        }
+      }
+
+      const extracted = normalizeExtractedBidDraft(parsed, fileName);
+      res.json({ ok: true, extracted });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to extract details from PDF.';
+      const status =
+        msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')
+          ? 429
+          : msg.includes('403') || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')
+            ? 403
+            : 500;
+      res.status(status).json({
+        ok: false,
+        error:
+          status === 429
+            ? 'Gemini API rate limit reached. Please wait a moment and retry.'
+            : status === 403
+              ? 'Gemini API key permission issue. Please verify GEMINI_API_KEY in Settings > Secrets.'
+              : msg,
+      });
+    }
+  });
+
+  function isValidAppsScriptUrl(rawUrl: string): boolean {
+    const trimmed = (rawUrl || '').trim();
+    if (!trimmed || trimmed.length > 500) return false;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== 'https:') return false;
+      const host = parsed.hostname.toLowerCase();
+      if (host === 'script.google.com' || host === 'script.googleusercontent.com') {
+        return parsed.pathname.startsWith('/macros/');
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  router.post('/sheet-sync', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      webhookUrl?: unknown;
+      payload?: unknown;
+    };
+    const webhookUrl = typeof body.webhookUrl === 'string' ? body.webhookUrl.trim() : '';
+
+    if (!isValidAppsScriptUrl(webhookUrl)) {
+      res.status(400).json({
+        ok: false,
+        error:
+          'Invalid Google Apps Script Webhook URL. Expected https://script.google.com/macros/s/.../exec',
+      });
+      return;
+    }
+
+    if (!body.payload || typeof body.payload !== 'object') {
+      res.status(400).json({
+        ok: false,
+        error: 'Missing structured JSON sync payload.',
+      });
+      return;
+    }
+
+    try {
+      const upstream = await fetch(webhookUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body.payload),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      const rawText = await upstream.text();
+      const trimmed = rawText.trim();
+      const looksLikeAuthHtml =
+        trimmed.startsWith('<!DOCTYPE') ||
+        trimmed.startsWith('<html') ||
+        trimmed.includes('accounts.google.com') ||
+        trimmed.includes('ServiceLogin');
+
+      if (looksLikeAuthHtml) {
+        res.status(400).json({
+          ok: false,
+          error:
+            'Google Apps Script returned a login page instead of JSON. In Apps Script -> Deploy -> Manage deployments, set "Who has access" to "Anyone" and redeploy.',
+        });
+        return;
+      }
+
+      let parsedJson: { ok?: boolean; error?: string; [key: string]: unknown } | null = null;
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          parsedJson = JSON.parse(trimmed) as { ok?: boolean; error?: string };
+        } catch {
+          parsedJson = null;
+        }
+      }
+
+      if (!upstream.ok) {
+        res.status(502).json({
+          ok: false,
+          error:
+            parsedJson?.error ||
+            `Google Apps Script returned HTTP ${upstream.status}. Verify the Web App deployment URL.`,
+        });
+        return;
+      }
+
+      if (parsedJson && parsedJson.ok === false) {
+        res.status(400).json({
+          ok: false,
+          error: parsedJson.error || 'Google Apps Script reported an execution error.',
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        syncedAt: new Date().toISOString(),
+        scriptResponse: parsedJson ?? { ok: true, raw: trimmed.slice(0, 300) },
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to reach Google Apps Script Webhook URL.';
+      res.status(502).json({
+        ok: false,
+        error: message.includes('Timeout')
+          ? 'Google Apps Script webhook timed out after 15s.'
+          : `Google Sheet webhook failed: ${message}`,
+      });
+    }
+  });
+
+  router.post('/sheet-sync/pull', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as { webhookUrl?: unknown };
+    const webhookUrl = typeof body.webhookUrl === 'string' ? body.webhookUrl.trim() : '';
+
+    if (!isValidAppsScriptUrl(webhookUrl)) {
+      res.status(400).json({
+        ok: false,
+        error: 'Invalid Google Apps Script Webhook URL.',
+      });
+      return;
+    }
+
+    try {
+      const upstream = await fetch(webhookUrl, {
+        method: 'GET',
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
+      });
+      const text = await upstream.text();
+      if (!upstream.ok || !text.trim().startsWith('{')) {
+        res.status(502).json({
+          ok: false,
+          error: 'Could not read JSON status from Google Apps Script Web App.',
+        });
+        return;
+      }
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      res.json({ ok: true, sheetStatus: parsed });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to query Google Sheet status.',
+      });
+    }
+  });
+
   return router;
 }
+

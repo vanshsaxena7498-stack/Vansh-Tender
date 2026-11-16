@@ -17,6 +17,8 @@ import type { MafItemStatus, MafLineItem, MafTrackerRecord, Tender } from '../ty
 import { buildCsvContent, downloadTextFile, formatShortDate } from '../utils/formatters';
 import {
   computeMafSummaryMetrics,
+  getMafContactDetails,
+  getMafRequestedDate,
   MAF_STATUS_OPTIONS,
   resolveAndFilterMafTrackers,
   validateMafUploadFile,
@@ -132,9 +134,11 @@ export function MafStatusTab({
       'Item Name',
       'Required Quantity',
       'OEM Name',
-      'OEM Contact',
+      'Concerned Person Name',
+      'Contact No.',
+      'Mail ID',
       'Item MAF Status',
-      'Validity Date',
+      'MAF Requested Date',
       'Attachment / Link',
       'Remarks',
     ];
@@ -156,9 +160,12 @@ export function MafStatusTab({
           '',
           '',
           '',
+          '',
+          '',
         ]);
       } else {
         for (const item of items) {
+          const contact = getMafContactDetails(item);
           rows.push([
             tracker.tenderId,
             tracker.resolvedTenderTitle,
@@ -168,9 +175,11 @@ export function MafStatusTab({
             item.itemName,
             item.requiredQuantity,
             item.oemName,
-            item.oemContact ?? '',
+            contact.concernedPersonName,
+            contact.contactNo,
+            contact.mailId,
             item.mafStatus,
-            item.validityDate,
+            getMafRequestedDate(item),
             item.mafDocumentName ||
               (item.mafDocumentUrl.startsWith('data:') ? 'Uploaded File' : item.mafDocumentUrl),
             item.remarks,
@@ -507,9 +516,10 @@ export function MafStatusTab({
                                     <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 text-[11px] font-semibold text-slate-600 dark:text-slate-300">
                                       <th className="py-2.5 px-3">Item Name</th>
                                       <th className="py-2.5 px-3">OEM Name</th>
+                                      <th className="py-2.5 px-3">OEM Contact Details</th>
                                       <th className="py-2.5 px-3">MAF Status</th>
                                       <th className="py-2.5 px-3 whitespace-nowrap">
-                                        Validity Date
+                                        MAF Requested Date
                                       </th>
                                       <th className="py-2.5 px-3">Attachment</th>
                                       <th className="py-2.5 px-3 text-right">Actions</th>
@@ -520,13 +530,15 @@ export function MafStatusTab({
                                       const itemKey = `${tracker.id}:${item.itemId}`;
                                       const isUploading = uploadingKey === itemKey;
                                       const isDataUri = item.mafDocumentUrl.startsWith('data:');
+                                      const contact = getMafContactDetails(item);
+                                      const requestedDate = getMafRequestedDate(item);
 
                                       return (
                                         <tr
                                           key={item.itemId}
                                           className="hover:bg-slate-50/80 dark:hover:bg-slate-800/30"
                                         >
-                                          <td className="py-2.5 px-3 max-w-[230px]">
+                                          <td className="py-2.5 px-3 max-w-[210px]">
                                             <p className="font-medium text-slate-900 dark:text-slate-100 truncate">
                                               <span className="text-slate-500 dark:text-slate-400 mr-1">
                                                 Item {idx + 1}:
@@ -544,14 +556,40 @@ export function MafStatusTab({
                                             )}
                                           </td>
 
-                                          <td className="py-2.5 px-3 max-w-[165px]">
+                                          <td className="py-2.5 px-3 max-w-[140px]">
                                             <p className="font-medium text-slate-800 dark:text-slate-200 truncate">
                                               {item.oemName}
                                             </p>
-                                            {item.oemContact && (
-                                              <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                                                {item.oemContact}
-                                              </p>
+                                          </td>
+
+                                          <td className="py-2.5 px-3 max-w-[210px]">
+                                            {contact.concernedPersonName ||
+                                            contact.contactNo ||
+                                            contact.mailId ? (
+                                              <div className="space-y-0.5">
+                                                {contact.concernedPersonName && (
+                                                  <p className="font-medium text-slate-800 dark:text-slate-200 truncate">
+                                                    {contact.concernedPersonName}
+                                                  </p>
+                                                )}
+                                                {contact.contactNo && (
+                                                  <p className="font-mono-num text-[11px] text-slate-600 dark:text-slate-400 truncate">
+                                                    {contact.contactNo}
+                                                  </p>
+                                                )}
+                                                {contact.mailId && (
+                                                  <a
+                                                    href={`mailto:${contact.mailId}`}
+                                                    className="block text-[11px] text-blue-700 dark:text-blue-400 hover:underline truncate"
+                                                  >
+                                                    {contact.mailId}
+                                                  </a>
+                                                )}
+                                              </div>
+                                            ) : (
+                                              <span className="text-slate-400 dark:text-slate-500">
+                                                —
+                                              </span>
                                             )}
                                           </td>
 
@@ -583,7 +621,7 @@ export function MafStatusTab({
                                           </td>
 
                                           <td className="py-2.5 px-3 whitespace-nowrap font-mono-num text-slate-700 dark:text-slate-300">
-                                            {formatShortDate(item.validityDate)}
+                                            {formatShortDate(requestedDate)}
                                           </td>
 
                                           <td className="py-2.5 px-3 whitespace-nowrap">

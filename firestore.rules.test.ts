@@ -464,4 +464,68 @@ test('WhatsAppAlertLog Firestore rules enforce ownership, milestone/status enums
   );
 });
 
+function isValidSheetConfig(
+  data: Record<string, unknown>,
+  auth: AuthContext,
+  userId: string,
+): boolean {
+  const keys = [
+    'ownerUid',
+    'enabled',
+    'webhookUrl',
+    'sheetName',
+    'lastSyncedAt',
+    'createdAt',
+    'updatedAt',
+  ];
+  if (!hasExactKeys(data, keys, keys)) return false;
+  return (
+    isValidId(data.ownerUid) &&
+    data.ownerUid === userId &&
+    data.ownerUid === auth.uid &&
+    typeof data.enabled === 'boolean' &&
+    typeof data.webhookUrl === 'string' &&
+    data.webhookUrl.length <= 500 &&
+    (data.webhookUrl === '' || data.webhookUrl.startsWith('https://')) &&
+    typeof data.sheetName === 'string' &&
+    data.sheetName.length >= 1 &&
+    data.sheetName.length <= 120 &&
+    typeof data.lastSyncedAt === 'string' &&
+    data.lastSyncedAt.length <= 40 &&
+    data.createdAt === SERVER_TIME &&
+    data.updatedAt === SERVER_TIME
+  );
+}
+
+test('GoogleSheetConfig Firestore rules enforce ownership, HTTPS webhook URLs, and reject shadow fields', () => {
+  const verifiedUser: AuthContext = {
+    uid: 'u2',
+    token: { email: 'user@example.com', email_verified: true },
+  };
+  const validConfig: Record<string, unknown> = {
+    ownerUid: 'u2',
+    enabled: true,
+    webhookUrl: 'https://script.google.com/macros/s/AKfycb123/exec',
+    sheetName: 'MIS Monthly Report',
+    lastSyncedAt: '2026-11-16T08:00:00.000Z',
+    createdAt: SERVER_TIME,
+    updatedAt: SERVER_TIME,
+  };
+  assert.equal(isValidSheetConfig(validConfig, verifiedUser, 'u2'), true);
+  assert.equal(isValidSheetConfig({ ...validConfig, webhookUrl: '' }, verifiedUser, 'u2'), true);
+  assert.equal(
+    isValidSheetConfig({ ...validConfig, webhookUrl: 'http://example.com' }, verifiedUser, 'u2'),
+    false,
+  );
+  assert.equal(
+    isValidSheetConfig({ ...validConfig, shadowKey: 1 }, verifiedUser, 'u2'),
+    false,
+  );
+  assert.equal(
+    isValidSheetConfig({ ...validConfig, ownerUid: 'victim' }, verifiedUser, 'u2'),
+    false,
+  );
+});
+
+
 

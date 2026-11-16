@@ -8,6 +8,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { BidSearchTab } from './components/BidSearchTab';
 import { DashboardTab } from './components/DashboardTab';
 import { EmdBgFormModal } from './components/EmdBgFormModal';
 import { EmdBgTab } from './components/EmdBgTab';
@@ -32,10 +33,14 @@ import type {
   CrmBackupPayload,
   EmdBgRecord,
   FirmProfile,
+  GoogleSheetSettings,
   MafItemStatus,
   MafLineItem,
   MafTrackerRecord,
   NotificationItem,
+  SheetSyncAction,
+  SheetSyncEntityType,
+  SheetSyncStatus,
   TabKey,
   Tender,
   UserPreferences,
@@ -58,6 +63,7 @@ import {
   syncMafTrackerToCloud,
   syncPreferencesToCloud,
   syncProfileToCloud,
+  syncSheetConfigToCloud,
   syncTenderToCloud,
   syncWhatsAppAlertLogToCloud,
   syncWhatsAppConfigToCloud,
@@ -69,6 +75,11 @@ import {
   mergeCloudProfileWithLocal,
   mergeCloudTendersWithFiles,
 } from './utils/cloudSyncHelpers';
+import {
+  buildSheetSyncPayload,
+  DEFAULT_GOOGLE_SHEET_SETTINGS,
+  isValidAppsScriptWebhookUrl,
+} from './utils/googleSheetSync';
 import { findMatchingDailyTender } from './utils/mafCalculations';
 import {
   buildTenderWhatsAppMessage,
@@ -151,6 +162,11 @@ export default function App() {
     automatedConfigured: boolean;
     provider: string;
   }>({ automatedConfigured: false, provider: 'none' });
+  const [sheetSettings, setSheetSettings] = useState<GoogleSheetSettings>(
+    DEFAULT_GOOGLE_SHEET_SETTINGS,
+  );
+  const [sheetSyncStatus, setSheetSyncStatus] = useState<SheetSyncStatus>('unconfigured');
+  const [sheetSyncError, setSheetSyncError] = useState<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -193,6 +209,7 @@ export default function App() {
     adminPin,
     darkMode,
     whatsappSettings,
+    sheetSettings,
     firebaseUser,
   });
   useEffect(() => {
@@ -204,6 +221,7 @@ export default function App() {
       adminPin,
       darkMode,
       whatsappSettings,
+      sheetSettings,
       firebaseUser,
     };
   }, [
@@ -214,6 +232,7 @@ export default function App() {
     adminPin,
     darkMode,
     whatsappSettings,
+    sheetSettings,
     firebaseUser,
   ]);
 
@@ -308,10 +327,12 @@ export default function App() {
             adminPin: curPin,
             darkMode: curDark,
             whatsappSettings: curWaSettings,
+            sheetSettings: curSheetSettings,
           } = stateRef.current;
           const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
           await backupAllToCloud(firebaseUser, curProfile, prefs, curTenders, curEmd, curMaf);
           await syncWhatsAppConfigToCloud(firebaseUser, curWaSettings);
+          await syncSheetConfigToCloud(firebaseUser, curSheetSettings);
           if (!cancelled) {
             markSyncedNow();
             setCloudFeedback({
@@ -329,6 +350,16 @@ export default function App() {
           }
           if (cloud.whatsappConfig) {
             setWhatsappSettings(cloud.whatsappConfig);
+          }
+          if (cloud.sheetConfig) {
+            setSheetSettings(cloud.sheetConfig);
+            setSheetSyncStatus(
+              cloud.sheetConfig.webhookUrl
+                ? cloud.sheetConfig.lastSyncedAt
+                  ? 'synced'
+                  : 'idle'
+                : 'unconfigured',
+            );
           }
           if (cloud.whatsappAlerts.length > 0) {
             setWhatsappLogs((prev) => mergeWhatsappLogs(cloud.whatsappAlerts, prev));
@@ -362,6 +393,15 @@ export default function App() {
           },
           onWhatsAppConfig: (remoteConfig) => {
             setWhatsappSettings(remoteConfig);
+            markSyncedNow();
+          },
+          onSheetConfig: (remoteSheetConfig) => {
+            setSheetSettings(remoteSheetConfig);
+            setSheetSyncStatus((prev) => {
+              if (prev === 'syncing') return prev;
+              if (!remoteSheetConfig.webhookUrl) return 'unconfigured';
+              return remoteSheetConfig.lastSyncedAt ? 'synced' : 'idle';
+            });
             markSyncedNow();
           },
           onWhatsAppAlerts: (remoteLogs) => {
@@ -738,28 +778,133 @@ export default function App() {
     return { nextTrackers, changedTrackers };
   };
 
+  const pushToGoogleSheet = async (opts: {
+    action: SheetSyncAction;
+    entityType: SheetSyncEntityType;
+    tender?: Tender | null;
+    emdRecord?: EmdBgRecord | null;
+    tendersSnapshot?: Tender[];
+    emdSnapshot?: EmdBgRecord[];
+    settingsOverride?: GoogleSheetSettings;
+    force?: boolean;
+  }): Promise<boolean> => {
+    const cfg = opts.settingsOverride ?? stateRef.current.sheetSettings;
+    const webhookUrl = (cfg.webhookUrl || '').trim();
+
+    if (!webhookUrl || !isValidAppsScriptWebhookUrl(webhookUrl)) {
+      if (opts.force) {
+        const msg = 'Configure a valid Google Apps Script Webhook URL in Admin Settings first.';
+        setSheetSyncStatus('error');
+        setSheetSyncError(msg);
+        showToast('err', msg);
+      }
+      return false;
+    }
+
+    if (!opts.force && !cfg.enabled) {
+      return false;
+    }
+
+    setSheetSyncStatus('syncing');
+    setSheetSyncError(null);
+
+    const payload = buildSheetSyncPayload({
+      action: opts.action,
+      entityType: opts.entityType,
+      sheetName: cfg.sheetName,
+      firmName: stateRef.current.firmProfile.firmName,
+      assignedOwner: stateRef.current.firmProfile.adminName,
+      tender: opts.tender ?? null,
+      emdRecord: opts.emdRecord ?? null,
+      tenders: opts.tendersSnapshot ?? stateRef.current.tenders,
+      emdRecords: opts.emdSnapshot ?? stateRef.current.emdRecords,
+    });
+
+    try {
+      const res = await fetch('/api/sheet-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhookUrl,
+          payload,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        syncedAt?: string;
+        scriptResponse?: { message?: string; spreadsheetName?: string };
+      };
+
+      if (!res.ok || data.ok === false) {
+        const errMsg = data.error || `Google Sheet webhook returned HTTP ${res.status}.`;
+        setSheetSyncStatus('error');
+        setSheetSyncError(errMsg);
+        showToast('err', errMsg);
+        return false;
+      }
+
+      const syncedAt = data.syncedAt || new Date().toISOString();
+      const updatedCfg: GoogleSheetSettings = {
+        ...cfg,
+        webhookUrl,
+        lastSyncedAt: syncedAt,
+      };
+      stateRef.current.sheetSettings = updatedCfg;
+      setSheetSettings(updatedCfg);
+      setSheetSyncStatus('synced');
+      setSheetSyncError(null);
+
+      if (stateRef.current.firebaseUser) {
+        void syncSheetConfigToCloud(stateRef.current.firebaseUser, updatedCfg).catch(() => {
+          // Non-fatal: already updated in-memory
+        });
+      }
+
+      if (opts.force) {
+        const label =
+          opts.action === 'PING'
+            ? data.scriptResponse?.message ||
+              `Connected to Google Sheet "${updatedCfg.sheetName}" successfully.`
+            : `Synced ${payload.tenders.length} tenders & ${payload.emdRecords.length} EMD/BG records to "${updatedCfg.sheetName}".`;
+        showToast('ok', label);
+      }
+      return true;
+    } catch (err) {
+      const errMsg =
+        err instanceof Error ? err.message : 'Unable to reach /api/sheet-sync endpoint.';
+      setSheetSyncStatus('error');
+      setSheetSyncError(errMsg);
+      showToast('err', errMsg);
+      return false;
+    }
+  };
+
   const handleSaveTender = (
     saved: Tender,
     syncToEmd: boolean,
     initialMafItems?: MafLineItem[],
   ) => {
     cacheAttachmentPayloads(saved.attachments);
-    setTenders((prev) => {
-      const exists = prev.some((t) => t.id === saved.id);
-      if (exists) {
-        return prev.map((t) => (t.id === saved.id ? saved : t));
-      }
-      return [saved, ...prev];
-    });
+    const prevTenders = stateRef.current.tenders;
+    const isExisting = prevTenders.some((t) => t.id === saved.id);
+    const nextTenders = isExisting
+      ? prevTenders.map((t) => (t.id === saved.id ? saved : t))
+      : [saved, ...prevTenders];
+    stateRef.current.tenders = nextTenders;
+    setTenders(nextTenders);
 
     let linkedRecordToSync: EmdBgRecord | null = null;
+    let nextEmdRecords = stateRef.current.emdRecords;
     if (syncToEmd && saved.emdAmount > 0) {
-      const alreadyLinked = emdRecords.some(
+      const alreadyLinked = nextEmdRecords.some(
         (r) => r.tenderId.toLowerCase() === saved.tenderId.toLowerCase(),
       );
       if (!alreadyLinked) {
         linkedRecordToSync = createLinkedEmdRecord(saved);
-        setEmdRecords((prev) => [linkedRecordToSync!, ...prev]);
+        nextEmdRecords = [linkedRecordToSync, ...nextEmdRecords];
+        stateRef.current.emdRecords = nextEmdRecords;
+        setEmdRecords(nextEmdRecords);
       }
     }
 
@@ -808,11 +953,25 @@ export default function App() {
         await syncMafTrackerToCloud(user, updatedMaf);
       }
     });
+
+    void pushToGoogleSheet({
+      action: isExisting ? 'UPDATE' : 'CREATE',
+      entityType: 'TENDER',
+      tender: saved,
+      emdRecord: linkedRecordToSync,
+      tendersSnapshot: nextTenders,
+      emdSnapshot: nextEmdRecords,
+    });
   };
 
   const handleUpdateTenderInline = (updated: Tender) => {
     cacheAttachmentPayloads(updated.attachments);
-    setTenders((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    const nextTenders = stateRef.current.tenders.map((t) =>
+      t.id === updated.id ? updated : t,
+    );
+    stateRef.current.tenders = nextTenders;
+    setTenders(nextTenders);
+
     const { changedTrackers } = buildSyncedMafTrackersForTender(
       updated,
       stateRef.current.mafTrackers,
@@ -826,43 +985,95 @@ export default function App() {
         await syncMafTrackerToCloud(user, updatedMaf);
       }
     });
+
+    void pushToGoogleSheet({
+      action: 'UPDATE',
+      entityType: 'TENDER',
+      tender: updated,
+      tendersSnapshot: nextTenders,
+      emdSnapshot: stateRef.current.emdRecords,
+    });
   };
 
   const handleDeleteTender = (id: string) => {
-    setTenders((prev) => prev.filter((t) => t.id !== id));
+    const deletedTender = stateRef.current.tenders.find((t) => t.id === id) ?? null;
+    const nextTenders = stateRef.current.tenders.filter((t) => t.id !== id);
+    stateRef.current.tenders = nextTenders;
+    setTenders(nextTenders);
+
     if (selectedTenderId === id) {
       setSelectedTenderId(null);
     }
     void runCloudTask((user) => deleteTenderFromCloud(user, id));
+
+    if (deletedTender) {
+      void pushToGoogleSheet({
+        action: 'DELETE',
+        entityType: 'TENDER',
+        tender: deletedTender,
+        tendersSnapshot: nextTenders,
+        emdSnapshot: stateRef.current.emdRecords,
+      });
+    }
   };
 
   const handleSyncTenderToEmd = (tender: Tender) => {
-    const alreadyExists = emdRecords.some(
+    const alreadyExists = stateRef.current.emdRecords.some(
       (r) => r.tenderId.toLowerCase() === tender.tenderId.toLowerCase(),
     );
     if (!alreadyExists && tender.emdAmount > 0) {
       const linked = createLinkedEmdRecord(tender);
-      setEmdRecords((prev) => [linked, ...prev]);
+      const nextEmdRecords = [linked, ...stateRef.current.emdRecords];
+      stateRef.current.emdRecords = nextEmdRecords;
+      setEmdRecords(nextEmdRecords);
       void runCloudTask((user) => syncEmdRecordToCloud(user, linked));
+      void pushToGoogleSheet({
+        action: 'CREATE',
+        entityType: 'EMD_BG',
+        emdRecord: linked,
+        tendersSnapshot: stateRef.current.tenders,
+        emdSnapshot: nextEmdRecords,
+      });
     }
   };
 
   const handleSaveEmdRecord = (saved: EmdBgRecord) => {
     cacheAttachmentPayloads(saved.attachments);
-    setEmdRecords((prev) => {
-      const exists = prev.some((r) => r.id === saved.id);
-      if (exists) {
-        return prev.map((r) => (r.id === saved.id ? saved : r));
-      }
-      return [saved, ...prev];
-    });
+    const prevEmd = stateRef.current.emdRecords;
+    const isExisting = prevEmd.some((r) => r.id === saved.id);
+    const nextEmdRecords = isExisting
+      ? prevEmd.map((r) => (r.id === saved.id ? saved : r))
+      : [saved, ...prevEmd];
+    stateRef.current.emdRecords = nextEmdRecords;
+    setEmdRecords(nextEmdRecords);
     setEmdModalTarget(undefined);
     void runCloudTask((user) => syncEmdRecordToCloud(user, saved));
+
+    void pushToGoogleSheet({
+      action: isExisting ? 'UPDATE' : 'CREATE',
+      entityType: 'EMD_BG',
+      emdRecord: saved,
+      tendersSnapshot: stateRef.current.tenders,
+      emdSnapshot: nextEmdRecords,
+    });
   };
 
   const handleDeleteEmdRecord = (id: string) => {
-    setEmdRecords((prev) => prev.filter((r) => r.id !== id));
+    const deletedRecord = stateRef.current.emdRecords.find((r) => r.id === id) ?? null;
+    const nextEmdRecords = stateRef.current.emdRecords.filter((r) => r.id !== id);
+    stateRef.current.emdRecords = nextEmdRecords;
+    setEmdRecords(nextEmdRecords);
     void runCloudTask((user) => deleteEmdRecordFromCloud(user, id));
+
+    if (deletedRecord) {
+      void pushToGoogleSheet({
+        action: 'DELETE',
+        entityType: 'EMD_BG',
+        emdRecord: deletedRecord,
+        tendersSnapshot: stateRef.current.tenders,
+        emdSnapshot: nextEmdRecords,
+      });
+    }
   };
 
   // MAF Tracker Optimistic Handlers
@@ -1070,6 +1281,44 @@ export default function App() {
     void runCloudTask((user) => syncWhatsAppConfigToCloud(user, nextSettings));
   };
 
+  const handleSaveSheetSettings = async (nextSettings: GoogleSheetSettings) => {
+    stateRef.current.sheetSettings = nextSettings;
+    setSheetSettings(nextSettings);
+    setSheetSyncError(null);
+    if (stateRef.current.firebaseUser) {
+      void runCloudTask((user) => syncSheetConfigToCloud(user, nextSettings));
+    }
+    if (!nextSettings.webhookUrl.trim()) {
+      setSheetSyncStatus('unconfigured');
+      return;
+    }
+    setSheetSyncStatus('idle');
+    await pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      settingsOverride: nextSettings,
+      force: true,
+    });
+  };
+
+  const handleTestSheetWebhook = async (settingsOverride?: GoogleSheetSettings) => {
+    await pushToGoogleSheet({
+      action: 'PING',
+      entityType: 'SYSTEM',
+      settingsOverride,
+      force: true,
+    });
+  };
+
+  const handleFullSyncToSheet = async (settingsOverride?: GoogleSheetSettings) => {
+    await pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      settingsOverride,
+      force: true,
+    });
+  };
+
   const handleTriggerTestWhatsApp = async () => {
     const sampleTender =
       stateRef.current.tenders.find(
@@ -1115,6 +1364,9 @@ export default function App() {
     for (const m of payload.mafTrackers ?? []) cacheMafPayloads(m.itemsMAF);
 
     const nextMaf = payload.mafTrackers ?? [];
+    stateRef.current.tenders = payload.tenders;
+    stateRef.current.emdRecords = payload.emdRecords;
+    stateRef.current.firmProfile = payload.profile;
     setFirmProfile(payload.profile);
     setTenders(payload.tenders);
     setEmdRecords(payload.emdRecords);
@@ -1134,9 +1386,18 @@ export default function App() {
         nextMaf,
       ),
     );
+    void pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      tendersSnapshot: payload.tenders,
+      emdSnapshot: payload.emdRecords,
+    });
   };
 
   const handleResetDemoData = () => {
+    stateRef.current.firmProfile = DEFAULT_FIRM_PROFILE;
+    stateRef.current.tenders = SEED_TENDERS;
+    stateRef.current.emdRecords = SEED_EMD_RECORDS;
     setFirmProfile(DEFAULT_FIRM_PROFILE);
     setTenders(SEED_TENDERS);
     setEmdRecords(SEED_EMD_RECORDS);
@@ -1156,10 +1417,18 @@ export default function App() {
         SEED_MAF_TRACKERS,
       ),
     );
+    void pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      tendersSnapshot: SEED_TENDERS,
+      emdSnapshot: SEED_EMD_RECORDS,
+    });
   };
 
   const handleClearAllData = () => {
     attachmentFilesRef.current.clear();
+    stateRef.current.tenders = [];
+    stateRef.current.emdRecords = [];
     setTenders([]);
     setEmdRecords([]);
     setMafTrackers([]);
@@ -1171,6 +1440,12 @@ export default function App() {
     void runCloudTask((user) =>
       replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], []),
     );
+    void pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      tendersSnapshot: [],
+      emdSnapshot: [],
+    });
   };
 
   if (!isAuthenticated) {
@@ -1215,6 +1490,9 @@ export default function App() {
           cloudError={cloudFeedback?.type === 'err'}
           onConnectCloud={handleConnectCloud}
           onOpenCloudSettings={() => setActiveTab('settings')}
+          sheetSyncStatus={sheetSyncStatus}
+          sheetSyncError={sheetSyncError}
+          onOpenSheetSettings={() => setActiveTab('settings')}
         />
 
         <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto space-y-4">
@@ -1291,6 +1569,20 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'bidsearch' && (
+            <BidSearchTab
+              tenders={tenders}
+              onSaveScannedTender={(saved, syncToEmd) => handleSaveTender(saved, syncToEmd)}
+              onOpenExistingTender={(tender) => {
+                setActiveTab('tenders');
+                setSelectedTenderId(tender.id);
+              }}
+              onAddManualTender={() => setTenderModalTarget(null)}
+              onGoToDailyTenders={() => setActiveTab('tenders')}
+              onNotify={showToast}
+            />
+          )}
+
           {activeTab === 'tenders' && (
             <TendersTab
               tenders={tenders}
@@ -1351,6 +1643,12 @@ export default function App() {
               whatsappGatewayInfo={whatsappGatewayInfo}
               onSaveWhatsAppSettings={handleSaveWhatsAppSettings}
               onTriggerTestWhatsApp={handleTriggerTestWhatsApp}
+              sheetSettings={sheetSettings}
+              sheetSyncStatus={sheetSyncStatus}
+              sheetSyncError={sheetSyncError}
+              onSaveSheetSettings={handleSaveSheetSettings}
+              onTestSheetWebhook={handleTestSheetWebhook}
+              onFullSyncToSheet={handleFullSyncToSheet}
             />
           )}
         </main>

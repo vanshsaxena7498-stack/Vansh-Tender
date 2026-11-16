@@ -115,7 +115,26 @@ export interface UserPreferences {
   darkMode: boolean;
 }
 
-export type TabKey = 'dashboard' | 'tenders' | 'maf' | 'emdbg' | 'settings';
+export type TabKey = 'dashboard' | 'bidsearch' | 'tenders' | 'maf' | 'emdbg' | 'settings';
+
+export interface ExtractedBidDraft {
+  tenderId: string;
+  portal: PortalType;
+  stage: TenderStage;
+  department: string;
+  location: string;
+  title: string;
+  category: string;
+  publishDate: string;
+  submissionDueDate: string;
+  preBidDate: string;
+  completionDate: string;
+  estimatedValue: number;
+  quotedValue: number;
+  emdStatus: EmdSecurityType;
+  emdAmount: number;
+  resultInfo: string;
+}
 
 export type MafItemStatus =
   | 'Not Requested'
@@ -129,9 +148,13 @@ export interface MafLineItem {
   itemName: string;
   requiredQuantity: string;
   oemName: string;
+  concernedPersonName?: string;
+  contactNo?: string;
+  mailId?: string;
   oemContact?: string;
   mafStatus: MafItemStatus;
-  validityDate: string;
+  mafRequestedDate: string;
+  validityDate?: string;
   mafDocumentUrl: string;
   mafDocumentName?: string;
   mafAttachmentId?: string;
@@ -186,6 +209,19 @@ export interface WhatsAppAlertLog {
   createdAt: string;
 }
 
+export type SheetSyncAction = 'CREATE' | 'UPDATE' | 'DELETE' | 'FULL_SYNC' | 'PING';
+
+export type SheetSyncEntityType = 'TENDER' | 'EMD_BG' | 'BULK' | 'SYSTEM';
+
+export type SheetSyncStatus = 'unconfigured' | 'idle' | 'syncing' | 'synced' | 'error';
+
+export interface GoogleSheetSettings {
+  enabled: boolean;
+  webhookUrl: string;
+  sheetName: string;
+  lastSyncedAt?: string;
+}
+
 export interface CrmBackupPayload {
   version: number;
   exportedAt: string;
@@ -194,4 +230,5 @@ export interface CrmBackupPayload {
   emdRecords: EmdBgRecord[];
   mafTrackers?: MafTrackerRecord[];
 }
+
 

@@ -670,6 +670,52 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "GoogleSheetConfig": {
+      "title": "GoogleSheetConfig",
+      "description": "Google Apps Script Webhook URL and MIS Monthly Report real-time sync configuration.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "webhookUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "sheetName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "lastSyncedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "enabled",
+        "webhookUrl",
+        "sheetName",
+        "lastSyncedAt",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -732,6 +778,12 @@
         "$ref": "#/entities/WhatsAppAlertLog"
       },
       "description": "Deduplicated 48h and 4h tender WhatsApp notification logs."
+    },
+    "/users/{userId}/sheetConfig/{configId}": {
+      "schema": {
+        "$ref": "#/entities/GoogleSheetConfig"
+      },
+      "description": "Google Apps Script Webhook configuration for real-time MIS Monthly Report synchronization."
     }
   }
 }
