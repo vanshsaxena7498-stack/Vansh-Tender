@@ -9,6 +9,7 @@ import {
   Loader2,
   Paperclip,
   Plus,
+  RotateCcw,
   ScanSearch,
   Search,
   Trash2,
@@ -34,7 +35,10 @@ import {
   buildTenderFromBidDraft,
   findDuplicateTender,
 } from '../utils/bidSearchParser';
+import { sanitizeExtractErrorMessage } from '../utils/geminiRetry';
 import { formatINR, formatShortDate, getDaysRemaining } from '../utils/formatters';
+
+const EXTRACT_PDF_TIMEOUT_MS = 45_000;
 
 interface BidSearchTabProps {
   tenders: Tender[];
@@ -74,10 +78,13 @@ const STAGE_OPTIONS: TenderStage[] = [
 
 interface ScannedBidCardState {
   scanId: string;
+  file: File;
   fileName: string;
   fileSize: number;
   status: 'scanning' | 'ready' | 'error' | 'saved';
   errorMsg?: string;
+  modelUsed?: string;
+  fallbackUsed?: boolean;
   draft?: ExtractedBidDraft;
   attachment1: AttachmentItem | null;
   attachmentWarning?: string;
@@ -86,13 +93,25 @@ interface ScannedBidCardState {
   savedTenderRecord?: Tender;
 }
 
-async function safeParseJson<T>(res: Response): Promise<T | null> {
-  const text = await res.text();
-  if (!text) return null;
+interface ParsedExtractResponse {
+  ok?: boolean;
+  success?: boolean;
+  modelUsed?: string;
+  fallbackUsed?: boolean;
+  extracted?: ExtractedBidDraft;
+  error?: string;
+}
+
+async function safeReadExtractResponse(res: Response): Promise<{
+  json: ParsedExtractResponse | null;
+  rawText: string;
+}> {
+  const rawText = await res.text().catch(() => '');
+  if (!rawText) return { json: null, rawText: '' };
   try {
-    return JSON.parse(text) as T;
+    return { json: JSON.parse(rawText) as ParsedExtractResponse, rawText };
   } catch {
-    return null;
+    return { json: null, rawText };
   }
 }
 
@@ -145,6 +164,165 @@ export function BidSearchTab({
       .slice(0, 8);
   }, [tenders, recentSearchQuery]);
 
+  const scanSingleBidCard = async (
+    scanId: string,
+    file: File,
+    batchAutoSavedIds: Set<string>,
+  ) => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), EXTRACT_PDF_TIMEOUT_MS);
+
+    try {
+      // 1. Read PDF as base64 for server-side Gemini extraction
+      const rawDataUrl = await readFileAsDataUrl(file);
+      const commaIdx = rawDataUrl.indexOf(',');
+      const fileBase64 = commaIdx >= 0 ? rawDataUrl.slice(commaIdx + 1) : rawDataUrl;
+
+      // 2. Prepare Attachment 1 (NIT / Tender Document) respecting existing 650 KB Firestore limit
+      let attachment1: AttachmentItem | null = null;
+      let attachmentWarning: string | undefined;
+      if (file.size <= MAX_ATTACHMENT_BYTES) {
+        try {
+          const prepared = await readAttachmentForFirestore(file);
+          attachment1 = {
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            slotLabel: TENDER_DEFAULT_SLOT_LABELS[0],
+            fileName: file.name,
+            fileType: prepared.fileType || 'application/pdf',
+            fileSize: prepared.fileSize,
+            uploadedAt: new Date().toISOString().slice(0, 10),
+            dataUrl: prepared.dataUrl,
+          };
+        } catch (attErr) {
+          attachmentWarning =
+            attErr instanceof Error
+              ? attErr.message
+              : 'PDF exceeds 650 KB cloud attachment limit.';
+        }
+      } else {
+        attachmentWarning = `PDF (${formatFileSize(file.size)}) exceeds the 650 KB Attachment 1 Firestore limit. Tender details will still save; attach a compressed PDF in Attachment 1 later.`;
+      }
+
+      // 3. Call server-side Gemini API proxy route with strict 45s AbortController timeout
+      const res = await fetch('/api/tenders/extract-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          fileName: file.name,
+          mimeType: file.type || 'application/pdf',
+          fileBase64,
+        }),
+      });
+
+      const { json: data, rawText } = await safeReadExtractResponse(res);
+      const isOk = Boolean(res.ok && (data?.ok || data?.success) && data?.extracted);
+
+      if (!isOk || !data?.extracted) {
+        const cleanErrMsg = sanitizeExtractErrorMessage(
+          data?.error || rawText || `HTTP ${res.status}`,
+          res.status,
+        );
+        setScanQueue((prev) =>
+          prev.map((item) =>
+            item.scanId === scanId
+              ? {
+                  ...item,
+                  status: 'error',
+                  errorMsg: cleanErrMsg,
+                  attachment1,
+                  attachmentWarning,
+                }
+              : item,
+          ),
+        );
+        return;
+      }
+
+      const draft = data.extracted;
+      const shouldAutoSyncEmd =
+        (draft.emdStatus === 'EMD Paid' || draft.emdStatus === 'BG Submitted') &&
+        draft.emdAmount > 0;
+
+      // Check auto-save mode (only if unique / non-duplicate across both existing and current batch)
+      const normalizedId = draft.tenderId.trim().toLowerCase();
+      const isDuplicate =
+        Boolean(findDuplicateTender(tendersRef.current, draft.tenderId)) ||
+        batchAutoSavedIds.has(normalizedId);
+
+      if (autoSaveEnabled && !isDuplicate && normalizedId) {
+        batchAutoSavedIds.add(normalizedId);
+        const newTender = buildTenderFromBidDraft(draft, attachment1);
+        onSaveScannedTender(newTender, shouldAutoSyncEmd);
+        setScanQueue((prev) =>
+          prev.map((item) =>
+            item.scanId === scanId
+              ? {
+                  ...item,
+                  status: 'saved',
+                  errorMsg: undefined,
+                  modelUsed: data.modelUsed,
+                  fallbackUsed: data.fallbackUsed,
+                  draft,
+                  attachment1,
+                  attachmentWarning,
+                  syncToEmd: shouldAutoSyncEmd,
+                  savedTenderId: newTender.tenderId,
+                  savedTenderRecord: newTender,
+                }
+              : item,
+          ),
+        );
+        onNotify(
+          'ok',
+          attachment1
+            ? `Auto-saved ${newTender.tenderId} (${newTender.location}) with Attachment 1.`
+            : `Auto-saved ${newTender.tenderId} (${newTender.location}) to Daily Tender Data.`,
+        );
+        return;
+      }
+
+      setScanQueue((prev) =>
+        prev.map((item) =>
+          item.scanId === scanId
+            ? {
+                ...item,
+                status: 'ready',
+                errorMsg: undefined,
+                modelUsed: data.modelUsed,
+                fallbackUsed: data.fallbackUsed,
+                draft,
+                attachment1,
+                attachmentWarning,
+                syncToEmd: shouldAutoSyncEmd,
+              }
+            : item,
+        ),
+      );
+    } catch (err) {
+      const isAbort =
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
+      const cleanErrMsg = isAbort
+        ? sanitizeExtractErrorMessage('AbortError: 45s timeout', 504)
+        : sanitizeExtractErrorMessage(err);
+
+      setScanQueue((prev) =>
+        prev.map((item) =>
+          item.scanId === scanId
+            ? {
+                ...item,
+                status: 'error',
+                errorMsg: cleanErrMsg,
+              }
+            : item,
+        ),
+      );
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
   const processPdfFiles = async (fileList: FileList | File[]) => {
     const files = Array.from(fileList);
     if (files.length === 0) return;
@@ -179,6 +357,7 @@ export function BidSearchTab({
       ...createdEntries.map(
         ({ scanId, file }): ScannedBidCardState => ({
           scanId,
+          file,
           fileName: file.name,
           fileSize: file.size,
           status: 'scanning',
@@ -193,150 +372,31 @@ export function BidSearchTab({
       tendersRef.current.map((t) => t.tenderId.trim().toLowerCase()),
     );
 
-    await Promise.all(
-      createdEntries.map(async ({ scanId, file }) => {
-        try {
-          // 1. Read PDF as base64 for server-side Gemini extraction
-          const rawDataUrl = await readFileAsDataUrl(file);
-          const commaIdx = rawDataUrl.indexOf(',');
-          const fileBase64 = commaIdx >= 0 ? rawDataUrl.slice(commaIdx + 1) : rawDataUrl;
-
-          // 2. Prepare Attachment 1 (NIT / Tender Document) respecting existing 650 KB Firestore limit
-          let attachment1: AttachmentItem | null = null;
-          let attachmentWarning: string | undefined;
-          if (file.size <= MAX_ATTACHMENT_BYTES) {
-            try {
-              const prepared = await readAttachmentForFirestore(file);
-              attachment1 = {
-                id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                slotLabel: TENDER_DEFAULT_SLOT_LABELS[0],
-                fileName: file.name,
-                fileType: prepared.fileType || 'application/pdf',
-                fileSize: prepared.fileSize,
-                uploadedAt: new Date().toISOString().slice(0, 10),
-                dataUrl: prepared.dataUrl,
-              };
-            } catch (attErr) {
-              attachmentWarning =
-                attErr instanceof Error
-                  ? attErr.message
-                  : 'PDF exceeds 650 KB cloud attachment limit.';
-            }
-          } else {
-            attachmentWarning = `PDF (${formatFileSize(file.size)}) exceeds the 650 KB Attachment 1 Firestore limit. Tender details will still save; attach a compressed PDF in Attachment 1 later.`;
-          }
-
-          // 3. Call server-side Gemini API proxy route
-          const res = await fetch('/api/tenders/extract-pdf', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fileName: file.name,
-              mimeType: file.type || 'application/pdf',
-              fileBase64,
-            }),
-          });
-
-          const data = await safeParseJson<{
-            ok?: boolean;
-            extracted?: ExtractedBidDraft;
-            error?: string;
-          }>(res);
-
-          if (!res.ok || !data?.ok || !data.extracted) {
-            const errMsg =
-              data?.error ||
-              (res.status === 413
-                ? 'PDF is too large for serverless payload limit (~4.5 MB). Please upload a smaller or first-pages PDF.'
-                : `AI PDF scan failed (HTTP ${res.status}).`);
-            setScanQueue((prev) =>
-              prev.map((item) =>
-                item.scanId === scanId
-                  ? {
-                      ...item,
-                      status: 'error',
-                      errorMsg: errMsg,
-                      attachment1,
-                      attachmentWarning,
-                    }
-                  : item,
-              ),
-            );
-            return;
-          }
-
-          const draft = data.extracted;
-          const shouldAutoSyncEmd =
-            (draft.emdStatus === 'EMD Paid' || draft.emdStatus === 'BG Submitted') &&
-            draft.emdAmount > 0;
-
-          // Check auto-save mode (only if unique / non-duplicate across both existing and current batch)
-          const normalizedId = draft.tenderId.trim().toLowerCase();
-          const isDuplicate =
-            Boolean(findDuplicateTender(tendersRef.current, draft.tenderId)) ||
-            batchAutoSavedIds.has(normalizedId);
-
-          if (autoSaveEnabled && !isDuplicate && normalizedId) {
-            batchAutoSavedIds.add(normalizedId);
-            const newTender = buildTenderFromBidDraft(draft, attachment1);
-            onSaveScannedTender(newTender, shouldAutoSyncEmd);
-            setScanQueue((prev) =>
-              prev.map((item) =>
-                item.scanId === scanId
-                  ? {
-                      ...item,
-                      status: 'saved',
-                      draft,
-                      attachment1,
-                      attachmentWarning,
-                      syncToEmd: shouldAutoSyncEmd,
-                      savedTenderId: newTender.tenderId,
-                      savedTenderRecord: newTender,
-                    }
-                  : item,
-              ),
-            );
-            onNotify(
-              'ok',
-              attachment1
-                ? `Auto-saved ${newTender.tenderId} (${newTender.location}) with Attachment 1.`
-                : `Auto-saved ${newTender.tenderId} (${newTender.location}) to Daily Tender Data.`,
-            );
-            return;
-          }
-
-          setScanQueue((prev) =>
-            prev.map((item) =>
-              item.scanId === scanId
-                ? {
-                    ...item,
-                    status: 'ready',
-                    draft,
-                    attachment1,
-                    attachmentWarning,
-                    syncToEmd: shouldAutoSyncEmd,
-                  }
-                : item,
-            ),
-          );
-        } catch (err) {
-          setScanQueue((prev) =>
-            prev.map((item) =>
-              item.scanId === scanId
-                ? {
-                    ...item,
-                    status: 'error',
-                    errorMsg:
-                      err instanceof Error
-                        ? err.message
-                        : 'Unexpected error while scanning PDF.',
-                  }
-                : item,
-            ),
-          );
-        }
-      }),
+    // Run each file inside an independent Promise.allSettled worker so one failure never interrupts sibling PDFs
+    await Promise.allSettled(
+      createdEntries.map(({ scanId, file }) =>
+        scanSingleBidCard(scanId, file, batchAutoSavedIds),
+      ),
     );
+  };
+
+  const handleRetrySingleCard = (item: ScannedBidCardState) => {
+    if (item.status === 'scanning') return;
+    setScanQueue((prev) =>
+      prev.map((card) =>
+        card.scanId === item.scanId
+          ? {
+              ...card,
+              status: 'scanning',
+              errorMsg: undefined,
+            }
+          : card,
+      ),
+    );
+    const existingIds = new Set(
+      tendersRef.current.map((t) => t.tenderId.trim().toLowerCase()),
+    );
+    void scanSingleBidCard(item.scanId, item.file, existingIds);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
@@ -669,19 +729,43 @@ export function BidSearchTab({
 
                   {/* Error State */}
                   {item.status === 'error' && (
-                    <div className="p-5 flex flex-wrap items-center justify-between gap-3 bg-red-50/70 dark:bg-red-950/30 text-xs text-red-800 dark:text-red-200">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <AlertTriangle className="h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
-                        <span>{item.errorMsg}</span>
+                    <div
+                      role="alert"
+                      className="p-5 flex flex-wrap items-center justify-between gap-3 bg-red-50/70 dark:bg-red-950/30 text-xs text-red-800 dark:text-red-200"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                        <AlertTriangle
+                          className="h-4 w-4 shrink-0 text-red-600 dark:text-red-400 mt-0.5"
+                          aria-hidden="true"
+                        />
+                        <div className="min-w-0 space-y-0.5">
+                          <p className="font-semibold text-red-900 dark:text-red-100">
+                            Scan unsuccessful for {item.fileName}
+                          </p>
+                          <p className="text-red-800 dark:text-red-200 break-words">
+                            {item.errorMsg}
+                          </p>
+                        </div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveCard(item.scanId)}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-300 dark:border-red-800 bg-white dark:bg-slate-900 text-xs font-medium text-red-700 dark:text-red-300"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        <span>Dismiss</span>
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleRetrySingleCard(item)}
+                          aria-label={`Retry scanning ${item.fileName}`}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium transition-colors"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>Retry This File</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveCard(item.scanId)}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-300 dark:border-red-800 bg-white dark:bg-slate-900 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>Dismiss</span>
+                        </button>
+                      </div>
                     </div>
                   )}
 

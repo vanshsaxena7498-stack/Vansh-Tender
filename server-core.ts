@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import express, { type Request, type Response, type Router } from 'express';
+import express, { type NextFunction, type Request, type Response, type Router } from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import nodemailer from 'nodemailer';
 import {
@@ -10,6 +10,20 @@ import {
   sanitizeDistrictStateLocation,
   type RawGeminiBidExtraction,
 } from './src/utils/bidSearchParser.ts';
+import {
+  DEFAULT_RETRY_DELAYS_MS,
+  executeWithRetryAndFallback,
+  extractErrorStatus,
+  extractJsonObjectFromText,
+  FALLBACK_PDF_MODEL,
+  isNonRetryableAuthOrConfigError,
+  isRetryableGeminiError,
+  PRIMARY_PDF_MODEL,
+  sanitizeExtractErrorMessage,
+  TimeoutError,
+  withRetry,
+  withTimeout,
+} from './src/utils/geminiRetry.ts';
 
 const ADMIN_USERNAME = 'VanshSales';
 const DEFAULT_ADMIN_PASSWORD = process.env.CRM_INITIAL_PASSWORD || 'Vansh@2027';
@@ -742,11 +756,17 @@ export function createApiRouter(): Router {
   });
 
   router.post('/tenders/extract-pdf', async (req: Request, res: Response) => {
+    const routeStartedAt = Date.now();
+    const TOTAL_ROUTE_BUDGET_MS = 39_000;
+    const PER_ATTEMPT_TIMEOUT_MS = 16_000;
+
     try {
       const apiKey = process.env.GEMINI_API_KEY?.trim();
       if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-        res.status(500).json({
+        res.status(503).json({
           ok: false,
+          success: false,
+          retryable: false,
           error:
             'Gemini API key is not configured on the server. Add GEMINI_API_KEY in AI Studio Secrets or Vercel Environment Variables.',
         });
@@ -758,7 +778,10 @@ export function createApiRouter(): Router {
         mimeType?: unknown;
         fileBase64?: unknown;
       };
-      const fileName = typeof body.fileName === 'string' ? body.fileName.trim() : 'bid-document.pdf';
+      const fileName =
+        typeof body.fileName === 'string' && body.fileName.trim()
+          ? body.fileName.trim()
+          : 'bid-document.pdf';
       const mimeType =
         typeof body.mimeType === 'string' && body.mimeType.trim()
           ? body.mimeType.trim()
@@ -769,6 +792,8 @@ export function createApiRouter(): Router {
       if (!base64Data) {
         res.status(400).json({
           ok: false,
+          success: false,
+          retryable: false,
           error: 'No PDF content received. Please upload a valid .pdf file.',
         });
         return;
@@ -777,6 +802,8 @@ export function createApiRouter(): Router {
       if (mimeType !== 'application/pdf' && !fileName.toLowerCase().endsWith('.pdf')) {
         res.status(400).json({
           ok: false,
+          success: false,
+          retryable: false,
           error: 'Only PDF (.pdf) bid documents are supported for Bid Search scanning.',
         });
         return;
@@ -813,123 +840,164 @@ export function createApiRouter(): Router {
         '17. resultInfo: Always return "".',
       ].join('\n');
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: 'application/pdf',
-                data: base64Data,
-              },
-            },
-            {
-              text: promptText,
-            },
-          ],
-        },
-        config: {
-          systemInstruction:
-            'You are a precision Indian GeM and government tender PDF parser. Extract structured bid details strictly matching the JSON schema without inventing missing financial figures.',
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              tenderId: { type: Type.STRING, description: 'Exact Tender ID / Bid Number' },
-              portal: { type: Type.STRING, description: 'Portal source such as GeM' },
-              stage: { type: Type.STRING, description: 'Always Identified / Reviewing' },
-              department: {
-                type: Type.STRING,
-                description: 'Combined Ministry, Department, and Organisation Name',
-              },
-              location: {
-                type: Type.STRING,
-                description: 'District and State from Consignee Address or Pre-Bid Venue',
-              },
-              consigneeAddressRaw: {
-                type: Type.STRING,
-                description: 'Complete verbatim Consignee / Delivery Address or PIN code from PDF',
-              },
-              title: {
-                type: Type.STRING,
-                description: 'BOQ Title or primary scope of work',
-              },
-              category: {
-                type: Type.STRING,
-                description: 'Primary Product Category or main Item Category',
-              },
-              publishDate: {
-                type: Type.STRING,
-                description: 'Dated / Published Date in YYYY-MM-DD format',
-              },
-              submissionDueDate: {
-                type: Type.STRING,
-                description: 'Bid End Date/Time in YYYY-MM-DDTHH:mm format',
-              },
-              preBidDate: {
-                type: Type.STRING,
-                description: 'Pre-Bid Meeting Date in YYYY-MM-DD format or empty string',
-              },
-              completionDate: {
-                type: Type.STRING,
-                description: 'Leave blank empty string',
-              },
-              estimatedValue: {
-                type: Type.NUMBER,
-                description: 'Estimated Bid Value in INR if explicitly mentioned, else 0',
-              },
-              quotedValue: {
-                type: Type.NUMBER,
-                description: 'Leave 0',
-              },
-              emdRequired: {
-                type: Type.STRING,
-                description: 'Required, BG Submitted, Exempted - MSME/Startup, or Not Required',
-              },
-              emdAmount: {
-                type: Type.NUMBER,
-                description: 'Numeric EMD amount in INR or 0',
-              },
-              resultInfo: {
-                type: Type.STRING,
-                description: 'Leave blank empty string',
-              },
-            },
-            required: [
-              'tenderId',
-              'portal',
-              'stage',
-              'department',
-              'location',
-              'consigneeAddressRaw',
-              'title',
-              'category',
-              'publishDate',
-              'submissionDueDate',
-              'preBidDate',
-              'completionDate',
-              'estimatedValue',
-              'quotedValue',
-              'emdRequired',
-              'emdAmount',
-              'resultInfo',
-            ],
+      const extractionSchema = {
+        type: Type.OBJECT,
+        properties: {
+          tenderId: { type: Type.STRING, description: 'Exact Tender ID / Bid Number' },
+          portal: { type: Type.STRING, description: 'Portal source such as GeM' },
+          stage: { type: Type.STRING, description: 'Always Identified / Reviewing' },
+          department: {
+            type: Type.STRING,
+            description: 'Combined Ministry, Department, and Organisation Name',
           },
+          location: {
+            type: Type.STRING,
+            description: 'District and State from Consignee Address or Pre-Bid Venue',
+          },
+          consigneeAddressRaw: {
+            type: Type.STRING,
+            description: 'Complete verbatim Consignee / Delivery Address or PIN code from PDF',
+          },
+          title: {
+            type: Type.STRING,
+            description: 'BOQ Title or primary scope of work',
+          },
+          category: {
+            type: Type.STRING,
+            description: 'Primary Product Category or main Item Category',
+          },
+          publishDate: {
+            type: Type.STRING,
+            description: 'Dated / Published Date in YYYY-MM-DD format',
+          },
+          submissionDueDate: {
+            type: Type.STRING,
+            description: 'Bid End Date/Time in YYYY-MM-DDTHH:mm format',
+          },
+          preBidDate: {
+            type: Type.STRING,
+            description: 'Pre-Bid Meeting Date in YYYY-MM-DD format or empty string',
+          },
+          completionDate: {
+            type: Type.STRING,
+            description: 'Leave blank empty string',
+          },
+          estimatedValue: {
+            type: Type.NUMBER,
+            description: 'Estimated Bid Value in INR if explicitly mentioned, else 0',
+          },
+          quotedValue: {
+            type: Type.NUMBER,
+            description: 'Leave 0',
+          },
+          emdRequired: {
+            type: Type.STRING,
+            description: 'Required, BG Submitted, Exempted - MSME/Startup, or Not Required',
+          },
+          emdAmount: {
+            type: Type.NUMBER,
+            description: 'Numeric EMD amount in INR or 0',
+          },
+          resultInfo: {
+            type: Type.STRING,
+            description: 'Leave blank empty string',
+          },
+        },
+        required: [
+          'tenderId',
+          'portal',
+          'stage',
+          'department',
+          'location',
+          'consigneeAddressRaw',
+          'title',
+          'category',
+          'publishDate',
+          'submissionDueDate',
+          'preBidDate',
+          'completionDate',
+          'estimatedValue',
+          'quotedValue',
+          'emdRequired',
+          'emdAmount',
+          'resultInfo',
+        ],
+      };
+
+      const extractionOutcome = await executeWithRetryAndFallback<RawGeminiBidExtraction>({
+        primaryModel: PRIMARY_PDF_MODEL,
+        fallbackModel: FALLBACK_PDF_MODEL,
+        primaryRetryOptions: {
+          maxRetries: 3,
+          delaysMs: DEFAULT_RETRY_DELAYS_MS,
+          deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS - 10_000,
+          onRetry: ({ attempt, maxRetries, delayMs }) => {
+            console.warn(
+              `[extract-pdf] Primary model ${PRIMARY_PDF_MODEL} busy on "${fileName}". Retry ${attempt}/${maxRetries} in ${delayMs}ms.`,
+            );
+          },
+        },
+        fallbackRetryOptions: {
+          maxRetries: 1,
+          delaysMs: [1500],
+          deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS - 2_000,
+        },
+        onFallback: ({ fromModel, toModel }) => {
+          console.warn(
+            `[extract-pdf] Switching from ${fromModel} to fast fallback model ${toModel} for "${fileName}".`,
+          );
+        },
+        runAttempt: async (model) => {
+          const remainingBudgetMs = routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now();
+          const attemptTimeoutMs = Math.max(
+            4_000,
+            Math.min(PER_ATTEMPT_TIMEOUT_MS, remainingBudgetMs),
+          );
+          if (remainingBudgetMs <= 1_500) {
+            throw new TimeoutError('Server time budget exceeded before completing PDF extraction.');
+          }
+
+          const modelResponse = await withTimeout(
+            ai.models.generateContent({
+              model,
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'application/pdf',
+                      data: base64Data,
+                    },
+                  },
+                  {
+                    text: promptText,
+                  },
+                ],
+              },
+              config: {
+                abortSignal: AbortSignal.timeout(attemptTimeoutMs),
+                systemInstruction:
+                  'You are a precision Indian GeM and government tender PDF parser. Extract structured bid details strictly matching the JSON schema without inventing missing financial figures.',
+                ...(model === PRIMARY_PDF_MODEL
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+                responseMimeType: 'application/json',
+                responseSchema: extractionSchema,
+              },
+            }),
+            attemptTimeoutMs,
+            'Gemini PDF extraction request timed out.',
+          );
+
+          const rawText = (modelResponse.text ?? '').trim();
+          const parsedJson = extractJsonObjectFromText<RawGeminiBidExtraction>(rawText);
+          if (!parsedJson) {
+            throw new Error('Gemini returned empty or invalid structured JSON output.');
+          }
+          return parsedJson;
         },
       });
 
-      const rawText = (response.text ?? '{}').trim();
-      let parsed: RawGeminiBidExtraction = {};
-      try {
-        parsed = JSON.parse(rawText) as RawGeminiBidExtraction;
-      } catch {
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          parsed = JSON.parse(jsonMatch[0]) as RawGeminiBidExtraction;
-        }
-      }
-
+      const parsed = extractionOutcome.result;
       const addressForSearch =
         typeof parsed.consigneeAddressRaw === 'string' && parsed.consigneeAddressRaw.trim()
           ? parsed.consigneeAddressRaw.trim()
@@ -937,27 +1005,46 @@ export function createApiRouter(): Router {
             ? parsed.location.trim()
             : '';
 
-      if (addressForSearch) {
+      const remainingForGeoMs = routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now();
+      if (addressForSearch && remainingForGeoMs >= 3_500) {
         try {
-          const geoResponse = await ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: [
-              'Using Google Search, find the exact Indian administrative District and State for the address below (lookup PIN code, locality, town, cantonment, or organisation campus if district is not explicitly stated).',
-              'Return ONLY "District, State" (for example: "Panchkula, Haryana" or "Lucknow, Uttar Pradesh") with no extra words, street address, or PIN code.',
-              '',
-              `Address from PDF: ${addressForSearch}`,
-              `Department / Organisation: ${typeof parsed.department === 'string' ? parsed.department : ''}`,
-              `Initial Extracted Location: ${typeof parsed.location === 'string' ? parsed.location : ''}`,
-            ].join('\n'),
-            config: {
-              tools: [{ googleSearch: {} }],
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              systemInstruction:
-                'Output strictly "District, State" for an Indian address. Never include street address, PIN code, office name, bullet points, or explanatory text.',
+          const geoModel = extractionOutcome.fallbackUsed ? FALLBACK_PDF_MODEL : PRIMARY_PDF_MODEL;
+          const geoOutcome = await withRetry(
+            async () => {
+              const geoTimeout = Math.max(2_500, Math.min(6_500, routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now()));
+              return await withTimeout(
+                ai.models.generateContent({
+                  model: geoModel,
+                  contents: [
+                    'Using Google Search, find the exact Indian administrative District and State for the address below (lookup PIN code, locality, town, cantonment, or organisation campus if district is not explicitly stated).',
+                    'Return ONLY "District, State" (for example: "Panchkula, Haryana" or "Lucknow, Uttar Pradesh") with no extra words, street address, or PIN code.',
+                    '',
+                    `Address from PDF: ${addressForSearch}`,
+                    `Department / Organisation: ${typeof parsed.department === 'string' ? parsed.department : ''}`,
+                    `Initial Extracted Location: ${typeof parsed.location === 'string' ? parsed.location : ''}`,
+                  ].join('\n'),
+                  config: {
+                    abortSignal: AbortSignal.timeout(geoTimeout),
+                    tools: [{ googleSearch: {} }],
+                    ...(geoModel === PRIMARY_PDF_MODEL
+                      ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                      : {}),
+                    systemInstruction:
+                      'Output strictly "District, State" for an Indian address. Never include street address, PIN code, office name, bullet points, or explanatory text.',
+                  },
+                }),
+                geoTimeout,
+                'Google Search location grounding timed out.',
+              );
             },
-          });
+            {
+              maxRetries: 1,
+              delaysMs: [1000],
+              deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS,
+            },
+          );
 
-          const groundedLocation = sanitizeDistrictStateLocation(geoResponse.text ?? '');
+          const groundedLocation = sanitizeDistrictStateLocation(geoOutcome.value.text ?? '');
           if (
             groundedLocation &&
             groundedLocation.includes(',') &&
@@ -966,29 +1053,43 @@ export function createApiRouter(): Router {
             parsed.location = groundedLocation;
           }
         } catch {
-          // Non-fatal fallback: keep normalized PDF location if Search Grounding fails
+          // Non-fatal fallback: keep normalized PDF location if Search Grounding fails or times out
         }
       }
 
       const extracted = normalizeExtractedBidDraft(parsed, fileName);
-      res.json({ ok: true, extracted });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to extract details from PDF.';
-      const status =
-        msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')
-          ? 429
-          : msg.includes('403') || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')
-            ? 403
-            : 500;
-      res.status(status).json({
-        ok: false,
-        error:
-          status === 429
-            ? 'Gemini API rate limit reached. Please wait a moment and retry.'
-            : status === 403
-              ? 'Gemini API key permission issue. Please verify GEMINI_API_KEY in Settings > Secrets.'
-              : msg,
+      res.status(200).json({
+        ok: true,
+        success: true,
+        modelUsed: extractionOutcome.modelUsed,
+        fallbackUsed: extractionOutcome.fallbackUsed,
+        extracted,
       });
+    } catch (err) {
+      const inferredStatus = extractErrorStatus(err);
+      const retryable = isRetryableGeminiError(err);
+      const isAuthErr = isNonRetryableAuthOrConfigError(err);
+      const httpStatus = isAuthErr
+        ? 403
+        : inferredStatus === 429
+          ? 429
+          : err instanceof TimeoutError || inferredStatus === 504
+            ? 504
+            : retryable || inferredStatus === 503 || inferredStatus === 502
+              ? 503
+              : 500;
+
+      const friendlyError = sanitizeExtractErrorMessage(err, httpStatus);
+      console.error('[extract-pdf] Returning clean error JSON:', httpStatus, friendlyError);
+
+      if (!res.headersSent) {
+        res.status(httpStatus).json({
+          ok: false,
+          success: false,
+          retryable,
+          error: friendlyError,
+        });
+      }
     }
   });
 
@@ -1140,4 +1241,31 @@ export function createApiRouter(): Router {
 
   return router;
 }
+
+export function apiJsonErrorMiddleware(
+  err: unknown,
+  _req: Request,
+  res: Response,
+  _next: NextFunction,
+): void {
+  const statusCandidate = extractErrorStatus(err);
+  const status =
+    statusCandidate && statusCandidate >= 400 && statusCandidate <= 599
+      ? statusCandidate
+      : (err as { type?: string } | null)?.type === 'entity.too.large'
+        ? 413
+        : (err as { type?: string } | null)?.type === 'entity.parse.failed'
+          ? 400
+          : 500;
+
+  if (!res.headersSent) {
+    res.status(status).json({
+      ok: false,
+      success: false,
+      retryable: status === 503 || status === 429 || status === 504,
+      error: sanitizeExtractErrorMessage(err, status),
+    });
+  }
+}
+
 
