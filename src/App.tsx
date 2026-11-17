@@ -881,10 +881,15 @@ export default function App() {
   };
 
   const handleSaveTender = (
-    saved: Tender,
+    rawSaved: Tender,
     syncToEmd: boolean,
     initialMafItems?: MafLineItem[],
   ) => {
+    const interactionIso = new Date().toISOString();
+    const saved: Tender = {
+      ...rawSaved,
+      updatedAt: interactionIso,
+    };
     cacheAttachmentPayloads(saved.attachments);
     const prevTenders = stateRef.current.tenders;
     const isExisting = prevTenders.some((t) => t.id === saved.id);
@@ -964,7 +969,11 @@ export default function App() {
     });
   };
 
-  const handleUpdateTenderInline = (updated: Tender) => {
+  const handleUpdateTenderInline = (rawUpdated: Tender) => {
+    const updated: Tender = {
+      ...rawUpdated,
+      updatedAt: new Date().toISOString(),
+    };
     cacheAttachmentPayloads(updated.attachments);
     const nextTenders = stateRef.current.tenders.map((t) =>
       t.id === updated.id ? updated : t,

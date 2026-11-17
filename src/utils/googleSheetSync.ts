@@ -6,7 +6,6 @@ import type {
   Tender,
 } from '../types/crm';
 import { ACTIVE_LOCKED_STATUSES } from './calculations';
-import { formatMonthLabel, getMonthKey } from './formatters';
 
 export const DEFAULT_GOOGLE_SHEET_SETTINGS: GoogleSheetSettings = {
   enabled: true,
@@ -14,6 +13,35 @@ export const DEFAULT_GOOGLE_SHEET_SETTINGS: GoogleSheetSettings = {
   sheetName: 'MIS Monthly Report',
   lastSyncedAt: '',
 };
+
+export const MIS_MONTHLY_TENDER_HEADERS = [
+  'S.No.',
+  'Tender ID / Bid No.',
+  'Portal / Source',
+  'Department / Organization',
+  'District / State',
+  'Item Category',
+  'Work / Supply Title',
+  'Publish Date',
+  'Submission Due Date',
+] as const;
+
+export const MIS_MONTH_GAP_ROWS = 3;
+
+const FULL_MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+] as const;
 
 export interface SheetMonthlyBreakdownRow {
   monthKey: string;
@@ -72,7 +100,14 @@ export interface SheetTenderRowPayload {
   assignedOwner: string;
   remarksNextAction: string;
   resultInfo: string;
+  lastUpdatedAt: string;
   updatedAt: string;
+}
+
+export interface SheetMonthlyMisBlock {
+  monthKey: string;
+  monthLabel: string;
+  rows: SheetTenderRowPayload[];
 }
 
 export interface SheetEmdRowPayload {
@@ -103,6 +138,7 @@ export interface GoogleSheetSyncPayload {
   tender: SheetTenderRowPayload | null;
   emdRecord: SheetEmdRowPayload | null;
   summary: SheetMonthlySummaryMetrics;
+  monthlyBlocks: SheetMonthlyMisBlock[];
   tenders: SheetTenderRowPayload[];
   emdRecords: SheetEmdRowPayload[];
 }
@@ -146,10 +182,8 @@ export function formatIndianDateForSheet(rawDate?: string | null): string {
   const trimmed = (rawDate || '').trim();
   if (!trimmed) return '';
 
-  // Already DD/MM/YYYY
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(trimmed)) return trimmed;
 
-  // ISO with timezone (Z or +/-HH:MM) -> convert accurately to IST
   if (/(?:Z|[+\-]\d{2}:?\d{2})$/i.test(trimmed)) {
     const parsed = new Date(trimmed);
     if (!Number.isNaN(parsed.getTime())) {
@@ -157,7 +191,6 @@ export function formatIndianDateForSheet(rawDate?: string | null): string {
     }
   }
 
-  // Local YYYY-MM-DD or YYYY-MM-DDTHH:mm
   const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (match) {
     return `${match[3]}/${match[2]}/${match[1]}`;
@@ -177,11 +210,9 @@ export function formatIndianDateTimeForSheet(rawDateTime?: string | null): strin
   const trimmed = (rawDateTime || '').trim();
   if (!trimmed) return '';
 
-  // Already DD/MM/YYYY HH:MM
   if (/^\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}$/.test(trimmed)) return trimmed;
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(trimmed)) return trimmed;
 
-  // ISO with explicit UTC Z or timezone offset -> convert to Asia/Kolkata (IST)
   if (/(?:Z|[+\-]\d{2}:?\d{2})$/i.test(trimmed)) {
     const parsed = new Date(trimmed);
     if (!Number.isNaN(parsed.getTime())) {
@@ -189,13 +220,11 @@ export function formatIndianDateTimeForSheet(rawDateTime?: string | null): strin
     }
   }
 
-  // Local CRM input YYYY-MM-DDTHH:mm or YYYY-MM-DD HH:mm (already Indian local wall time)
   const dtMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
   if (dtMatch) {
     return `${dtMatch[3]}/${dtMatch[2]}/${dtMatch[1]} ${dtMatch[4]}:${dtMatch[5]}`;
   }
 
-  // Date-only fallback -> DD/MM/YYYY
   const dMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (dMatch) {
     return `${dMatch[3]}/${dMatch[2]}/${dMatch[1]}`;
@@ -233,6 +262,99 @@ export function isValidAppsScriptWebhookUrl(rawUrl: string): boolean {
   }
 }
 
+/**
+ * Prioritizes `lastUpdatedAt` / `updatedAt` interaction timestamp, falling back to `publishDate`.
+ */
+export function getTenderInteractionTimestamp(
+  t: Pick<Tender, 'publishDate'> & { lastUpdatedAt?: string; updatedAt?: string },
+): string {
+  const lastUpdated = (t.lastUpdatedAt || '').trim();
+  if (lastUpdated) return lastUpdated;
+  const updated = (t.updatedAt || '').trim();
+  if (updated) return updated;
+  return (t.publishDate || '').trim();
+}
+
+/**
+ * Extracts chronological `YYYY-MM` key in IST (`Asia/Kolkata`) from a timestamp or date string.
+ */
+export function getMonthKeyInIst(rawTimestamp?: string | null): string {
+  const trimmed = (rawTimestamp || '').trim();
+  if (!trimmed) return 'Unspecified';
+
+  // ISO timestamp with timezone offset or Z -> convert to Asia/Kolkata
+  if (/(?:Z|[+\-]\d{2}:?\d{2})$/i.test(trimmed)) {
+    const parsed = new Date(trimmed);
+    if (!Number.isNaN(parsed.getTime())) {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+      }).formatToParts(parsed);
+      const year = parts.find((p) => p.type === 'year')?.value;
+      const month = parts.find((p) => p.type === 'month')?.value;
+      if (year && month) return `${year}-${month}`;
+    }
+  }
+
+  // ISO/local YYYY-MM or YYYY-MM-DD
+  const ymdMatch = trimmed.match(/^(\d{4})-(\d{2})(?:-\d{2})?/);
+  if (ymdMatch) {
+    return `${ymdMatch[1]}-${ymdMatch[2]}`;
+  }
+
+  // Indian DD/MM/YYYY
+  const dmyMatch = trimmed.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (dmyMatch) {
+    return `${dmyMatch[3]}-${dmyMatch[2]}`;
+  }
+
+  const parsed = new Date(trimmed);
+  if (!Number.isNaN(parsed.getTime())) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+    }).formatToParts(parsed);
+    const year = parts.find((p) => p.type === 'year')?.value;
+    const month = parts.find((p) => p.type === 'month')?.value;
+    if (year && month) return `${year}-${month}`;
+  }
+
+  return 'Unspecified';
+}
+
+export function getTenderInteractionMonthKey(
+  t: Pick<Tender, 'publishDate'> & { lastUpdatedAt?: string; updatedAt?: string },
+): string {
+  return getMonthKeyInIst(getTenderInteractionTimestamp(t));
+}
+
+/**
+ * Converts `2026-11` into `November 2026`.
+ */
+export function formatFullMonthYearLabel(monthKey: string): string {
+  const match = (monthKey || '').match(/^(\d{4})-(\d{2})$/);
+  if (!match) return monthKey || 'Unspecified';
+  const year = match[1];
+  const monthIdx = Number(match[2]) - 1;
+  const monthName = FULL_MONTH_NAMES[monthIdx];
+  return monthName ? `${monthName} ${year}` : monthKey;
+}
+
+function getTimestampSortEpoch(rawTimestamp?: string | null): number {
+  const trimmed = (rawTimestamp || '').trim();
+  if (!trimmed) return Number.MAX_SAFE_INTEGER;
+  const dmyMatch = trimmed.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+  if (dmyMatch) {
+    const [, dd, mm, yyyy, hh = '00', min = '00'] = dmyMatch;
+    const parsed = Date.parse(`${yyyy}-${mm}-${dd}T${hh}:${min}:00+05:30`);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  const parsed = Date.parse(trimmed);
+  return Number.isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed;
+}
+
 export function serializeTenderForSheet(
   t: Tender,
   opts?: { serialNo?: number; firmName?: string; assignedOwner?: string },
@@ -245,6 +367,7 @@ export function serializeTenderForSheet(
   const firmLabel = (opts?.firmName || '').trim() || 'Self';
   const ownerLabel = (opts?.assignedOwner || '').trim() || 'Vansh Saxena';
   const locationDepartment = [t.location?.trim(), t.department?.trim()].filter(Boolean).join(' / ');
+  const rawInteractionTimestamp = getTenderInteractionTimestamp(t);
 
   return {
     ...(typeof opts?.serialNo === 'number' ? { serialNo: opts.serialNo } : {}),
@@ -278,8 +401,60 @@ export function serializeTenderForSheet(
     assignedOwner: ownerLabel,
     remarksNextAction: combinedRemarks,
     resultInfo: t.resultInfo || '',
-    updatedAt: formatIndianDateTimeForSheet(t.updatedAt || new Date().toISOString()),
+    lastUpdatedAt: rawInteractionTimestamp,
+    updatedAt: formatIndianDateTimeForSheet(rawInteractionTimestamp),
   };
+}
+
+/**
+ * Groups all tenders chronologically by Month & Year of their last interaction/update timestamp
+ * (`lastUpdatedAt` / `updatedAt`, falling back to `publishDate`), numbering S.No. from 1 freshly per month.
+ */
+export function groupTendersByInteractionMonth(
+  tenders: Tender[],
+  opts?: { firmName?: string; assignedOwner?: string },
+): SheetMonthlyMisBlock[] {
+  const bucketMap = new Map<string, Tender[]>();
+
+  for (const t of tenders) {
+    const monthKey = getTenderInteractionMonthKey(t);
+    const list = bucketMap.get(monthKey);
+    if (list) {
+      list.push(t);
+    } else {
+      bucketMap.set(monthKey, [t]);
+    }
+  }
+
+  const sortedMonthKeys = Array.from(bucketMap.keys()).sort((a, b) => {
+    if (a === 'Unspecified') return 1;
+    if (b === 'Unspecified') return -1;
+    return a.localeCompare(b);
+  });
+
+  return sortedMonthKeys.map((monthKey) => {
+    const items = [...(bucketMap.get(monthKey) ?? [])].sort((a, b) => {
+      const epochDiff =
+        getTimestampSortEpoch(getTenderInteractionTimestamp(a)) -
+        getTimestampSortEpoch(getTenderInteractionTimestamp(b));
+      if (epochDiff !== 0) return epochDiff;
+      return a.tenderId.localeCompare(b.tenderId);
+    });
+
+    const rows = items.map((item, idx) =>
+      serializeTenderForSheet(item, {
+        serialNo: idx + 1,
+        firmName: opts?.firmName,
+        assignedOwner: opts?.assignedOwner,
+      }),
+    );
+
+    return {
+      monthKey,
+      monthLabel: formatFullMonthYearLabel(monthKey),
+      rows,
+    };
+  });
 }
 
 export function serializeEmdForSheet(r: EmdBgRecord): SheetEmdRowPayload {
@@ -352,10 +527,10 @@ export function computeMonthlySummaryForSheet(
     totalEstimatedValue += est;
     totalQuotedValue += quoted;
 
-    const monthKey = getMonthKey(t.submissionDueDate || t.publishDate) || 'Unspecified';
+    const monthKey = getTenderInteractionMonthKey(t);
     const existing = monthlyMap.get(monthKey) ?? {
       monthKey,
-      monthLabel: monthKey === 'Unspecified' ? 'Unspecified' : formatMonthLabel(monthKey),
+      monthLabel: formatFullMonthYearLabel(monthKey),
       total: 0,
       inPreparation: 0,
       submitted: 0,
@@ -389,9 +564,11 @@ export function computeMonthlySummaryForSheet(
     }
   }
 
-  const monthlyBreakdown = Array.from(monthlyMap.values()).sort((a, b) =>
-    a.monthKey.localeCompare(b.monthKey),
-  );
+  const monthlyBreakdown = Array.from(monthlyMap.values()).sort((a, b) => {
+    if (a.monthKey === 'Unspecified') return 1;
+    if (b.monthKey === 'Unspecified') return -1;
+    return a.monthKey.localeCompare(b.monthKey);
+  });
 
   return {
     totalTenders: tenders.length,
@@ -427,6 +604,12 @@ export function buildSheetSyncPayload(params: {
   const triggeredAt = formatIndianDateTimeForSheet(
     params.triggeredAt || new Date().toISOString(),
   );
+  const monthlyBlocks = groupTendersByInteractionMonth(params.tenders, {
+    firmName,
+    assignedOwner,
+  });
+
+  const flattenedTenders = monthlyBlocks.flatMap((block) => block.rows);
 
   return {
     action: params.action,
@@ -440,9 +623,8 @@ export function buildSheetSyncPayload(params: {
       : null,
     emdRecord: params.emdRecord ? serializeEmdForSheet(params.emdRecord) : null,
     summary: computeMonthlySummaryForSheet(params.tenders, params.emdRecords),
-    tenders: params.tenders.map((t, idx) =>
-      serializeTenderForSheet(t, { serialNo: idx + 1, firmName, assignedOwner }),
-    ),
+    monthlyBlocks,
+    tenders: flattenedTenders,
     emdRecords: params.emdRecords.map(serializeEmdForSheet),
   };
 }
@@ -451,34 +633,33 @@ export const GOOGLE_APPS_SCRIPT_CODE_GS = `/**
  * Tender Management CRM <-> Google Sheet ("MIS Monthly Report") Real-Time Sync
  * Paste this complete script into Extensions -> Apps Script -> Code.gs,
  * then Deploy -> New deployment -> Web app (Execute as: Me, Who has access: Anyone).
+ *
+ * Features:
+ * - Zero frozen rows (frozenRowCount = 0 / setFrozenRows(0)). No stuck top header row.
+ * - Groups all CRM tenders chronologically by Month & Year of their lastUpdatedAt / updatedAt timestamp
+ *   (falling back to Publish Date only when no update timestamp is present).
+ * - Renders clean Monthly MIS Blocks:
+ *   1) Merged Banner Row (Column A to Column I, #000000 background, centered bold white Month & Year)
+ *   2) Dark Navy/Black Header Row directly below Banner
+ *   3) Data Rows with S.No. freshly starting at 1, 2, 3... inside each month
+ *   4) Leaves 3 blank rows between different monthly blocks
  */
 
 var TAB_TENDERS = 'Daily Tender Data';
 var TAB_SUMMARY = 'Monthly MIS Summary';
 var TAB_EMD = 'EMD & BG Tracker';
+var BLANK_GAP_ROWS_BETWEEN_MONTHS = 3;
 
-var TENDER_HEADERS = [
+var MIS_MONTHLY_HEADERS = [
   'S.No.',
-  'Tender Ref / ID',
-  'Client / Organization Name',
-  'Location / Department',
-  'Location',
-  'Brief Description & Scope of Work',
-  'Portal / Platform',
-  'Publish / Tender Date',
-  'Due Date & Time',
-  'Pre-Bid Meeting Date',
-  'Estimated Tender Value (INR)',
-  'EMD Amount (INR)',
-  'EMD Mode / Form',
-  'Current Status',
-  'Technical Opening Date',
-  'Financial Opening Date',
-  'L1 Bidder Name',
-  'L1 Quoted Value (INR)',
-  'Our Position / Rank',
-  'Assigned Person / Owner',
-  'Remarks / Next Action'
+  'Tender ID / Bid No.',
+  'Portal / Source',
+  'Department / Organization',
+  'District / State',
+  'Item Category',
+  'Work / Supply Title',
+  'Publish Date',
+  'Submission Due Date'
 ];
 
 var EMD_HEADERS = [
@@ -498,6 +679,21 @@ var EMD_HEADERS = [
   'Remarks'
 ];
 
+var FULL_MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December'
+];
+
 function doPost(e) {
   var lock = LockService.getScriptLock();
   lock.waitLock(15000);
@@ -506,15 +702,23 @@ function doPost(e) {
     var payload = JSON.parse(raw);
 
     var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var tenderSheet = ensureSheetWithHeaders_(ss, TAB_TENDERS, TENDER_HEADERS);
-    var summarySheet = ensureSummarySheet_(ss);
-    var emdSheet = ensureSheetWithHeaders_(ss, TAB_EMD, EMD_HEADERS);
+    var tenderSheet = getOrCreateSheet_(ss, TAB_TENDERS);
+    var summarySheet = getOrCreateSheet_(ss, TAB_SUMMARY);
+    var emdSheet = getOrCreateSheet_(ss, TAB_EMD);
+
+    // Explicitly enforce zero frozen rows across sheets
+    tenderSheet.setFrozenRows(0);
+    summarySheet.setFrozenRows(0);
+    emdSheet.setFrozenRows(0);
 
     var action = String(payload.action || 'UPDATE').toUpperCase();
     var entityType = String(payload.entityType || 'TENDER').toUpperCase();
     var rowsAffected = 0;
 
     if (action === 'PING') {
+      if ((payload.monthlyBlocks && payload.monthlyBlocks.length > 0) || (payload.tenders && payload.tenders.length > 0)) {
+        rewriteMonthlyMisSheet_(tenderSheet, payload);
+      }
       refreshMonthlySummary_(summarySheet, payload);
       return jsonResponse_({
         ok: true,
@@ -524,19 +728,15 @@ function doPost(e) {
       });
     }
 
+    // Rewrite clean Monthly MIS Blocks whenever tenders are synced (CREATE, UPDATE, DELETE, FULL_SYNC, BULK)
+    if (action === 'FULL_SYNC' || entityType === 'BULK' || entityType === 'TENDER') {
+      rowsAffected += rewriteMonthlyMisSheet_(tenderSheet, payload);
+    }
+
     if (action === 'FULL_SYNC' || entityType === 'BULK') {
-      replaceAllTenderRows_(tenderSheet, payload.tenders || [], payload);
       replaceAllEmdRows_(emdSheet, payload.emdRecords || []);
-      rowsAffected = (payload.tenders || []).length + (payload.emdRecords || []).length;
+      rowsAffected += (payload.emdRecords || []).length;
     } else if (entityType === 'TENDER') {
-      if (payload.tender) {
-        if (action === 'DELETE') {
-          rowsAffected += deleteTenderRow_(tenderSheet, payload.tender.tenderId);
-        } else {
-          upsertTenderRow_(tenderSheet, payload.tender, payload);
-          rowsAffected += 1;
-        }
-      }
       if (payload.emdRecord) {
         upsertEmdRow_(emdSheet, payload.emdRecord);
         rowsAffected += 1;
@@ -574,14 +774,24 @@ function doPost(e) {
 
 function doGet() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var tenderSheet = ensureSheetWithHeaders_(ss, TAB_TENDERS, TENDER_HEADERS);
-  var emdSheet = ensureSheetWithHeaders_(ss, TAB_EMD, EMD_HEADERS);
+  var tenderSheet = getOrCreateSheet_(ss, TAB_TENDERS);
+  var emdSheet = getOrCreateSheet_(ss, TAB_EMD);
+  tenderSheet.setFrozenRows(0);
+  emdSheet.setFrozenRows(0);
   return jsonResponse_({
     ok: true,
     spreadsheetName: ss.getName(),
-    tenderRowCount: Math.max(0, tenderSheet.getLastRow() - 1),
+    tenderRowCount: tenderSheet.getLastRow(),
     emdRowCount: Math.max(0, emdSheet.getLastRow() - 1)
   });
+}
+
+function getOrCreateSheet_(ss, name) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+  return sheet;
 }
 
 function formatIstDate_(val) {
@@ -616,59 +826,212 @@ function formatIstDateTime_(val) {
   return s;
 }
 
-function ensureSheetWithHeaders_(ss, name, headers) {
-  var sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
+function getInteractionTimestamp_(t) {
+  if (t.lastUpdatedAt && String(t.lastUpdatedAt).trim()) {
+    return String(t.lastUpdatedAt).trim();
   }
-  var firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-  var needsHeader = firstRow[0] !== headers[0] || firstRow[1] !== headers[1] || firstRow[headers.length - 1] !== headers[headers.length - 1];
+  if (t.updatedAt && String(t.updatedAt).trim()) {
+    return String(t.updatedAt).trim();
+  }
+  if (t.publishDate && String(t.publishDate).trim()) {
+    return String(t.publishDate).trim();
+  }
+  return '';
+}
+
+function getInteractionMonthKey_(rawVal) {
+  var s = String(rawVal || '').trim();
+  if (!s) return 'Unspecified';
+
+  if (/(?:Z|[+\\-]\\d{2}:?\\d{2})$/i.test(s)) {
+    var isoDate = new Date(s);
+    if (!isNaN(isoDate.getTime())) {
+      return Utilities.formatDate(isoDate, 'Asia/Kolkata', 'yyyy-MM');
+    }
+  }
+
+  var ymd = s.match(/^(\\d{4})-(\\d{2})/);
+  if (ymd) return ymd[1] + '-' + ymd[2];
+
+  var dmy = s.match(/^(\\d{2})\\/(\\d{2})\\/(\\d{4})/);
+  if (dmy) return dmy[3] + '-' + dmy[2];
+
+  var fallback = new Date(s);
+  if (!isNaN(fallback.getTime())) {
+    return Utilities.formatDate(fallback, 'Asia/Kolkata', 'yyyy-MM');
+  }
+  return 'Unspecified';
+}
+
+function formatFullMonthLabel_(monthKey) {
+  var m = String(monthKey || '').match(/^(\\d{4})-(\\d{2})$/);
+  if (!m) return monthKey || 'Unspecified';
+  var idx = Number(m[2]) - 1;
+  var name = FULL_MONTH_NAMES[idx];
+  return name ? name + ' ' + m[1] : monthKey;
+}
+
+function timestampEpoch_(rawVal) {
+  var s = String(rawVal || '').trim();
+  if (!s) return 9e15;
+  var dmy = s.match(/^(\\d{2})\\/(\\d{2})\\/(\\d{4})(?:\\s+(\\d{2}):(\\d{2}))?/);
+  if (dmy) {
+    var isoLike = dmy[3] + '-' + dmy[2] + '-' + dmy[1] + 'T' + (dmy[4] || '00') + ':' + (dmy[5] || '00') + ':00+05:30';
+    var parsedDmy = Date.parse(isoLike);
+    if (!isNaN(parsedDmy)) return parsedDmy;
+  }
+  var parsed = Date.parse(s);
+  return isNaN(parsed) ? 9e15 : parsed;
+}
+
+function buildMonthlyBlocksFromPayload_(payload) {
+  if (payload && Array.isArray(payload.monthlyBlocks) && payload.monthlyBlocks.length > 0) {
+    return payload.monthlyBlocks;
+  }
+
+  var tenders = (payload && Array.isArray(payload.tenders)) ? payload.tenders : [];
+  if (tenders.length === 0) return [];
+
+  var grouped = {};
+  for (var i = 0; i < tenders.length; i++) {
+    var t = tenders[i];
+    var ts = getInteractionTimestamp_(t);
+    var monthKey = getInteractionMonthKey_(ts);
+    if (!grouped[monthKey]) grouped[monthKey] = [];
+    grouped[monthKey].push(t);
+  }
+
+  var keys = Object.keys(grouped).sort(function (a, b) {
+    if (a === 'Unspecified') return 1;
+    if (b === 'Unspecified') return -1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+
+  return keys.map(function (monthKey) {
+    var items = grouped[monthKey].slice().sort(function (a, b) {
+      var diff = timestampEpoch_(getInteractionTimestamp_(a)) - timestampEpoch_(getInteractionTimestamp_(b));
+      if (diff !== 0) return diff;
+      return String(a.tenderId || '').localeCompare(String(b.tenderId || ''));
+    });
+
+    return {
+      monthKey: monthKey,
+      monthLabel: formatFullMonthLabel_(monthKey),
+      rows: items
+    };
+  });
+}
+
+function rewriteMonthlyMisSheet_(sheet, payload) {
+  var totalCols = MIS_MONTHLY_HEADERS.length; // 9 columns (Column A to Column I)
+  var existingLastRow = sheet.getLastRow();
+  var existingLastCol = Math.max(sheet.getLastColumn(), totalCols);
+
+  // Break any previously merged month banners and clear all content & formatting
+  if (existingLastRow > 0 && existingLastCol > 0) {
+    sheet.getRange(1, 1, existingLastRow, existingLastCol).breakApart();
+  }
+  sheet.clear();
+  sheet.setFrozenRows(0);
+
+  var blocks = buildMonthlyBlocksFromPayload_(payload);
+  if (!blocks || blocks.length === 0) {
+    return 0;
+  }
+
+  var currentRow = 1;
+  var totalWritten = 0;
+
+  for (var b = 0; b < blocks.length; b++) {
+    var block = blocks[b];
+    var items = block.rows || [];
+    if (items.length === 0) continue;
+
+    // 1. Month Banner Row: Merged Column A to Column I, solid black (#000000), centered bold white text
+    var bannerRange = sheet.getRange(currentRow, 1, 1, totalCols);
+    bannerRange.merge();
+    bannerRange
+      .setValue(block.monthLabel || formatFullMonthLabel_(block.monthKey))
+      .setBackground('#000000')
+      .setFontColor('#FFFFFF')
+      .setFontWeight('bold')
+      .setFontSize(12)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle');
+    sheet.setRowHeight(currentRow, 30);
+    currentRow += 1;
+
+    // 2. Column Header Row directly below banner: Dark navy/black with bold white text
+    var headerRange = sheet.getRange(currentRow, 1, 1, totalCols);
+    headerRange
+      .setValues([MIS_MONTHLY_HEADERS])
+      .setBackground('#0F172A')
+      .setFontColor('#FFFFFF')
+      .setFontWeight('bold')
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle');
+    headerRange.setBorder(true, true, true, true, true, true, '#334155', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(currentRow, 1, 1, 1).setHorizontalAlignment('center');
+    sheet.setRowHeight(currentRow, 26);
+    currentRow += 1;
+
+    // 3. Data Rows: Fresh S.No. (1, 2, 3...) per month
+    var dataRows = [];
+    for (var r = 0; r < items.length; r++) {
+      var t = items[r];
+      dataRows.push([
+        r + 1,
+        t.tenderId || '',
+        t.portal || '',
+        t.department || t.clientName || '',
+        t.location || '',
+        t.category || '',
+        t.title || '',
+        formatIstDate_(t.publishDate),
+        formatIstDateTime_(t.submissionDueDate)
+      ]);
+    }
+
+    var dataRange = sheet.getRange(currentRow, 1, dataRows.length, totalCols);
+    dataRange
+      .setValues(dataRows)
+      .setBackground('#FFFFFF')
+      .setFontColor('#0F172A')
+      .setFontWeight('normal')
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+    dataRange.setBorder(true, true, true, true, true, true, '#CBD5E1', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(currentRow, 1, dataRows.length, 1).setHorizontalAlignment('center');
+
+    totalWritten += dataRows.length;
+    currentRow += dataRows.length;
+
+    // 4. Leave 3 blank rows between different monthly blocks
+    if (b < blocks.length - 1) {
+      currentRow += BLANK_GAP_ROWS_BETWEEN_MONTHS;
+    }
+  }
+
+  sheet.autoResizeColumns(1, totalCols);
+  return totalWritten;
+}
+
+function ensureEmdHeaders_(sheet) {
+  sheet.setFrozenRows(0);
+  var firstRow = sheet.getRange(1, 1, 1, EMD_HEADERS.length).getValues()[0];
+  var needsHeader =
+    firstRow[0] !== EMD_HEADERS[0] ||
+    firstRow[1] !== EMD_HEADERS[1] ||
+    firstRow[EMD_HEADERS.length - 1] !== EMD_HEADERS[EMD_HEADERS.length - 1];
+
   if (needsHeader) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sheet.getRange(1, 1, 1, headers.length)
+    sheet.getRange(1, 1, 1, EMD_HEADERS.length)
+      .setValues([EMD_HEADERS])
       .setBackground('#0F172A')
       .setFontColor('#FFFFFF')
       .setFontWeight('bold');
-    sheet.setFrozenRows(1);
   }
-  return sheet;
-}
-
-function ensureSummarySheet_(ss) {
-  var sheet = ss.getSheetByName(TAB_SUMMARY);
-  if (!sheet) {
-    sheet = ss.insertSheet(TAB_SUMMARY);
-  }
-  return sheet;
-}
-
-function tenderToRow_(t, serialNo, payload) {
-  var clientName = t.clientName || t.department || '';
-  var locationDept = t.locationDepartment || [t.location, t.department].filter(Boolean).join(' / ');
-  var owner = t.assignedOwner || (payload && payload.assignedOwner) || 'Vansh Saxena';
-  return [
-    Number(serialNo || t.serialNo || 1),
-    t.tenderId || '',
-    clientName,
-    locationDept,
-    t.location || '',
-    t.title || '',
-    t.portal || '',
-    formatIstDate_(t.publishDate),
-    formatIstDateTime_(t.submissionDueDate),
-    formatIstDateTime_(t.preBidDate),
-    Number(t.estimatedValue || 0),
-    Number(t.emdAmount || 0),
-    t.emdMode || t.emdStatus || '',
-    t.stage || '',
-    formatIstDate_(t.technicalOpeningDate),
-    formatIstDate_(t.financialOpeningDate || t.completionDate),
-    t.l1BidderName || '',
-    Number(t.l1QuotedValue !== undefined ? t.l1QuotedValue : (t.quotedValue || 0)),
-    t.ourPositionRank || '',
-    owner,
-    t.remarksNextAction || t.resultInfo || ''
-  ];
 }
 
 function emdToRow_(r) {
@@ -690,29 +1053,6 @@ function emdToRow_(r) {
   ];
 }
 
-function findTenderRowIndex_(sheet, tenderId) {
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2 || !tenderId) return -1;
-  var vals = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
-  for (var i = 0; i < vals.length; i++) {
-    if (String(vals[i][0]).trim() === String(tenderId).trim()) {
-      return i + 2;
-    }
-  }
-  return -1;
-}
-
-function renumberSerialNumbers_(sheet) {
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return;
-  var count = lastRow - 1;
-  var nums = [];
-  for (var i = 1; i <= count; i++) {
-    nums.push([i]);
-  }
-  sheet.getRange(2, 1, count, 1).setValues(nums);
-}
-
 function findEmdRowIndex_(sheet, idValue, secondaryCode) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return -1;
@@ -732,19 +1072,8 @@ function findEmdRowIndex_(sheet, idValue, secondaryCode) {
   return -1;
 }
 
-function upsertTenderRow_(sheet, t, payload) {
-  var rowIdx = findTenderRowIndex_(sheet, t.tenderId);
-  var serialNo = rowIdx > 1 ? rowIdx - 1 : Math.max(1, sheet.getLastRow());
-  var row = tenderToRow_(t, serialNo, payload);
-  if (rowIdx > 1) {
-    sheet.getRange(rowIdx, 1, 1, row.length).setValues([row]);
-  } else {
-    sheet.appendRow(row);
-    renumberSerialNumbers_(sheet);
-  }
-}
-
 function upsertEmdRow_(sheet, r) {
+  ensureEmdHeaders_(sheet);
   var row = emdToRow_(r);
   var rowIdx = findEmdRowIndex_(sheet, r.id, r.referenceNo);
   if (rowIdx > 1) {
@@ -754,17 +1083,8 @@ function upsertEmdRow_(sheet, r) {
   }
 }
 
-function deleteTenderRow_(sheet, tenderId) {
-  var rowIdx = findTenderRowIndex_(sheet, tenderId);
-  if (rowIdx > 1) {
-    sheet.deleteRow(rowIdx);
-    renumberSerialNumbers_(sheet);
-    return 1;
-  }
-  return 0;
-}
-
 function deleteEmdRowById_(sheet, idValue, secondaryCode) {
+  ensureEmdHeaders_(sheet);
   var rowIdx = findEmdRowIndex_(sheet, idValue, secondaryCode);
   if (rowIdx > 1) {
     sheet.deleteRow(rowIdx);
@@ -773,23 +1093,15 @@ function deleteEmdRowById_(sheet, idValue, secondaryCode) {
   return 0;
 }
 
-function replaceAllTenderRows_(sheet, tenders, payload) {
-  var lastRow = sheet.getLastRow();
-  if (lastRow > 1) {
-    sheet.getRange(2, 1, lastRow - 1, TENDER_HEADERS.length).clearContent();
-  }
-  if (!tenders || tenders.length === 0) return;
-  var rows = tenders.map(function (t, idx) {
-    return tenderToRow_(t, idx + 1, payload);
-  });
-  sheet.getRange(2, 1, rows.length, TENDER_HEADERS.length).setValues(rows);
-}
-
 function replaceAllEmdRows_(sheet, records) {
-  var lastRow = sheet.getLastRow();
-  if (lastRow > 1) {
-    sheet.getRange(2, 1, lastRow - 1, EMD_HEADERS.length).clearContent();
-  }
+  sheet.clear();
+  sheet.setFrozenRows(0);
+  sheet.getRange(1, 1, 1, EMD_HEADERS.length)
+    .setValues([EMD_HEADERS])
+    .setBackground('#0F172A')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold');
+
   if (!records || records.length === 0) return;
   var rows = records.map(emdToRow_);
   sheet.getRange(2, 1, rows.length, EMD_HEADERS.length).setValues(rows);
@@ -797,7 +1109,8 @@ function replaceAllEmdRows_(sheet, records) {
 
 function refreshMonthlySummary_(sheet, payload) {
   var s = payload.summary || {};
-  sheet.clearContents();
+  sheet.clear();
+  sheet.setFrozenRows(0);
 
   var kpiRows = [
     ['MIS Monthly Report - Executive Summary', payload.firmName || 'Corporate Tender Desk'],
@@ -826,7 +1139,7 @@ function refreshMonthlySummary_(sheet, payload) {
 
   var breakdownStart = kpiRows.length + 2;
   var monthlyHeaders = [
-    'Month',
+    'Last Interaction Month',
     'Total Tenders',
     'In Preparation',
     'Submitted',

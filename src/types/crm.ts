@@ -67,6 +67,7 @@ export interface Tender {
   attachments?: AttachmentItem[];
   createdAt: string;
   updatedAt: string;
+  lastUpdatedAt?: string;
 }
 
 export type InstrumentType =
