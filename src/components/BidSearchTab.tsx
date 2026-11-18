@@ -38,7 +38,8 @@ import {
 import { sanitizeExtractErrorMessage } from '../utils/geminiRetry';
 import { formatINR, formatShortDate, getDaysRemaining } from '../utils/formatters';
 
-const EXTRACT_PDF_TIMEOUT_MS = 45_000;
+const EXTRACT_PDF_TIMEOUT_MS = 58_000;
+const BATCH_SCAN_CONCURRENCY = 2;
 
 interface BidSearchTabProps {
   tenders: Tender[];
@@ -96,6 +97,7 @@ interface ScannedBidCardState {
 interface ParsedExtractResponse {
   ok?: boolean;
   success?: boolean;
+  retryable?: boolean;
   modelUsed?: string;
   fallbackUsed?: boolean;
   extracted?: ExtractedBidDraft;
@@ -203,8 +205,9 @@ export function BidSearchTab({
         attachmentWarning = `PDF (${formatFileSize(file.size)}) exceeds the 650 KB Attachment 1 Firestore limit. Tender details will still save; attach a compressed PDF in Attachment 1 later.`;
       }
 
-      // 3. Call server-side Gemini API proxy route with strict 45s AbortController timeout
-      const res = await fetch('/api/tenders/extract-pdf', {
+      // 3. Call server-side Gemini API proxy route with strict 58s AbortController timeout
+      const attemptStartedAt = Date.now();
+      let res = await fetch('/api/tenders/extract-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -215,8 +218,33 @@ export function BidSearchTab({
         }),
       });
 
-      const { json: data, rawText } = await safeReadExtractResponse(res);
-      const isOk = Boolean(res.ok && (data?.ok || data?.success) && data?.extracted);
+      let { json: data, rawText } = await safeReadExtractResponse(res);
+      let isOk = Boolean(res.ok && (data?.ok || data?.success) && data?.extracted);
+
+      // If the server returned a quick transient 503/429 (e.g. primary model cooled down right after),
+      // wait 2.5s and perform 1 clean retry automatically within our remaining 58s window.
+      if (
+        !isOk &&
+        (res.status === 503 || res.status === 429 || data?.retryable) &&
+        Date.now() - attemptStartedAt < 32_000 &&
+        !controller.signal.aborted
+      ) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2500));
+        if (!controller.signal.aborted) {
+          res = await fetch('/api/tenders/extract-pdf', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              fileName: file.name,
+              mimeType: file.type || 'application/pdf',
+              fileBase64,
+            }),
+          });
+          ({ json: data, rawText } = await safeReadExtractResponse(res));
+          isOk = Boolean(res.ok && (data?.ok || data?.success) && data?.extracted);
+        }
+      }
 
       if (!isOk || !data?.extracted) {
         const cleanErrMsg = sanitizeExtractErrorMessage(
@@ -304,7 +332,7 @@ export function BidSearchTab({
         (err instanceof DOMException && err.name === 'AbortError') ||
         (err instanceof Error && err.name === 'AbortError');
       const cleanErrMsg = isAbort
-        ? sanitizeExtractErrorMessage('AbortError: 45s timeout', 504)
+        ? sanitizeExtractErrorMessage('AbortError: 58s timeout', 504)
         : sanitizeExtractErrorMessage(err);
 
       setScanQueue((prev) =>
@@ -372,11 +400,20 @@ export function BidSearchTab({
       tendersRef.current.map((t) => t.tenderId.trim().toLowerCase()),
     );
 
-    // Run each file inside an independent Promise.allSettled worker so one failure never interrupts sibling PDFs
+    // Run files with bounded concurrency (2 at a time) so batch drops do not trigger Gemini 429/503 bursts
+    let cursor = 0;
+    const workerCount = Math.min(BATCH_SCAN_CONCURRENCY, createdEntries.length);
     await Promise.allSettled(
-      createdEntries.map(({ scanId, file }) =>
-        scanSingleBidCard(scanId, file, batchAutoSavedIds),
-      ),
+      Array.from({ length: workerCount }, async () => {
+        while (cursor < createdEntries.length) {
+          const idx = cursor;
+          cursor += 1;
+          const entry = createdEntries[idx];
+          if (entry) {
+            await scanSingleBidCard(entry.scanId, entry.file, batchAutoSavedIds);
+          }
+        }
+      }),
     );
   };
 

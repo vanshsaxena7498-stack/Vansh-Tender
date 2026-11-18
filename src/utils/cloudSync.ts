@@ -134,6 +134,8 @@ function docToMafTracker(data: Record<string, unknown>): MafTrackerRecord {
       const contact = getMafContactDetails(item);
       return {
         ...item,
+        oemName: String(item.oemName ?? ''),
+        companyName: String(item.companyName ?? ''),
         concernedPersonName: contact.concernedPersonName,
         contactNo: contact.contactNo,
         mailId: contact.mailId,

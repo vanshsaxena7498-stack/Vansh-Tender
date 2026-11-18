@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  clearModelBusyCooldown,
   DEFAULT_RETRY_DELAYS_MS,
   executeWithRetryAndFallback,
   extractJsonObjectFromText,
@@ -110,6 +111,66 @@ test('executeWithRetryAndFallback automatically switches to fast fallback model 
   ]);
   assert.deepEqual(recordedDelays, [2000, 4000, 8000]);
   assert.deepEqual(outcome.result, { tenderId: 'GEM/2026/B/9990001' });
+});
+
+test('skipPrimaryIfInCooldown routes directly to healthy fallback during cooldown and resets cleanly', async () => {
+  clearModelBusyCooldown();
+  let fakeNow = 100_000;
+  const secondRunModels: string[] = [];
+
+  try {
+    // 1. Primary fails -> fallback succeeds -> puts primary in 60s cooldown
+    await executeWithRetryAndFallback({
+      primaryModel: PRIMARY_PDF_MODEL,
+      fallbackModel: FALLBACK_PDF_MODEL,
+      skipPrimaryIfInCooldown: true,
+      cooldownDurationMs: 60_000,
+      nowFn: () => fakeNow,
+      primaryRetryOptions: { maxRetries: 1, sleepFn: async () => {} },
+      fallbackRetryOptions: { maxRetries: 1, sleepFn: async () => {} },
+      runAttempt: async (model) => {
+        if (model === PRIMARY_PDF_MODEL) throw { status: 503, message: 'high demand' };
+        return 'ok-1';
+      },
+    });
+
+    // 2. Within cooldown, goes straight to fallback with 0 primary attempts
+    fakeNow += 10_000;
+    const fastRes = await executeWithRetryAndFallback({
+      primaryModel: PRIMARY_PDF_MODEL,
+      fallbackModel: FALLBACK_PDF_MODEL,
+      skipPrimaryIfInCooldown: true,
+      cooldownDurationMs: 60_000,
+      nowFn: () => fakeNow,
+      fallbackRetryOptions: { maxRetries: 1, sleepFn: async () => {} },
+      runAttempt: async (model) => {
+        secondRunModels.push(model);
+        return 'ok-2';
+      },
+    });
+    assert.deepEqual(secondRunModels, [FALLBACK_PDF_MODEL]);
+    assert.equal(fastRes.primaryAttempts, 0);
+    assert.equal(fastRes.fallbackUsed, true);
+
+    // 3. After cooldown expires, tries primary again
+    fakeNow += 60_000;
+    const recoveredRes = await executeWithRetryAndFallback({
+      primaryModel: PRIMARY_PDF_MODEL,
+      fallbackModel: FALLBACK_PDF_MODEL,
+      skipPrimaryIfInCooldown: true,
+      cooldownDurationMs: 60_000,
+      nowFn: () => fakeNow,
+      primaryRetryOptions: { maxRetries: 0, sleepFn: async () => {} },
+      runAttempt: async (model) => {
+        assert.equal(model, PRIMARY_PDF_MODEL);
+        return 'ok-3';
+      },
+    });
+    assert.equal(recoveredRes.modelUsed, PRIMARY_PDF_MODEL);
+    assert.equal(recoveredRes.fallbackUsed, false);
+  } finally {
+    clearModelBusyCooldown();
+  }
 });
 
 test('withTimeout rejects cleanly with TimeoutError when promise stalls', async () => {

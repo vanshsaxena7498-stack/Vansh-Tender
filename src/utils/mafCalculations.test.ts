@@ -68,6 +68,13 @@ test('calculateOverallMafStatus rolls up item statuses accurately', () => {
     ]),
     'Requested / Follow-up',
   );
+  assert.equal(
+    calculateOverallMafStatus([
+      makeItem({ mafStatus: 'Pending', oemName: '' }),
+      makeItem({ itemId: 'item-2', mafStatus: 'Pending', oemName: '' }),
+    ]),
+    'Pending',
+  );
 });
 
 test('computeMafSummaryMetrics aggregates active tenders, items, pending, and received counts', () => {
@@ -101,7 +108,7 @@ test('computeMafSummaryMetrics aggregates active tenders, items, pending, and re
   assert.equal(metrics.mafPending, 3);
 });
 
-test('resolveAndFilterMafTrackers joins tender data and filters by Tender ID, Item/OEM, and Overall Status', () => {
+test('resolveAndFilterMafTrackers joins tender data, prefers Attachment 1 tracker department, and filters by Tender ID, Item/OEM, and Overall Status', () => {
   const trackers: MafTrackerRecord[] = [
     {
       id: 'maf-1',
@@ -118,6 +125,7 @@ test('resolveAndFilterMafTrackers joins tender data and filters by Tender ID, It
       id: 'maf-2',
       tenderRefId: SEED_TENDERS[1].id,
       tenderId: SEED_TENDERS[1].tenderId,
+      department: 'Attachment 1 Inviting Authority Dept',
       itemsMAF: [
         makeItem({ itemId: 'c', itemName: 'ANPR Cameras', oemName: 'Hikvision', mafStatus: 'Requested / Follow-up' }),
       ],
@@ -142,6 +150,7 @@ test('resolveAndFilterMafTrackers joins tender data and filters by Tender ID, It
   });
   assert.equal(byStatus.length, 1);
   assert.equal(byStatus[0].tenderId, SEED_TENDERS[1].tenderId);
+  assert.equal(byStatus[0].resolvedDepartment, 'Attachment 1 Inviting Authority Dept');
 });
 
 test('findDailyTenderByCode and findMatchingDailyTender match registered Daily Tenders case-insensitively and reject unknown codes', () => {
@@ -161,9 +170,11 @@ test('findDailyTenderByCode and findMatchingDailyTender match registered Daily T
   assert.equal(mismatchedCodeWithOldRef, undefined);
 });
 
-test('validateMafItemDraft and validateMafUploadFile enforce required fields and 5MB PDF/image bounds', () => {
+test('validateMafItemDraft and validateMafUploadFile enforce required fields, allow blank OEM for Pending items, and enforce 5MB PDF/image bounds', () => {
   assert.ok(validateMafItemDraft({ itemName: '', oemName: 'Cisco' }));
   assert.ok(validateMafItemDraft({ itemName: 'Switches', oemName: '  ' }));
+  assert.equal(validateMafItemDraft({ itemName: 'Switches', oemName: '', mafStatus: 'Pending' }), null);
+  assert.equal(validateMafItemDraft({ itemName: 'Switches', oemName: '', allowBlankOem: true }), null);
   assert.equal(validateMafItemDraft({ itemName: 'Switches', oemName: 'Cisco' }), null);
 
   assert.equal(

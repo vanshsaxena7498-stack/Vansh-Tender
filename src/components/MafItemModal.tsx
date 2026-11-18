@@ -47,6 +47,7 @@ export function MafItemModal({
   const [itemName, setItemName] = useState(initialItem?.itemName ?? '');
   const [requiredQuantity, setRequiredQuantity] = useState(initialItem?.requiredQuantity ?? '');
   const [oemName, setOemName] = useState(initialItem?.oemName ?? '');
+  const [companyName, setCompanyName] = useState(initialItem?.companyName ?? '');
   const [concernedPersonName, setConcernedPersonName] = useState(
     initialContact.concernedPersonName,
   );
@@ -102,7 +103,13 @@ export function MafItemModal({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    const validationErr = validateMafItemDraft({ itemName, oemName, requiredQuantity });
+    const validationErr = validateMafItemDraft({
+      itemName,
+      oemName,
+      companyName,
+      mafStatus,
+      requiredQuantity,
+    });
     if (validationErr) {
       setErrorMsg(validationErr);
       return;
@@ -121,6 +128,7 @@ export function MafItemModal({
       itemName: itemName.trim(),
       requiredQuantity: requiredQuantity.trim(),
       oemName: oemName.trim(),
+      companyName: companyName.trim(),
       concernedPersonName: cleanPerson,
       contactNo: cleanPhone,
       mailId: cleanMail,
@@ -219,12 +227,12 @@ export function MafItemModal({
                 htmlFor="maf-oem-name"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                OEM / Manufacturer Name *
+                OEM / Manufacturer Name {mafStatus !== 'Pending' ? '*' : ''}
               </label>
               <input
                 id="maf-oem-name"
                 type="text"
-                required
+                required={mafStatus !== 'Pending'}
                 list="common-oem-suggestions"
                 value={oemName}
                 onChange={(e) => setOemName(e.target.value)}
@@ -236,6 +244,23 @@ export function MafItemModal({
                   <option key={name} value={name} />
                 ))}
               </datalist>
+            </div>
+
+            <div>
+              <label
+                htmlFor="maf-company-name"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+              >
+                Company Name
+              </label>
+              <input
+                id="maf-company-name"
+                type="text"
+                value={companyName}
+                onChange={(e) => setCompanyName(e.target.value)}
+                placeholder="e.g. OEM / Authorized Partner Firm"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
             </div>
 
             <div>

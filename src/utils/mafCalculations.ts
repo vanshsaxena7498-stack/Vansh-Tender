@@ -1,6 +1,7 @@
 import type { MafItemStatus, MafLineItem, MafTrackerRecord, Tender } from '../types/crm';
 
 export const MAF_STATUS_OPTIONS: MafItemStatus[] = [
+  'Pending',
   'Not Requested',
   'Requested / Follow-up',
   'Under Approval',
@@ -58,6 +59,9 @@ export function calculateOverallMafStatus(items: MafLineItem[]): MafItemStatus {
   }
   if (statuses.some((s) => s === 'Requested / Follow-up')) {
     return 'Requested / Follow-up';
+  }
+  if (statuses.some((s) => s === 'Pending')) {
+    return 'Pending';
   }
   return 'Not Requested';
 }
@@ -124,7 +128,7 @@ export function resolveAndFilterMafTrackers(
       tenderByCode.get(tracker.tenderId.toLowerCase());
 
     const resolvedTenderTitle = linked?.title || tracker.tenderTitle || 'Linked Tender Work';
-    const resolvedDepartment = linked?.department || tracker.department || 'Department';
+    const resolvedDepartment = tracker.department || linked?.department || 'Department';
     const resolvedDueDate = linked?.submissionDueDate || tracker.tenderDueDate || '';
     const overallStatus = calculateOverallMafStatus(tracker.itemsMAF ?? []);
 
@@ -147,6 +151,7 @@ export function resolveAndFilterMafTrackers(
           return (
             item.itemName.toLowerCase().includes(iq) ||
             item.oemName.toLowerCase().includes(iq) ||
+            (item.companyName ?? '').toLowerCase().includes(iq) ||
             contact.concernedPersonName.toLowerCase().includes(iq) ||
             contact.contactNo.toLowerCase().includes(iq) ||
             contact.mailId.toLowerCase().includes(iq) ||
@@ -176,19 +181,26 @@ export function resolveAndFilterMafTrackers(
 export function validateMafItemDraft(draft: {
   itemName: string;
   oemName: string;
+  companyName?: string;
+  mafStatus?: MafItemStatus;
+  allowBlankOem?: boolean;
   requiredQuantity?: string;
 }): string | null {
   if (!draft.itemName || !draft.itemName.trim()) {
     return 'Item Name is required.';
   }
-  if (!draft.oemName || !draft.oemName.trim()) {
+  const oemExempt = draft.allowBlankOem === true || draft.mafStatus === 'Pending';
+  if (!oemExempt && (!draft.oemName || !draft.oemName.trim())) {
     return 'OEM Name is required.';
   }
   if (draft.itemName.trim().length > 220) {
     return 'Item Name must be 220 characters or fewer.';
   }
-  if (draft.oemName.trim().length > 150) {
+  if (draft.oemName && draft.oemName.trim().length > 150) {
     return 'OEM Name must be 150 characters or fewer.';
+  }
+  if (draft.companyName && draft.companyName.trim().length > 150) {
+    return 'Company Name must be 150 characters or fewer.';
   }
   return null;
 }

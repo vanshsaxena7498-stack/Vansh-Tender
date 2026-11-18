@@ -46,10 +46,11 @@ function makeEmptyItem(index: number): MafLineItem {
     itemName: '',
     requiredQuantity: '',
     oemName: '',
+    companyName: '',
     concernedPersonName: '',
     contactNo: '',
     mailId: '',
-    mafStatus: 'Not Requested',
+    mafStatus: 'Pending',
     mafRequestedDate: '',
     mafDocumentUrl: '',
     mafDocumentName: '',
@@ -62,6 +63,8 @@ function hydrateItemForForm(item: MafLineItem): MafLineItem {
   const contact = getMafContactDetails(item);
   return {
     ...item,
+    oemName: item.oemName ?? '',
+    companyName: item.companyName ?? '',
     concernedPersonName: contact.concernedPersonName,
     contactNo: contact.contactNo,
     mailId: contact.mailId,
@@ -94,7 +97,7 @@ export function MafTrackerFormModal({
     initialMatched?.title ?? initialTracker?.tenderTitle ?? '',
   );
   const [department, setDepartment] = useState(
-    initialMatched?.department ?? initialTracker?.department ?? '',
+    initialTracker?.department ?? initialMatched?.department ?? '',
   );
   const [tenderDueDate, setTenderDueDate] = useState(
     initialMatched?.submissionDueDate ?? initialTracker?.tenderDueDate ?? '',
@@ -259,6 +262,7 @@ export function MafTrackerFormModal({
         itemName: item.itemName.trim(),
         requiredQuantity: item.requiredQuantity.trim(),
         oemName: item.oemName.trim(),
+        companyName: (item.companyName ?? '').trim(),
         concernedPersonName,
         contactNo,
         mailId,
@@ -271,13 +275,15 @@ export function MafTrackerFormModal({
       };
     });
 
+    const resolvedDept = department.trim() || verifiedTender.department;
+
     const finalTracker: MafTrackerRecord = existingForTender
       ? {
           ...existingForTender,
           tenderRefId: verifiedTender.id,
           tenderId: verifiedTender.tenderId,
           tenderTitle: verifiedTender.title,
-          department: verifiedTender.department,
+          department: existingForTender.department || resolvedDept,
           tenderDueDate: verifiedTender.submissionDueDate,
           itemsMAF: [...existingForTender.itemsMAF, ...cleanedItems].slice(0, 50),
           updatedAt: nowIso,
@@ -287,7 +293,7 @@ export function MafTrackerFormModal({
           tenderRefId: verifiedTender.id,
           tenderId: verifiedTender.tenderId,
           tenderTitle: verifiedTender.title,
-          department: verifiedTender.department,
+          department: resolvedDept,
           tenderDueDate: verifiedTender.submissionDueDate,
           itemsMAF: cleanedItems,
           createdAt: initialTracker?.createdAt ?? nowIso,
@@ -591,15 +597,28 @@ export function MafTrackerFormModal({
 
                         <div>
                           <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            OEM Name *
+                            OEM Name {item.mafStatus !== 'Pending' ? '*' : ''}
                           </label>
                           <input
                             type="text"
-                            required
+                            required={item.mafStatus !== 'Pending'}
                             list="maf-form-oem-list"
                             value={item.oemName}
                             onChange={(e) => handleUpdateRow(idx, { oemName: e.target.value })}
                             placeholder="e.g. CP Plus"
+                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            Company Name
+                          </label>
+                          <input
+                            type="text"
+                            value={item.companyName ?? ''}
+                            onChange={(e) => handleUpdateRow(idx, { companyName: e.target.value })}
+                            placeholder="e.g. Partner / OEM Co."
                             className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                           />
                         </div>

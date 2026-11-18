@@ -1,6 +1,36 @@
 export const PRIMARY_PDF_MODEL = 'gemini-4-hydrogen';
 export const FALLBACK_PDF_MODEL = 'gemini-3.1-flash-lite';
 export const DEFAULT_RETRY_DELAYS_MS = [2000, 4000, 8000] as const;
+export const MODEL_BUSY_COOLDOWN_MS = 120_000;
+
+const modelCooldownUntilMs = new Map<string, number>();
+
+export function isModelInBusyCooldown(model: string, nowMs = Date.now()): boolean {
+  const until = modelCooldownUntilMs.get(model);
+  if (until === undefined) return false;
+  if (nowMs >= until) {
+    modelCooldownUntilMs.delete(model);
+    return false;
+  }
+  return true;
+}
+
+export function recordModelBusyCooldown(
+  model: string,
+  durationMs = MODEL_BUSY_COOLDOWN_MS,
+  nowMs = Date.now(),
+): void {
+  if (!model || durationMs <= 0) return;
+  modelCooldownUntilMs.set(model, nowMs + durationMs);
+}
+
+export function clearModelBusyCooldown(model?: string): void {
+  if (model) {
+    modelCooldownUntilMs.delete(model);
+  } else {
+    modelCooldownUntilMs.clear();
+  }
+}
 
 export interface RetryOptions {
   maxRetries?: number;
@@ -21,6 +51,9 @@ export interface FallbackRunnerOptions<T> {
   fallbackModel?: string;
   primaryRetryOptions?: RetryOptions;
   fallbackRetryOptions?: RetryOptions;
+  skipPrimaryIfInCooldown?: boolean;
+  cooldownDurationMs?: number;
+  nowFn?: () => number;
   runAttempt: (model: string, attemptIndex: number) => Promise<T>;
   onFallback?: (info: {
     fromModel: string;
@@ -226,9 +259,58 @@ export async function executeWithRetryAndFallback<T>({
   fallbackModel = FALLBACK_PDF_MODEL,
   primaryRetryOptions = {},
   fallbackRetryOptions = {},
+  skipPrimaryIfInCooldown = false,
+  cooldownDurationMs = MODEL_BUSY_COOLDOWN_MS,
+  nowFn = () => Date.now(),
   runAttempt,
   onFallback,
 }: FallbackRunnerOptions<T>): Promise<FallbackRunnerResult<T>> {
+  const canUseDistinctFallback = Boolean(fallbackModel && fallbackModel !== primaryModel);
+
+  if (skipPrimaryIfInCooldown && canUseDistinctFallback && isModelInBusyCooldown(primaryModel, nowFn())) {
+    try {
+      const fastRes = await withRetry(
+        (attemptIndex) => runAttempt(fallbackModel, attemptIndex),
+        {
+          maxRetries: 2,
+          delaysMs: [1500, 3000],
+          ...fallbackRetryOptions,
+        },
+      );
+      return {
+        result: fastRes.value,
+        modelUsed: fallbackModel,
+        fallbackUsed: true,
+        primaryAttempts: 0,
+        totalAttempts: fastRes.attempts,
+      };
+    } catch (fastError) {
+      if (isNonRetryableAuthOrConfigError(fastError)) {
+        throw fastError;
+      }
+      let backupAttempts = 0;
+      const backupRes = await withRetry(
+        (attemptIndex) => {
+          backupAttempts = attemptIndex + 1;
+          return runAttempt(primaryModel, attemptIndex);
+        },
+        {
+          maxRetries: 1,
+          delaysMs: [1500],
+          ...primaryRetryOptions,
+        },
+      );
+      clearModelBusyCooldown(primaryModel);
+      return {
+        result: backupRes.value,
+        modelUsed: primaryModel,
+        fallbackUsed: false,
+        primaryAttempts: backupAttempts,
+        totalAttempts: backupAttempts + 1,
+      };
+    }
+  }
+
   let primaryAttempts = 0;
 
   try {
@@ -244,6 +326,10 @@ export async function executeWithRetryAndFallback<T>({
       },
     );
 
+    if (skipPrimaryIfInCooldown) {
+      clearModelBusyCooldown(primaryModel);
+    }
+
     return {
       result: primaryRes.value,
       modelUsed: primaryModel,
@@ -252,7 +338,7 @@ export async function executeWithRetryAndFallback<T>({
       totalAttempts: primaryRes.attempts,
     };
   } catch (primaryError) {
-    if (isNonRetryableAuthOrConfigError(primaryError) || !fallbackModel || fallbackModel === primaryModel) {
+    if (isNonRetryableAuthOrConfigError(primaryError) || !canUseDistinctFallback) {
       throw primaryError;
     }
 
@@ -279,6 +365,10 @@ export async function executeWithRetryAndFallback<T>({
         ...fallbackRetryOptions,
       },
     );
+
+    if (skipPrimaryIfInCooldown) {
+      recordModelBusyCooldown(primaryModel, cooldownDurationMs, nowFn());
+    }
 
     return {
       result: fallbackRes.value,
@@ -355,7 +445,7 @@ export function sanitizeExtractErrorMessage(
     inferredStatus === 408 ||
     /AbortError|TimeoutError|timed out|timeout|DEADLINE_EXCEEDED/i.test(extractedText)
   ) {
-    return "Scan timeout ho gaya (45s limit). Network ya PDF bada hone ki wajah se time laga — 'Retry This File' par click karein.";
+    return "Scan timeout ho gaya (58s limit). Network ya PDF bada hone ki wajah se time laga — 'Retry This File' par click karein.";
   }
 
   if (inferredStatus === 413 || /payload too large|entity too large|413/i.test(extractedText)) {

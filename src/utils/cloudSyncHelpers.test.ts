@@ -206,6 +206,21 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
         mafDocumentName: 'Cloud link',
         remarks: 'Cloud drive draft',
       },
+      {
+        itemId: 'item-3',
+        itemName: 'Thermal Imaging Sight',
+        requiredQuantity: '5 Nos',
+        oemName: '',
+        companyName: '',
+        concernedPersonName: '',
+        contactNo: '',
+        mailId: '',
+        mafStatus: 'Pending',
+        mafRequestedDate: '',
+        mafDocumentUrl: '',
+        mafDocumentName: '',
+        remarks: '',
+      },
     ],
     createdAt: '2026-11-10T10:00:00Z',
     updatedAt: '2026-11-13T10:00:00Z',
@@ -213,7 +228,7 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
 
   const payload = buildCloudMafTrackerPayload(tracker, 'uid-1', TOKEN);
   const cloudItems = payload.itemsMAF as MafTrackerRecord['itemsMAF'];
-  assert.equal(cloudItems.length, 2);
+  assert.equal(cloudItems.length, 3);
   assert.equal(cloudItems[0].mafDocumentUrl, '');
   assert.equal(cloudItems[0].mafAttachmentId, 'maf-att-1');
   assert.equal(cloudItems[0].concernedPersonName, 'Ravi Singh');
@@ -221,6 +236,9 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
   assert.equal(cloudItems[0].mailId, 'ravi.singh@cpplusworld.com');
   assert.equal(cloudItems[0].mafRequestedDate, '2026-11-02');
   assert.equal(cloudItems[1].mafDocumentUrl, 'https://drive.google.com/file/d/abc/view');
+  assert.equal(cloudItems[2].oemName, '');
+  assert.equal(cloudItems[2].companyName, '');
+  assert.equal(cloudItems[2].mafStatus, 'Pending');
 
   const fileMap = new Map<string, string>([['maf-att-1', dataUri]]);
   const merged = mergeCloudMafTrackersWithFiles([{ ...tracker, itemsMAF: cloudItems }], fileMap, []);

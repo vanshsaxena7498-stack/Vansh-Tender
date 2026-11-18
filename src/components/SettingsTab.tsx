@@ -11,6 +11,7 @@ import {
   Download,
   ExternalLink,
   FileSpreadsheet,
+  HardDrive,
   LogOut,
   MessageCircle,
   RefreshCw,
@@ -21,6 +22,7 @@ import {
   Upload,
   User,
 } from 'lucide-react';
+import { firebaseConfig } from '../lib/firebase';
 import type {
   CrmBackupPayload,
   EmdBgRecord,
@@ -38,6 +40,7 @@ import {
   GOOGLE_APPS_SCRIPT_CODE_GS,
   isValidAppsScriptWebhookUrl,
 } from '../utils/googleSheetSync';
+import { formatStorageSize, type CloudStorageSummary } from '../utils/storageUsage';
 import { buildWhatsAppWebUrl, normalizeIndianWhatsAppPhone } from '../utils/whatsappAlerts';
 import type { CloudUserSummary } from './Header';
 
@@ -70,6 +73,7 @@ interface SettingsTabProps {
   onSaveSheetSettings: (settings: GoogleSheetSettings) => Promise<void> | void;
   onTestSheetWebhook: (settingsOverride?: GoogleSheetSettings) => Promise<void>;
   onFullSyncToSheet: (settingsOverride?: GoogleSheetSettings) => Promise<void>;
+  storageUsage: CloudStorageSummary;
 }
 
 export function SettingsTab({
@@ -101,6 +105,7 @@ export function SettingsTab({
   onSaveSheetSettings,
   onTestSheetWebhook,
   onFullSyncToSheet,
+  storageUsage,
 }: SettingsTabProps) {
   const [firmName, setFirmName] = useState(profile.firmName);
   const [gstin, setGstin] = useState(profile.gstin);
@@ -396,7 +401,7 @@ export function SettingsTab({
       <section className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
           <div className="flex items-center gap-2.5">
-            <Cloud className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
+            <Cloud className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400 shrink-0" aria-hidden="true" />
             <div>
               <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
                 Google Cloud Auto-Backup & Sync
@@ -511,6 +516,107 @@ export function SettingsTab({
             </div>
           </div>
         )}
+
+        {/* Live Cloud Storage Meter (1 GB Free Tier Quota) */}
+        <div
+          data-testid="cloud-storage-meter"
+          className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 p-4 space-y-3.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <HardDrive
+                className="h-4 w-4 text-[#1E3A8A] dark:text-blue-400 shrink-0"
+                aria-hidden="true"
+              />
+              <div>
+                <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                  Cloud Storage Usage (1 GB Firestore Quota)
+                </h3>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {cloudUser
+                    ? `Live footprint across ${storageUsage.totalDocs} synced documents (${storageUsage.firestoreAttachmentCount} attachments in Firestore)`
+                    : `Current workspace estimate across ${storageUsage.totalDocs} records (sign in with Google for live cloud totals)`}
+                </p>
+              </div>
+            </div>
+
+            <div className="w-full sm:w-auto flex flex-wrap items-center justify-between sm:justify-end gap-2.5 sm:gap-3 pt-1 sm:pt-0">
+              <div className="text-left sm:text-right min-w-0">
+                <p
+                  data-testid="cloud-storage-used-text"
+                  className="font-mono-num text-xs font-bold text-slate-900 dark:text-white"
+                >
+                  {formatStorageSize(storageUsage.totalBytes)} / 1.00 GB
+                </p>
+                <p className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400">
+                  {storageUsage.usagePercent.toFixed(2)}% used ·{' '}
+                  {formatStorageSize(storageUsage.remainingBytes)} free
+                </p>
+              </div>
+
+              <a
+                href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/usage`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-[11px] font-medium text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
+              >
+                <span>Firebase Usage</span>
+                <ExternalLink className="h-3 w-3" aria-hidden="true" />
+              </a>
+            </div>
+          </div>
+
+          <div
+            role="progressbar"
+            aria-label="Firestore 1 GB storage usage"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Number(storageUsage.usagePercent.toFixed(2))}
+            className="h-2.5 w-full rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden"
+          >
+            <div
+              className={`h-full rounded-full transition-all duration-300 ${
+                storageUsage.statusLevel === 'critical'
+                  ? 'bg-red-600'
+                  : storageUsage.statusLevel === 'warning'
+                    ? 'bg-amber-500'
+                    : 'bg-[#1E3A8A] dark:bg-blue-500'
+              }`}
+              style={{
+                width: `${
+                  storageUsage.totalBytes > 0 ? Math.max(1.5, storageUsage.usagePercent) : 0
+                }%`,
+              }}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+            {storageUsage.categories.map((cat) => (
+              <div
+                key={cat.key}
+                className="rounded-lg border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-2"
+              >
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                  {cat.label}
+                </p>
+                <div className="flex items-baseline justify-between gap-1.5 mt-0.5">
+                  <span className="font-mono-num text-xs font-bold text-slate-900 dark:text-slate-100">
+                    {formatStorageSize(cat.bytes)}
+                  </span>
+                  <span className="font-mono-num text-[10px] text-slate-500 dark:text-slate-400">
+                    {cat.docCount} {cat.docCount === 1 ? 'doc' : 'docs'}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {storageUsage.externalStorageFileCount > 0 && (
+            <p className="text-[11px] text-slate-500 dark:text-slate-400">
+              Note: {storageUsage.externalStorageFileCount} external / Firebase Storage MAF document link(s) are hosted outside the 1 GB Firestore database quota.
+            </p>
+          )}
+        </div>
       </section>
 
       {/* Company / Firm Profile */}

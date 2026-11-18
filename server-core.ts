@@ -13,6 +13,7 @@ import {
 import {
   DEFAULT_RETRY_DELAYS_MS,
   executeWithRetryAndFallback,
+  extractErrorMessage,
   extractErrorStatus,
   extractJsonObjectFromText,
   FALLBACK_PDF_MODEL,
@@ -24,6 +25,7 @@ import {
   withRetry,
   withTimeout,
 } from './src/utils/geminiRetry.ts';
+import { parsePlainTextSpecItems } from './src/utils/mafAutoGenerate.ts';
 
 const ADMIN_USERNAME = 'VanshSales';
 const DEFAULT_ADMIN_PASSWORD = process.env.CRM_INITIAL_PASSWORD || 'Vansh@2027';
@@ -757,8 +759,9 @@ export function createApiRouter(): Router {
 
   router.post('/tenders/extract-pdf', async (req: Request, res: Response) => {
     const routeStartedAt = Date.now();
-    const TOTAL_ROUTE_BUDGET_MS = 39_000;
-    const PER_ATTEMPT_TIMEOUT_MS = 16_000;
+    const TOTAL_ROUTE_BUDGET_MS = 54_000;
+    const PRIMARY_ATTEMPT_TIMEOUT_MS = 14_000;
+    const FALLBACK_ATTEMPT_TIMEOUT_MS = 20_000;
 
     try {
       const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -927,32 +930,37 @@ export function createApiRouter(): Router {
       const extractionOutcome = await executeWithRetryAndFallback<RawGeminiBidExtraction>({
         primaryModel: PRIMARY_PDF_MODEL,
         fallbackModel: FALLBACK_PDF_MODEL,
+        skipPrimaryIfInCooldown: true,
         primaryRetryOptions: {
           maxRetries: 3,
           delaysMs: DEFAULT_RETRY_DELAYS_MS,
-          deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS - 10_000,
-          onRetry: ({ attempt, maxRetries, delayMs }) => {
+          deadlineAtMs: routeStartedAt + 30_000,
+          onRetry: ({ attempt, maxRetries, delayMs, error }) => {
             console.warn(
-              `[extract-pdf] Primary model ${PRIMARY_PDF_MODEL} busy on "${fileName}". Retry ${attempt}/${maxRetries} in ${delayMs}ms.`,
+              `[extract-pdf] Primary model ${PRIMARY_PDF_MODEL} busy on "${fileName}" (status=${extractErrorStatus(error) ?? 'unknown'}). Retry ${attempt}/${maxRetries} in ${delayMs}ms.`,
             );
           },
         },
         fallbackRetryOptions: {
-          maxRetries: 1,
-          delaysMs: [1500],
+          maxRetries: 2,
+          delaysMs: [1500, 3000],
           deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS - 2_000,
+          onRetry: ({ attempt, maxRetries, delayMs, error }) => {
+            console.warn(
+              `[extract-pdf] Fallback model ${FALLBACK_PDF_MODEL} busy on "${fileName}" (status=${extractErrorStatus(error) ?? 'unknown'}). Retry ${attempt}/${maxRetries} in ${delayMs}ms.`,
+            );
+          },
         },
-        onFallback: ({ fromModel, toModel }) => {
+        onFallback: ({ fromModel, toModel, error }) => {
           console.warn(
-            `[extract-pdf] Switching from ${fromModel} to fast fallback model ${toModel} for "${fileName}".`,
+            `[extract-pdf] Switching from ${fromModel} to fast fallback model ${toModel} for "${fileName}" (${extractErrorStatus(error) ?? ''} ${extractErrorMessage(error).slice(0, 140)}).`,
           );
         },
         runAttempt: async (model) => {
           const remainingBudgetMs = routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now();
-          const attemptTimeoutMs = Math.max(
-            4_000,
-            Math.min(PER_ATTEMPT_TIMEOUT_MS, remainingBudgetMs),
-          );
+          const capMs =
+            model === PRIMARY_PDF_MODEL ? PRIMARY_ATTEMPT_TIMEOUT_MS : FALLBACK_ATTEMPT_TIMEOUT_MS;
+          const attemptTimeoutMs = Math.max(4_000, Math.min(capMs, remainingBudgetMs));
           if (remainingBudgetMs <= 1_500) {
             throw new TimeoutError('Server time budget exceeded before completing PDF extraction.');
           }
@@ -1011,7 +1019,7 @@ export function createApiRouter(): Router {
           const geoModel = extractionOutcome.fallbackUsed ? FALLBACK_PDF_MODEL : PRIMARY_PDF_MODEL;
           const geoOutcome = await withRetry(
             async () => {
-              const geoTimeout = Math.max(2_500, Math.min(6_500, routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now()));
+              const geoTimeout = Math.max(2_500, Math.min(5_000, routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now()));
               return await withTimeout(
                 ai.models.generateContent({
                   model: geoModel,
@@ -1038,7 +1046,7 @@ export function createApiRouter(): Router {
               );
             },
             {
-              maxRetries: 1,
+              maxRetries: remainingForGeoMs >= 9_000 ? 1 : 0,
               delaysMs: [1000],
               deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS,
             },
@@ -1236,6 +1244,294 @@ export function createApiRouter(): Router {
         ok: false,
         error: err instanceof Error ? err.message : 'Failed to query Google Sheet status.',
       });
+    }
+  });
+
+  router.post('/maf/extract-from-attachments', async (req: Request, res: Response) => {
+    const routeStartedAt = Date.now();
+    const TOTAL_ROUTE_BUDGET_MS = 54_000;
+    const PRIMARY_ATTEMPT_TIMEOUT_MS = 14_000;
+    const FALLBACK_ATTEMPT_TIMEOUT_MS = 20_000;
+
+    interface IncomingAttachmentInput {
+      fileName?: unknown;
+      mimeType?: unknown;
+      dataUrl?: unknown;
+    }
+
+    const parseAttachmentPayload = (raw: unknown) => {
+      if (!raw || typeof raw !== 'object') return null;
+      const obj = raw as IncomingAttachmentInput;
+      const fileName = typeof obj.fileName === 'string' ? obj.fileName.trim() : '';
+      const rawDataUrl = typeof obj.dataUrl === 'string' ? obj.dataUrl.trim() : '';
+      if (!rawDataUrl) return null;
+      const match = rawDataUrl.match(/^data:([^;]+);base64,(.+)$/i);
+      const mimeType = (
+        typeof obj.mimeType === 'string' && obj.mimeType.trim()
+          ? obj.mimeType.trim()
+          : match?.[1] || 'application/pdf'
+      ).toLowerCase();
+      const base64Data = (match?.[2] ?? rawDataUrl).replace(/\s+/g, '');
+      if (!base64Data) return null;
+      return {
+        fileName: fileName || 'document.pdf',
+        mimeType: mimeType === 'image/jpg' ? 'image/jpeg' : mimeType,
+        base64Data,
+      };
+    };
+
+    const GEMINI_INLINE_MIME_TYPES = new Set([
+      'application/pdf',
+      'image/png',
+      'image/jpeg',
+      'image/webp',
+    ]);
+
+    const buildGeminiPartsForAttachment = (
+      label: string,
+      att: { fileName: string; mimeType: string; base64Data: string },
+    ): {
+      parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>;
+      plainText?: string;
+    } => {
+      if (GEMINI_INLINE_MIME_TYPES.has(att.mimeType)) {
+        return {
+          parts: [
+            { text: `[${label}: ${att.fileName}]` },
+            { inlineData: { mimeType: att.mimeType, data: att.base64Data } },
+          ],
+        };
+      }
+      const lower = att.fileName.toLowerCase();
+      if (
+        att.mimeType.startsWith('text/') ||
+        att.mimeType === 'application/csv' ||
+        lower.endsWith('.txt') ||
+        lower.endsWith('.csv')
+      ) {
+        const decodedText = Buffer.from(att.base64Data, 'base64').toString('utf8').slice(0, 60_000);
+        return {
+          parts: [{ text: `[${label}: ${att.fileName}]\n${decodedText}` }],
+          plainText: decodedText,
+        };
+      }
+      return {
+        parts: [
+          {
+            text: `[${label}: ${att.fileName} (${att.mimeType}) — binary spreadsheet/word format]`,
+          },
+        ],
+      };
+    };
+
+    try {
+      const body = (req.body || {}) as {
+        attachment1?: unknown;
+        attachment2?: unknown;
+        fallbackDepartment?: unknown;
+      };
+      const att1 = parseAttachmentPayload(body.attachment1);
+      const att2 = parseAttachmentPayload(body.attachment2);
+      const fallbackDepartment =
+        typeof body.fallbackDepartment === 'string' ? body.fallbackDepartment.trim() : '';
+
+      if (!att1 && !att2) {
+        res.status(400).json({
+          ok: false,
+          success: false,
+          error: 'At least Attachment 1 or Attachment 2 content is required.',
+        });
+        return;
+      }
+
+      const built1 = att1
+        ? buildGeminiPartsForAttachment('Attachment 1 - Tender Inviting Authority / NIT Document', att1)
+        : null;
+      const built2 = att2
+        ? buildGeminiPartsForAttachment('Attachment 2 - BOQ / Specification Document', att2)
+        : null;
+
+      const apiKey = process.env.GEMINI_API_KEY?.trim();
+      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+        const fallbackItems = built2?.plainText ? parsePlainTextSpecItems(built2.plainText) : [];
+        if (fallbackItems.length > 0) {
+          res.status(200).json({
+            ok: true,
+            success: true,
+            department: fallbackDepartment,
+            items: fallbackItems,
+            fallbackParserUsed: true,
+          });
+          return;
+        }
+        res.status(503).json({
+          ok: false,
+          success: false,
+          retryable: false,
+          error:
+            'Gemini API key is not configured on the server to extract MAF items from PDF/image attachments.',
+        });
+        return;
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+
+      const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
+        ...(built1?.parts ?? []),
+        ...(built2?.parts ?? []),
+        {
+          text: [
+            'Extract Tender Department & Individual Product/Item rows strictly according to these rules:',
+            '1. department: Extract the exact Tender Inviting Authority / Department / Organisation Name from Attachment 1 (NIT / Tender Document). If Attachment 1 is absent or has no department, return "".',
+            '2. items: Extract EVERY individual required product/equipment/item listed in Attachment 2 (Specification / BOQ Document). If the tender requires 5 distinct products (for example: Item 1, Item 2, Item 3, Item 4, Item 5), return 5 separate objects in the items array—never merge multiple products into one item.',
+            '3. For each item object provide: itemName (concise product/equipment name without serial number prefix) and requiredQuantity (e.g. "10 Nos", "5 Sets", or "" if not specified).',
+            '4. Do NOT guess or invent OEM names, brand names, emails, phone numbers, or contact persons.',
+          ].join('\n'),
+        },
+      ];
+
+      interface RawMafExtractResult {
+        department?: string;
+        items?: Array<{ itemName?: string; requiredQuantity?: string }>;
+      }
+
+      const mafSchema = {
+        type: Type.OBJECT,
+        properties: {
+          department: {
+            type: Type.STRING,
+            description: 'Tender Inviting Authority / Department extracted from Attachment 1',
+          },
+          items: {
+            type: Type.ARRAY,
+            description: 'Individual required items extracted from Attachment 2',
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                itemName: { type: Type.STRING, description: 'Product / equipment name' },
+                requiredQuantity: { type: Type.STRING, description: 'Required quantity with unit or empty string' },
+              },
+              required: ['itemName', 'requiredQuantity'],
+            },
+          },
+        },
+        required: ['department', 'items'],
+      };
+
+      const outcome = await executeWithRetryAndFallback<RawMafExtractResult>({
+        primaryModel: PRIMARY_PDF_MODEL,
+        fallbackModel: FALLBACK_PDF_MODEL,
+        skipPrimaryIfInCooldown: true,
+        primaryRetryOptions: {
+          maxRetries: 2,
+          delaysMs: DEFAULT_RETRY_DELAYS_MS,
+          deadlineAtMs: routeStartedAt + 30_000,
+        },
+        fallbackRetryOptions: {
+          maxRetries: 2,
+          delaysMs: [1500, 3000],
+          deadlineAtMs: routeStartedAt + TOTAL_ROUTE_BUDGET_MS - 2_000,
+        },
+        runAttempt: async (model) => {
+          const remainingBudgetMs = routeStartedAt + TOTAL_ROUTE_BUDGET_MS - Date.now();
+          const capMs =
+            model === PRIMARY_PDF_MODEL ? PRIMARY_ATTEMPT_TIMEOUT_MS : FALLBACK_ATTEMPT_TIMEOUT_MS;
+          const attemptTimeoutMs = Math.max(4_000, Math.min(capMs, remainingBudgetMs));
+          if (remainingBudgetMs <= 1_500) {
+            throw new TimeoutError('Server time budget exceeded during MAF attachment extraction.');
+          }
+
+          const modelResponse = await withTimeout(
+            ai.models.generateContent({
+              model,
+              contents: { parts },
+              config: {
+                abortSignal: AbortSignal.timeout(attemptTimeoutMs),
+                systemInstruction:
+                  'You are a tender specification parser. Extract the inviting department from Attachment 1 and every individual item from Attachment 2 as clean JSON.',
+                ...(model === PRIMARY_PDF_MODEL
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+                responseMimeType: 'application/json',
+                responseSchema: mafSchema,
+              },
+            }),
+            attemptTimeoutMs,
+            'Gemini MAF attachment extraction timed out.',
+          );
+
+          const rawText = (modelResponse.text ?? '').trim();
+          const parsedJson = extractJsonObjectFromText<RawMafExtractResult>(rawText);
+          if (!parsedJson) {
+            throw new Error('Gemini returned empty or invalid structured JSON for MAF items.');
+          }
+          return parsedJson;
+        },
+      });
+
+      const extractedDepartment =
+        (typeof outcome.result.department === 'string' ? outcome.result.department.trim() : '') ||
+        fallbackDepartment;
+
+      const geminiItems = Array.isArray(outcome.result.items)
+        ? outcome.result.items
+            .map((it) => ({
+              itemName: typeof it?.itemName === 'string' ? it.itemName.trim().slice(0, 220) : '',
+              requiredQuantity:
+                typeof it?.requiredQuantity === 'string'
+                  ? it.requiredQuantity.trim().slice(0, 60)
+                  : '',
+            }))
+            .filter((it) => it.itemName.length > 0)
+            .slice(0, 50)
+        : [];
+
+      const items =
+        geminiItems.length > 0
+          ? geminiItems
+          : built2?.plainText
+            ? parsePlainTextSpecItems(built2.plainText)
+            : [];
+
+      res.status(200).json({
+        ok: true,
+        success: true,
+        modelUsed: outcome.modelUsed,
+        fallbackUsed: outcome.fallbackUsed,
+        department: extractedDepartment,
+        items,
+      });
+    } catch (err) {
+      const inferredStatus = extractErrorStatus(err);
+      const retryable = isRetryableGeminiError(err);
+      const isAuthErr = isNonRetryableAuthOrConfigError(err);
+      const httpStatus = isAuthErr
+        ? 403
+        : inferredStatus === 429
+          ? 429
+          : err instanceof TimeoutError || inferredStatus === 504
+            ? 504
+            : retryable || inferredStatus === 503 || inferredStatus === 502
+              ? 503
+              : 500;
+
+      const friendlyError = sanitizeExtractErrorMessage(err, httpStatus);
+      console.error('[maf/extract-from-attachments] Returning error JSON:', httpStatus, friendlyError);
+      if (!res.headersSent) {
+        res.status(httpStatus).json({
+          ok: false,
+          success: false,
+          retryable,
+          error: friendlyError,
+        });
+      }
     }
   });
 

@@ -138,6 +138,7 @@ export interface ExtractedBidDraft {
 }
 
 export type MafItemStatus =
+  | 'Pending'
   | 'Not Requested'
   | 'Requested / Follow-up'
   | 'Under Approval'
@@ -149,6 +150,7 @@ export interface MafLineItem {
   itemName: string;
   requiredQuantity: string;
   oemName: string;
+  companyName?: string;
   concernedPersonName?: string;
   contactNo?: string;
   mailId?: string;

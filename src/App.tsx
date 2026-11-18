@@ -80,6 +80,12 @@ import {
   DEFAULT_GOOGLE_SHEET_SETTINGS,
   isValidAppsScriptWebhookUrl,
 } from './utils/googleSheetSync';
+import {
+  buildTenderAttachmentExtractionSignature,
+  findTenderAttachmentSlot,
+  mergeAutoMafIntoTrackers,
+  type ExtractedSpecItem,
+} from './utils/mafAutoGenerate';
 import { findMatchingDailyTender } from './utils/mafCalculations';
 import {
   buildTenderWhatsAppMessage,
@@ -88,6 +94,7 @@ import {
   DEFAULT_WHATSAPP_SETTINGS,
   normalizeIndianWhatsAppPhone,
 } from './utils/whatsappAlerts';
+import { estimateCloudStorageUsage } from './utils/storageUsage';
 
 interface ToastNotice {
   id: string;
@@ -201,6 +208,7 @@ export default function App() {
   // In-memory refs for async Firestore listeners and attachment payloads
   const attachmentFilesRef = useRef<Map<string, string>>(new Map());
   const dispatchedWaKeysRef = useRef<Set<string>>(new Set());
+  const mafExtractionSignatureRef = useRef<Map<string, string>>(new Map());
   const stateRef = useRef({
     tenders,
     emdRecords,
@@ -698,6 +706,35 @@ export default function App() {
     [tenders, selectedTenderId],
   );
 
+  const cloudStorageSummary = useMemo(
+    () =>
+      estimateCloudStorageUsage({
+        ownerUid: firebaseUser?.uid,
+        profile: firmProfile,
+        preferences: { adminPin, darkMode },
+        tenders,
+        emdRecords,
+        mafTrackers,
+        whatsappSettings,
+        whatsappLogs,
+        sheetSettings,
+        attachmentFiles: attachmentFilesRef.current,
+      }),
+    [
+      firebaseUser?.uid,
+      firmProfile,
+      adminPin,
+      darkMode,
+      tenders,
+      emdRecords,
+      mafTrackers,
+      whatsappSettings,
+      whatsappLogs,
+      sheetSettings,
+      lastCloudSyncAt,
+    ],
+  );
+
   const createLinkedEmdRecord = (tender: Tender): EmdBgRecord => {
     const today = new Date().toISOString().slice(0, 10);
     const sixMonthsLater = new Date();
@@ -754,11 +791,13 @@ export default function App() {
         tracker.tenderId.trim().toLowerCase() === normalizedSavedCode;
       if (!isMatch) return tracker;
 
+      // Preserve Attachment 1 extracted department on existing tracker unless blank
+      const nextDept = tracker.department?.trim() ? tracker.department : saved.department;
       const needsUpdate =
         tracker.tenderRefId !== saved.id ||
         tracker.tenderId !== saved.tenderId ||
         tracker.tenderTitle !== saved.title ||
-        tracker.department !== saved.department ||
+        tracker.department !== nextDept ||
         tracker.tenderDueDate !== saved.submissionDueDate;
       if (!needsUpdate) return tracker;
 
@@ -767,7 +806,7 @@ export default function App() {
         tenderRefId: saved.id,
         tenderId: saved.tenderId,
         tenderTitle: saved.title,
-        department: saved.department,
+        department: nextDept,
         tenderDueDate: saved.submissionDueDate,
         updatedAt: nowIso,
       };
@@ -776,6 +815,106 @@ export default function App() {
     });
 
     return { nextTrackers, changedTrackers };
+  };
+
+  const triggerAutoMafFromTender = async (tender: Tender): Promise<void> => {
+    const att1 = findTenderAttachmentSlot(tender.attachments, 1);
+    const att2 = findTenderAttachmentSlot(tender.attachments, 2);
+
+    const resolveDataUrl = (att?: { id: string; dataUrl: string }) => {
+      if (!att) return '';
+      return att.dataUrl || attachmentFilesRef.current.get(att.id) || '';
+    };
+
+    const att1DataUrl = resolveDataUrl(att1);
+    const att2DataUrl = resolveDataUrl(att2);
+
+    // Attachment 2 (Specification / BOQ document) drives per-item breakdown
+    if (!att2 || !att2DataUrl) return;
+
+    const sig = buildTenderAttachmentExtractionSignature(tender);
+    const prevSig = mafExtractionSignatureRef.current.get(tender.id);
+    const normalizedTenderCode = tender.tenderId.trim().toLowerCase();
+    const hasExistingTracker = stateRef.current.mafTrackers.some(
+      (t) =>
+        (t.tenderRefId && t.tenderRefId === tender.id) ||
+        (normalizedTenderCode && t.tenderId.trim().toLowerCase() === normalizedTenderCode),
+    );
+
+    if (prevSig === sig && hasExistingTracker) {
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/maf/extract-from-attachments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          attachment1:
+            att1 && att1DataUrl
+              ? {
+                  fileName: att1.fileName,
+                  mimeType: att1.fileType,
+                  dataUrl: att1DataUrl,
+                }
+              : null,
+          attachment2: {
+            fileName: att2.fileName,
+            mimeType: att2.fileType,
+            dataUrl: att2DataUrl,
+          },
+          fallbackDepartment: tender.department,
+        }),
+      });
+
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        department?: string;
+        items?: ExtractedSpecItem[];
+        error?: string;
+      };
+
+      if (!res.ok || !data.ok) {
+        if (data.error) {
+          showToast('err', `MAF auto-extraction: ${data.error}`);
+        }
+        return;
+      }
+
+      mafExtractionSignatureRef.current.set(tender.id, sig);
+      const extractedItems = Array.isArray(data.items) ? data.items : [];
+      if (extractedItems.length === 0) return;
+
+      const latestTender =
+        stateRef.current.tenders.find((t) => t.id === tender.id) ?? tender;
+
+      const merged = mergeAutoMafIntoTrackers({
+        tender: latestTender,
+        extractedDepartment: typeof data.department === 'string' ? data.department : '',
+        extractedItems,
+        existingTrackers: stateRef.current.mafTrackers,
+      });
+
+      if (merged.addedCount === 0 && !merged.departmentUpdated) {
+        return;
+      }
+
+      stateRef.current.mafTrackers = merged.nextTrackers;
+      setMafTrackers(merged.nextTrackers);
+
+      if (merged.targetTracker && stateRef.current.firebaseUser) {
+        void runCloudTask((user) => syncMafTrackerToCloud(user, merged.targetTracker!));
+      }
+
+      if (merged.addedCount > 0) {
+        showToast(
+          'ok',
+          `Auto-generated ${merged.addedCount} MAF item(s) for ${latestTender.tenderId} (Status: Pending).`,
+        );
+      }
+    } catch {
+      // Non-fatal: tender save itself already succeeded
+    }
   };
 
   const pushToGoogleSheet = async (opts: {
@@ -913,35 +1052,49 @@ export default function App() {
       }
     }
 
-    const { changedTrackers } = buildSyncedMafTrackersForTender(
+    const syncedResult = buildSyncedMafTrackersForTender(
       saved,
       stateRef.current.mafTrackers,
     );
+    const changedTrackers = syncedResult.changedTrackers;
 
     let linkedMafToSync: MafTrackerRecord | null = null;
     if (initialMafItems && initialMafItems.length > 0) {
-      const nowIso = new Date().toISOString();
-      linkedMafToSync = {
-        id: `maf-${saved.id}`,
-        tenderRefId: saved.id,
-        tenderId: saved.tenderId,
-        tenderTitle: saved.title,
-        department: saved.department,
-        tenderDueDate: saved.submissionDueDate,
-        itemsMAF: initialMafItems,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-      setMafTrackers((prev) => {
-        const synced = buildSyncedMafTrackersForTender(saved, prev).nextTrackers;
-        return [linkedMafToSync!, ...synced];
+      const mergedManual = mergeAutoMafIntoTrackers({
+        tender: saved,
+        extractedDepartment: saved.department,
+        extractedItems: initialMafItems.map((it) => ({
+          itemName: it.itemName,
+          requiredQuantity: it.requiredQuantity,
+        })),
+        existingTrackers: syncedResult.nextTrackers,
       });
+      if (mergedManual.targetTracker) {
+        // Apply user's explicit OEM/status choices on manually initialized rows
+        const manualByKey = new Map(
+          initialMafItems.map((it) => [it.itemName.trim().toLowerCase(), it]),
+        );
+        const updatedTarget: MafTrackerRecord = {
+          ...mergedManual.targetTracker,
+          itemsMAF: mergedManual.targetTracker.itemsMAF.map((item) => {
+            const manual = manualByKey.get(item.itemName.trim().toLowerCase());
+            return manual ? { ...item, oemName: manual.oemName, mafStatus: manual.mafStatus } : item;
+          }),
+        };
+        linkedMafToSync = updatedTarget;
+        const nextMaf = mergedManual.nextTrackers.map((t) =>
+          t.id === updatedTarget.id ? updatedTarget : t,
+        );
+        stateRef.current.mafTrackers = nextMaf;
+        setMafTrackers(nextMaf);
+      }
       showToast(
         'ok',
         `Tender saved & initialized ${initialMafItems.length} MAF tracker item(s).`,
       );
     } else if (changedTrackers.length > 0) {
-      setMafTrackers((prev) => buildSyncedMafTrackersForTender(saved, prev).nextTrackers);
+      stateRef.current.mafTrackers = syncedResult.nextTrackers;
+      setMafTrackers(syncedResult.nextTrackers);
     }
 
     setTenderModalTarget(undefined);
@@ -967,6 +1120,8 @@ export default function App() {
       tendersSnapshot: nextTenders,
       emdSnapshot: nextEmdRecords,
     });
+
+    void triggerAutoMafFromTender(saved);
   };
 
   const handleUpdateTenderInline = (rawUpdated: Tender) => {
@@ -981,12 +1136,14 @@ export default function App() {
     stateRef.current.tenders = nextTenders;
     setTenders(nextTenders);
 
-    const { changedTrackers } = buildSyncedMafTrackersForTender(
+    const syncedResult = buildSyncedMafTrackersForTender(
       updated,
       stateRef.current.mafTrackers,
     );
+    const changedTrackers = syncedResult.changedTrackers;
     if (changedTrackers.length > 0) {
-      setMafTrackers((prev) => buildSyncedMafTrackersForTender(updated, prev).nextTrackers);
+      stateRef.current.mafTrackers = syncedResult.nextTrackers;
+      setMafTrackers(syncedResult.nextTrackers);
     }
     void runCloudTask(async (user) => {
       await syncTenderToCloud(user, updated);
@@ -1002,6 +1159,8 @@ export default function App() {
       tendersSnapshot: nextTenders,
       emdSnapshot: stateRef.current.emdRecords,
     });
+
+    void triggerAutoMafFromTender(updated);
   };
 
   const handleDeleteTender = (id: string) => {
@@ -1658,20 +1817,13 @@ export default function App() {
               onSaveSheetSettings={handleSaveSheetSettings}
               onTestSheetWebhook={handleTestSheetWebhook}
               onFullSyncToSheet={handleFullSyncToSheet}
+              storageUsage={cloudStorageSummary}
             />
           )}
         </main>
       </div>
 
       {/* Modals & Slide-over Drawers */}
-      {tenderModalTarget !== undefined && (
-        <TenderFormModal
-          initialTender={tenderModalTarget}
-          onClose={() => setTenderModalTarget(undefined)}
-          onSave={handleSaveTender}
-        />
-      )}
-
       {selectedTender && (
         <TenderDetailDrawer
           tender={selectedTender}
@@ -1679,7 +1831,10 @@ export default function App() {
             (r) => r.tenderId.toLowerCase() === selectedTender.tenderId.toLowerCase(),
           )}
           onClose={() => setSelectedTenderId(null)}
-          onEdit={(t) => setTenderModalTarget(t)}
+          onEdit={(t) => {
+            setSelectedTenderId(null);
+            setTenderModalTarget(t);
+          }}
           onDelete={handleDeleteTender}
           onUpdateTender={handleUpdateTenderInline}
           onSyncToEmdTracker={handleSyncTenderToEmd}
@@ -1687,6 +1842,14 @@ export default function App() {
             setSelectedTenderId(null);
             setActiveTab('emdbg');
           }}
+        />
+      )}
+
+      {tenderModalTarget !== undefined && (
+        <TenderFormModal
+          initialTender={tenderModalTarget}
+          onClose={() => setTenderModalTarget(undefined)}
+          onSave={handleSaveTender}
         />
       )}
 

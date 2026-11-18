@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState, type ChangeEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import {
   ChevronDown,
   ChevronRight,
@@ -44,6 +44,8 @@ interface MafStatusTabProps {
 
 function getMafStatusBadgeClass(status: MafItemStatus): string {
   switch (status) {
+    case 'Pending':
+      return 'bg-sky-100 text-sky-800 border-sky-200 dark:bg-sky-950/60 dark:text-sky-300 dark:border-sky-800/70';
     case 'Received / Approved':
       return 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800/70';
     case 'Under Approval':
@@ -77,9 +79,27 @@ export function MafStatusTab({
     const first = trackers[0]?.id;
     return first ? { [first]: true } : {};
   });
+  const seenTrackerIdsRef = useRef<Set<string>>(new Set(trackers.map((t) => t.id)));
   const [uploadingKey, setUploadingKey] = useState<string | null>(null);
   const [confirmDeleteTrackerId, setConfirmDeleteTrackerId] = useState<string | null>(null);
   const [confirmDeleteItemKey, setConfirmDeleteItemKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    const newlyAddedIds: string[] = [];
+    for (const t of trackers) {
+      if (!seenTrackerIdsRef.current.has(t.id)) {
+        seenTrackerIdsRef.current.add(t.id);
+        newlyAddedIds.push(t.id);
+      }
+    }
+    if (newlyAddedIds.length > 0) {
+      setExpandedIds((prev) => {
+        const next = { ...prev };
+        for (const id of newlyAddedIds) next[id] = true;
+        return next;
+      });
+    }
+  }, [trackers]);
 
   const metrics = useMemo(
     () => computeMafSummaryMetrics(trackers, tenders),
@@ -134,6 +154,7 @@ export function MafStatusTab({
       'Item Name',
       'Required Quantity',
       'OEM Name',
+      'Company Name',
       'Concerned Person Name',
       'Contact No.',
       'Mail ID',
@@ -162,6 +183,7 @@ export function MafStatusTab({
           '',
           '',
           '',
+          '',
         ]);
       } else {
         for (const item of items) {
@@ -175,6 +197,7 @@ export function MafStatusTab({
             item.itemName,
             item.requiredQuantity,
             item.oemName,
+            item.companyName ?? '',
             contact.concernedPersonName,
             contact.contactNo,
             contact.mailId,
@@ -556,10 +579,23 @@ export function MafStatusTab({
                                             )}
                                           </td>
 
-                                          <td className="py-2.5 px-3 max-w-[140px]">
-                                            <p className="font-medium text-slate-800 dark:text-slate-200 truncate">
-                                              {item.oemName}
-                                            </p>
+                                          <td className="py-2.5 px-3 max-w-[160px]">
+                                            {item.oemName || item.companyName ? (
+                                              <div className="space-y-0.5">
+                                                <p className="font-medium text-slate-800 dark:text-slate-200 truncate">
+                                                  {item.oemName || '—'}
+                                                </p>
+                                                {item.companyName && (
+                                                  <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                                                    {item.companyName}
+                                                  </p>
+                                                )}
+                                              </div>
+                                            ) : (
+                                              <span className="text-slate-400 dark:text-slate-500">
+                                                —
+                                              </span>
+                                            )}
                                           </td>
 
                                           <td className="py-2.5 px-3 max-w-[210px]">
