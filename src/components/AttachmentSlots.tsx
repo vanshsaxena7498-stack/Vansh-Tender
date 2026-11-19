@@ -6,6 +6,7 @@ import {
   readAttachmentForFirestore,
   type AttachmentSlotState,
 } from '../utils/attachments';
+import { getLocalDateInputValue } from '../utils/formatters';
 
 interface AttachmentSlotsProps {
   title: string;
@@ -16,28 +17,40 @@ interface AttachmentSlotsProps {
 export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps) {
   const [slotError, setSlotError] = useState<string>('');
   const [readingSlot, setReadingSlot] = useState<number | null>(null);
+  const [extraEmptySlots, setExtraEmptySlots] = useState<AttachmentSlotState[]>([]);
+
+  const displaySlots = [...slots, ...extraEmptySlots];
 
   const handleFilePick = async (slotIndex: number, e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
 
+    const targetSlot = displaySlots[slotIndex];
+    if (!targetSlot) return;
+
     setReadingSlot(slotIndex);
     try {
       const { dataUrl, fileSize, fileType } = await readAttachmentForFirestore(file);
       const item: AttachmentItem = {
         id: `att-${Date.now()}-${slotIndex}`,
-        slotLabel: slots[slotIndex].slotLabel,
+        slotLabel: targetSlot.slotLabel,
         fileName: file.name,
         fileType,
         fileSize,
-        uploadedAt: new Date().toISOString().slice(0, 10),
+        uploadedAt: getLocalDateInputValue(),
         dataUrl,
       };
       setSlotError('');
-      onChange(
-        slots.map((slot, idx) => (idx === slotIndex ? { ...slot, attachment: item } : slot)),
-      );
+      if (slotIndex < slots.length) {
+        onChange(
+          slots.map((slot, idx) => (idx === slotIndex ? { ...slot, attachment: item } : slot)),
+        );
+      } else {
+        const extraIdx = slotIndex - slots.length;
+        setExtraEmptySlots((prev) => prev.filter((_, idx) => idx !== extraIdx));
+        onChange([...slots, { ...targetSlot, attachment: item }]);
+      }
     } catch (err) {
       setSlotError(
         err instanceof Error ? err.message : 'Unable to process the selected file.',
@@ -49,15 +62,20 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
 
   const handleRemoveFile = (slotIndex: number) => {
     setSlotError('');
-    onChange(
-      slots.map((slot, idx) => (idx === slotIndex ? { ...slot, attachment: null } : slot)),
-    );
+    if (slotIndex < slots.length) {
+      onChange(
+        slots.map((slot, idx) => (idx === slotIndex ? { ...slot, attachment: null } : slot)),
+      );
+    } else {
+      const extraIdx = slotIndex - slots.length;
+      setExtraEmptySlots((prev) => prev.filter((_, idx) => idx !== extraIdx));
+    }
   };
 
   const handleAddSlot = () => {
-    const nextNumber = slots.length + 1;
-    onChange([
-      ...slots,
+    const nextNumber = displaySlots.length + 1;
+    setExtraEmptySlots((prev) => [
+      ...prev,
       {
         slotId: `slot-${Date.now()}-${nextNumber}`,
         slotLabel: `Attachment ${nextNumber} · Additional Document`,
@@ -66,7 +84,7 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
     ]);
   };
 
-  const attachedCount = slots.filter((s) => s.attachment !== null).length;
+  const attachedCount = displaySlots.filter((s) => s.attachment !== null).length;
 
   return (
     <section
@@ -80,7 +98,7 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
             {title}
           </h3>
           <span className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400">
-            ({attachedCount}/{slots.length} attached · max 650 KB/file, images auto-compressed)
+            ({attachedCount}/{displaySlots.length} attached · max 650 KB/file, images auto-compressed)
           </span>
         </div>
 
@@ -104,10 +122,11 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
       )}
 
       <div className="grid grid-cols-1 gap-2.5">
-        {slots.map((slot, idx) => {
+        {displaySlots.map((slot, idx) => {
           const inputId = `att-input-${slot.slotId}`;
           const file = slot.attachment;
           const isBusy = readingSlot === idx;
+          const isExtraEmpty = idx >= slots.length && !file;
           return (
             <div
               key={slot.slotId}
@@ -159,6 +178,17 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
                   </>
+                )}
+
+                {isExtraEmpty && (
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveFile(idx)}
+                    aria-label={`Remove ${slot.slotLabel}`}
+                    className="p-1.5 rounded-md border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-red-600 dark:text-slate-400 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
                 )}
 
                 <label

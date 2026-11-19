@@ -33,6 +33,7 @@ import {
 } from '../utils/attachments';
 import {
   buildTenderFromBidDraft,
+  detectMsmeEmdExemption,
   findDuplicateTender,
 } from '../utils/bidSearchParser';
 import { sanitizeExtractErrorMessage } from '../utils/geminiRetry';
@@ -90,6 +91,7 @@ interface ScannedBidCardState {
   attachment1: AttachmentItem | null;
   attachmentWarning?: string;
   syncToEmd: boolean;
+  manuallyOverriddenEmd?: boolean;
   savedTenderId?: string;
   savedTenderRecord?: Tender;
 }
@@ -453,13 +455,45 @@ export function BidSearchTab({
     e.target.value = '';
   };
 
-  const updateCardDraft = (scanId: string, patch: Partial<ExtractedBidDraft>) => {
+  const updateCardDraft = (
+    scanId: string,
+    patch: Partial<ExtractedBidDraft>,
+    markEmdOverride = false,
+  ) => {
     setScanQueue((prev) =>
-      prev.map((item) =>
-        item.scanId === scanId && item.draft
-          ? { ...item, draft: { ...item.draft, ...patch } }
-          : item,
-      ),
+      prev.map((item) => {
+        if (item.scanId !== scanId || !item.draft) return item;
+        const nextDraft = { ...item.draft, ...patch };
+        const nextOverridden = markEmdOverride ? true : Boolean(item.manuallyOverriddenEmd);
+        let nextSyncToEmd = item.syncToEmd;
+
+        if (
+          !markEmdOverride &&
+          !nextOverridden &&
+          ('title' in patch || 'category' in patch || 'department' in patch || 'resultInfo' in patch)
+        ) {
+          const combinedText = [
+            nextDraft.title,
+            nextDraft.category,
+            nextDraft.department,
+            nextDraft.resultInfo,
+          ]
+            .filter(Boolean)
+            .join(' ');
+          if (detectMsmeEmdExemption(combinedText, { includeBareMse: true })) {
+            nextDraft.emdStatus = 'Exempted - MSME/Startup';
+            nextDraft.emdAmount = 0;
+            nextSyncToEmd = false;
+          }
+        }
+
+        return {
+          ...item,
+          draft: nextDraft,
+          manuallyOverriddenEmd: nextOverridden,
+          syncToEmd: nextSyncToEmd,
+        };
+      }),
     );
   };
 
@@ -1125,13 +1159,17 @@ export function BidSearchTab({
                             value={item.draft.emdStatus}
                             onChange={(e) => {
                               const nextStatus = e.target.value as EmdSecurityType;
-                              updateCardDraft(item.scanId, {
-                                emdStatus: nextStatus,
-                                emdAmount:
-                                  nextStatus === 'EMD Paid' || nextStatus === 'BG Submitted'
-                                    ? item.draft?.emdAmount || 0
-                                    : 0,
-                              });
+                              updateCardDraft(
+                                item.scanId,
+                                {
+                                  emdStatus: nextStatus,
+                                  emdAmount:
+                                    nextStatus === 'EMD Paid' || nextStatus === 'BG Submitted'
+                                      ? item.draft?.emdAmount || 0
+                                      : 0,
+                                },
+                                true,
+                              );
                             }}
                             className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                           >
@@ -1141,6 +1179,11 @@ export function BidSearchTab({
                               </option>
                             ))}
                           </select>
+                          {item.draft.emdStatus === 'Exempted - MSME/Startup' && (
+                            <p className="mt-1 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                              MSME / Startup EMD Exemption Applied
+                            </p>
+                          )}
                         </div>
 
                         <div>
@@ -1153,9 +1196,13 @@ export function BidSearchTab({
                             disabled={!supportsEmd}
                             value={supportsEmd ? item.draft.emdAmount : 0}
                             onChange={(e) =>
-                              updateCardDraft(item.scanId, {
-                                emdAmount: Math.max(0, Number(e.target.value) || 0),
-                              })
+                              updateCardDraft(
+                                item.scanId,
+                                {
+                                  emdAmount: Math.max(0, Number(e.target.value) || 0),
+                                },
+                                true,
+                              )
                             }
                             className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 disabled:bg-slate-100 dark:disabled:bg-slate-800 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                           />
@@ -1203,7 +1250,7 @@ export function BidSearchTab({
                             </label>
                           ) : (
                             <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                              Saving syncs directly to Daily Tender Data, Firestore Cloud & WhatsApp
+                              Saving syncs directly to Daily Tender Data, Firestore Cloud &amp; Daily Email
                               Alerts
                             </span>
                           )}

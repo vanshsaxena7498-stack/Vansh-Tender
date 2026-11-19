@@ -1,5 +1,5 @@
 import { signInWithPopup } from 'firebase/auth';
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import {
   ArrowLeft,
   ArrowRightCircle,
@@ -22,22 +22,29 @@ import {
   TrendingUp,
   Trophy,
   User,
+  UserPlus,
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
-import { validateLoginCredentials } from '../utils/authCredentials';
-
-async function safeParseJsonResponse<T>(res: Response): Promise<T | null> {
-  try {
-    const text = await res.text();
-    if (!text) return null;
-    return JSON.parse(text) as T;
-  } catch {
-    return null;
-  }
-}
+import type { CrmUserSession } from '../types/crm';
+import {
+  ADMIN_RECOVERY_EMAIL,
+  findUserByIdentifier,
+  getAllStoredCredentialTokens,
+  getStoredCredentialToken,
+  registerSecondaryUserAccount,
+  saveResetPasswordCredential,
+  syncAuthenticatedUserFromServer,
+  VALID_LOGIN_USERNAME,
+  validateLoginCredentials,
+} from '../utils/authCredentials';
+import { safeReadJsonResponse } from '../utils/httpHelpers';
 
 interface LoginPageProps {
-  onLoginSuccess: (rememberMe: boolean) => void;
+  onLoginSuccess: (
+    session: CrmUserSession,
+    rememberMe: boolean,
+    serverMeta?: { credentialToken?: string; adminSessionToken?: string },
+  ) => void;
 }
 
 function VanshBrandEmblem({ className = 'h-10 w-10' }: { className?: string }) {
@@ -84,9 +91,8 @@ const FEATURE_HIGHLIGHTS = [
   { label: 'Task Management', icon: ClipboardCheck },
 ];
 
-const RECOVERY_EMAIL = 'vanshsaxena7498@gmail.com';
-
 export function LoginPage({ onLoginSuccess }: LoginPageProps) {
+  const [authView, setAuthView] = useState<'login' | 'reset' | 'signup'>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -95,24 +101,64 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
-  // Forgot Password / Reset Password flow
-  const [resetMode, setResetMode] = useState<'none' | 'request' | 'verify_otp' | 'verify_google'>('none');
+  // Forgot Password / Reset Password flow (per-user identifier -> attached Gmail OTP -> New Password)
+  const [resetMode, setResetMode] = useState<'request' | 'verify_otp' | 'set_password'>('request');
+  const [resetIdentifier, setResetIdentifier] = useState('');
+  const [resetTargetUser, setResetTargetUser] = useState<{
+    userId: string;
+    username: string;
+    targetEmail: string;
+    maskedEmail: string;
+  } | null>(null);
+  const [resetAuthMethod, setResetAuthMethod] = useState<'otp' | 'google'>('otp');
   const [resetLoading, setResetLoading] = useState(false);
   const [resetNotice, setResetNotice] = useState('');
   const [resetError, setResetError] = useState('');
   const [smtpUnconfiguredNotice, setSmtpUnconfiguredNotice] = useState(false);
   const [otpInput, setOtpInput] = useState('');
   const [otpToken, setOtpToken] = useState('');
+  const [verifiedToken, setVerifiedToken] = useState('');
   const [googleIdToken, setGoogleIdToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [showNewPassword, setShowNewPassword] = useState(false);
 
+  // Create New Secondary User flow (Gmail OTP -> User ID & Password -> Successful ID Creation)
+  const [signupStep, setSignupStep] = useState<'email' | 'verify_otp' | 'credentials' | 'success'>('email');
+  const [signupEmail, setSignupEmail] = useState('');
+  const [signupOtp, setSignupOtp] = useState('');
+  const [signupOtpToken, setSignupOtpToken] = useState('');
+  const [signupVerifiedToken, setSignupVerifiedToken] = useState('');
+  const [signupUsername, setSignupUsername] = useState('');
+  const [signupPassword, setSignupPassword] = useState('');
+  const [signupConfirmPassword, setSignupConfirmPassword] = useState('');
+  const [showSignupPassword, setShowSignupPassword] = useState(false);
+  const [signupLoading, setSignupLoading] = useState(false);
+  const [signupError, setSignupError] = useState('');
+  const [signupNotice, setSignupNotice] = useState('');
+  const [createdUsernameLabel, setCreatedUsernameLabel] = useState('');
+
+  useEffect(() => {
+    if (authView !== 'signup' || signupStep !== 'success') return;
+    const timer = window.setTimeout(() => {
+      setAuthView('login');
+      setSignupStep('email');
+      if (createdUsernameLabel) {
+        setUsername(createdUsernameLabel);
+      }
+      setPassword('');
+      setSuccessMsg(
+        `Successful ID Creation! You can now log in with your User ID "${createdUsernameLabel}" and password.`,
+      );
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [authView, signupStep, createdUsernameLabel]);
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const trimmedUser = username.trim();
     if (!trimmedUser) {
-      setErrorMsg('Please enter your Username or Email ID.');
+      setErrorMsg('Please enter your User ID or Email ID.');
       return;
     }
     if (!password) {
@@ -124,35 +170,67 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
     setErrorMsg('');
     setSuccessMsg('');
     try {
+      const credentialToken = getStoredCredentialToken(trimmedUser);
+      const clientCredentialTokens = getAllStoredCredentialTokens();
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: trimmedUser, password }),
+        body: JSON.stringify({
+          username: trimmedUser,
+          identifier: trimmedUser,
+          password,
+          ...(credentialToken ? { credentialToken } : {}),
+          ...(clientCredentialTokens.length > 0 ? { clientCredentialTokens } : {}),
+        }),
       });
-      const data = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        username?: string;
+        user?: CrmUserSession;
+        credentialToken?: string;
+        adminSessionToken?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+
       if (res.status === 404 || !data) {
         const localCheck = validateLoginCredentials(trimmedUser, password);
-        if (localCheck.ok) {
-          onLoginSuccess(rememberMe);
+        if (localCheck.ok && localCheck.user) {
+          onLoginSuccess(localCheck.user, rememberMe);
         } else {
           setErrorMsg(
             localCheck.error ||
-              'Invalid username or password. Please check your credentials and try again.',
+              'Invalid User ID or password. Please check your credentials and try again.',
           );
         }
         return;
       }
       if (!res.ok || !data.ok) {
         setErrorMsg(
-          data.error || 'Invalid username or password. Please check your credentials and try again.',
+          data.error || 'Invalid User ID or password. Please check your credentials and try again.',
         );
         return;
       }
-      onLoginSuccess(rememberMe);
+
+      const resolvedUser: CrmUserSession = data.user || {
+        userId: 'admin_vanshsales',
+        username: data.username || VALID_LOGIN_USERNAME,
+        email: ADMIN_RECOVERY_EMAIL,
+        role: 'admin',
+      };
+      syncAuthenticatedUserFromServer({
+        ...resolvedUser,
+        password,
+        credentialToken: data.credentialToken,
+      });
+      onLoginSuccess(resolvedUser, rememberMe, {
+        credentialToken: data.credentialToken,
+        adminSessionToken: data.adminSessionToken,
+      });
     } catch {
       const localCheck = validateLoginCredentials(trimmedUser, password);
-      if (localCheck.ok) {
-        onLoginSuccess(rememberMe);
+      if (localCheck.ok && localCheck.user) {
+        onLoginSuccess(localCheck.user, rememberMe);
       } else {
         setErrorMsg(
           localCheck.error || 'Unable to reach authentication server. Please retry.',
@@ -164,7 +242,22 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
   };
 
   const openForgotPasswordFlow = () => {
+    const initialId = username.trim();
+    const localMatch = initialId ? findUserByIdentifier(initialId) : null;
+    setAuthView('reset');
     setResetMode('request');
+    setResetIdentifier(initialId);
+    setResetTargetUser(
+      localMatch
+        ? {
+            userId: localMatch.userId,
+            username: localMatch.username,
+            targetEmail: localMatch.email,
+            maskedEmail: localMatch.email,
+          }
+        : null,
+    );
+    setResetAuthMethod('otp');
     setErrorMsg('');
     setSuccessMsg('');
     setResetError('');
@@ -172,51 +265,114 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
     setSmtpUnconfiguredNotice(false);
     setOtpInput('');
     setOtpToken('');
+    setVerifiedToken('');
     setGoogleIdToken('');
     setNewPassword('');
     setConfirmNewPassword('');
   };
 
+  const openCreateUserFlow = () => {
+    setAuthView('signup');
+    setSignupStep('email');
+    setSignupEmail('');
+    setSignupOtp('');
+    setSignupOtpToken('');
+    setSignupVerifiedToken('');
+    setSignupUsername('');
+    setSignupPassword('');
+    setSignupConfirmPassword('');
+    setSignupError('');
+    setSignupNotice('');
+    setCreatedUsernameLabel('');
+    setErrorMsg('');
+    setSuccessMsg('');
+  };
+
   const handleSendResetEmail = async () => {
+    const identifier = resetIdentifier.trim();
+    if (!identifier) {
+      setResetError('Please enter your User ID or registered Gmail address first.');
+      return;
+    }
+
     setResetLoading(true);
     setResetError('');
     setResetNotice('');
     setSmtpUnconfiguredNotice(false);
     try {
+      const clientCredentialTokens = getAllStoredCredentialTokens();
       const res = await fetch('/api/auth/forgot-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetEmail: RECOVERY_EMAIL }),
+        body: JSON.stringify({
+          identifier,
+          ...(clientCredentialTokens.length > 0 ? { clientCredentialTokens } : {}),
+        }),
       });
-      const data = await safeParseJsonResponse<{
+      const parsed = await safeReadJsonResponse<{
         ok?: boolean;
         emailSent?: boolean;
         providerConfigured?: boolean;
+        userId?: string;
+        username?: string;
+        targetEmail?: string;
+        maskedEmail?: string;
+        recipient?: string;
         otpToken?: string;
         message?: string;
         error?: string;
       }>(res);
-      if (res.status === 404 || !data) {
+      const data = parsed.data;
+
+      if (res.status === 404 && !data) {
+        const localMatch = findUserByIdentifier(identifier);
+        if (localMatch) {
+          setResetTargetUser({
+            userId: localMatch.userId,
+            username: localMatch.username,
+            targetEmail: localMatch.email,
+            maskedEmail: localMatch.email,
+          });
+        }
         setResetError(
-          'Password reset API endpoint (/api/auth/forgot-password) returned 404 on this host. Please redeploy with Vercel Serverless API enabled or verify locally.',
+          'Password reset API endpoint (/api/auth/forgot-password) is unavailable on this host. Please redeploy or use "Verify with Google" below.',
         );
         return;
       }
-      if (!res.ok || !data.ok) {
-        setResetError(data.error || `Could not send verification email to ${RECOVERY_EMAIL}.`);
+
+      if (!res.ok || !data?.ok) {
+        setResetError(
+          data?.error ||
+            parsed.errorMessage ||
+            `Could not find an account matching "${identifier}".`,
+        );
         return;
       }
+
+      const resolvedEmail = data.targetEmail || data.recipient || '';
+      const resolvedUsername = data.username || identifier;
+      const resolvedUserId = data.userId || '';
+      setResetTargetUser({
+        userId: resolvedUserId,
+        username: resolvedUsername,
+        targetEmail: resolvedEmail,
+        maskedEmail: data.maskedEmail || resolvedEmail,
+      });
+
       if (data.otpToken) {
         setOtpToken(data.otpToken);
       }
       if (data.emailSent) {
-        setResetNotice(data.message || `6-digit reset code sent to ${RECOVERY_EMAIL}.`);
+        setResetAuthMethod('otp');
+        setOtpInput('');
+        setVerifiedToken('');
+        setResetNotice(data.message || `6-digit reset code sent to ${resolvedEmail}.`);
         setResetMode('verify_otp');
       } else {
         setSmtpUnconfiguredNotice(true);
         setResetNotice(
           data.message ||
-            `SMTP/Resend email credentials are not configured yet. Verify via Google (${RECOVERY_EMAIL}) below to reset immediately.`,
+            `SMTP/Resend email credentials are not configured yet. Verify via Google (${resolvedEmail}) below to reset immediately.`,
         );
       }
     } catch {
@@ -226,23 +382,101 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
     }
   };
 
+  const handleVerifyResetCode = async (e: FormEvent) => {
+    e.preventDefault();
+    const cleanedOtp = otpInput.trim();
+    const targetEmail = resetTargetUser?.targetEmail || 'your registered Gmail';
+    if (!/^\d{6}$/.test(cleanedOtp)) {
+      setResetError(`Please enter the 6-digit verification code sent to ${targetEmail}.`);
+      return;
+    }
+
+    setResetLoading(true);
+    setResetError('');
+    try {
+      const res = await fetch('/api/auth/verify-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          otp: cleanedOtp,
+          otpToken,
+          userId: resetTargetUser?.userId,
+          identifier: resetTargetUser?.username || resetIdentifier.trim(),
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        verifiedToken?: string;
+        userId?: string;
+        username?: string;
+        targetEmail?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (!res.ok || !data?.ok) {
+        setResetError(
+          data?.error || parsed.errorMessage || 'Invalid 6-digit verification code. Please try again.',
+        );
+        return;
+      }
+      setVerifiedToken(data.verifiedToken || '');
+      if (data.userId && data.username && data.targetEmail) {
+        setResetTargetUser({
+          userId: data.userId,
+          username: data.username,
+          targetEmail: data.targetEmail,
+          maskedEmail: data.targetEmail,
+        });
+      }
+      setResetAuthMethod('otp');
+      setResetNotice(
+        data.message || 'Verification code confirmed. Enter your new password below.',
+      );
+      setResetMode('set_password');
+    } catch {
+      setResetError('Network error while verifying reset code.');
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
   const handleVerifyGoogleForReset = async () => {
+    const localMatch = findUserByIdentifier(resetIdentifier.trim());
+    const targetInfo =
+      resetTargetUser ||
+      (localMatch
+        ? {
+            userId: localMatch.userId,
+            username: localMatch.username,
+            targetEmail: localMatch.email,
+            maskedEmail: localMatch.email,
+          }
+        : null);
+
+    if (!targetInfo?.targetEmail) {
+      setResetError('Enter your User ID or registered Gmail address and click "Send Reset Code" first.');
+      return;
+    }
+
     setResetLoading(true);
     setResetError('');
     setResetNotice('');
     try {
       const credential = await signInWithPopup(auth, googleProvider);
-      const email = (credential.user.email || '').toLowerCase();
-      if (!credential.user.emailVerified || email !== RECOVERY_EMAIL.toLowerCase()) {
+      const signedInEmail = (credential.user.email || '').toLowerCase();
+      if (!credential.user.emailVerified || signedInEmail !== targetInfo.targetEmail.toLowerCase()) {
         setResetError(
-          `Signed in as ${credential.user.email || 'unknown account'}. Please sign in with ${RECOVERY_EMAIL} to reset the password.`,
+          `Signed in as ${credential.user.email || 'unknown account'}. Please sign in with ${targetInfo.targetEmail} to reset "${targetInfo.username}".`,
         );
         return;
       }
       const idToken = await credential.user.getIdToken();
+      setResetTargetUser(targetInfo);
       setGoogleIdToken(idToken);
-      setResetNotice(`Verified ${RECOVERY_EMAIL}. Enter your new CRM password below.`);
-      setResetMode('verify_google');
+      setResetAuthMethod('google');
+      setResetNotice(`Verified ${targetInfo.targetEmail}. Enter your new CRM password below.`);
+      setResetMode('set_password');
     } catch (err) {
       setResetError(
         err instanceof Error ? err.message : 'Google Sign-In verification cancelled or failed.',
@@ -255,8 +489,9 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
   const handleConfirmResetPassword = async (e: FormEvent) => {
     e.preventDefault();
     setResetError('');
-    if (resetMode === 'verify_otp' && otpInput.trim().length !== 6) {
-      setResetError(`Please enter the 6-digit verification code sent to ${RECOVERY_EMAIL}.`);
+    const targetEmail = resetTargetUser?.targetEmail || 'your registered Gmail';
+    if (resetAuthMethod === 'otp' && !verifiedToken && otpInput.trim().length !== 6) {
+      setResetError(`Please enter the 6-digit verification code sent to ${targetEmail}.`);
       return;
     }
     if (newPassword.length < 6) {
@@ -270,32 +505,232 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
 
     setResetLoading(true);
     try {
+      const clientCredentialTokens = getAllStoredCredentialTokens();
       const res = await fetch('/api/auth/reset-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(
-          resetMode === 'verify_google'
-            ? { mode: 'google', firebaseIdToken: googleIdToken, newPassword }
-            : { mode: 'otp', otp: otpInput.trim(), otpToken, newPassword },
+          resetAuthMethod === 'google'
+            ? {
+                mode: 'google',
+                userId: resetTargetUser?.userId,
+                identifier: resetTargetUser?.username || resetIdentifier.trim(),
+                firebaseIdToken: googleIdToken,
+                newPassword,
+                clientCredentialTokens,
+              }
+            : {
+                mode: 'otp',
+                userId: resetTargetUser?.userId,
+                identifier: resetTargetUser?.username || resetIdentifier.trim(),
+                otp: otpInput.trim(),
+                otpToken,
+                verifiedToken,
+                newPassword,
+                clientCredentialTokens,
+              },
         ),
       });
-      const data = await safeParseJsonResponse<{ ok?: boolean; message?: string; error?: string }>(
-        res,
-      );
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        username?: string;
+        user?: CrmUserSession;
+        credentialToken?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
       if (!res.ok || !data?.ok) {
-        setResetError(data?.error || 'Could not reset password.');
+        setResetError(data?.error || parsed.errorMessage || 'Could not reset password.');
         return;
       }
-      setResetMode('none');
+
+      const finalUsername = data.username || resetTargetUser?.username || VALID_LOGIN_USERNAME;
+      // Persist updated credential cleanly without touching or clearing any local CRM data
+      saveResetPasswordCredential(finalUsername, newPassword, data.credentialToken, {
+        userId: data.user?.userId || resetTargetUser?.userId,
+        email: data.user?.email || resetTargetUser?.targetEmail,
+        role: data.user?.role,
+      });
+
+      setAuthView('login');
+      setResetMode('request');
+      setResetTargetUser(null);
+      setOtpInput('');
+      setOtpToken('');
+      setVerifiedToken('');
+      setGoogleIdToken('');
+      setNewPassword('');
+      setConfirmNewPassword('');
       setPassword('');
-      setUsername('VanshSales');
+      setUsername(finalUsername);
       setSuccessMsg(
-        data.message || 'Password updated successfully! Please log in with your new password.',
+        data.message ||
+          `Password updated successfully for ${finalUsername}! Please log in with your new password.`,
       );
     } catch {
       setResetError('Network error while saving new password.');
     } finally {
       setResetLoading(false);
+    }
+  };
+
+  const handleSendSignupOtp = async (e?: FormEvent) => {
+    if (e) e.preventDefault();
+    const cleanEmail = signupEmail.trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setSignupError('Please enter a valid Gmail address.');
+      return;
+    }
+
+    setSignupLoading(true);
+    setSignupError('');
+    setSignupNotice('');
+    try {
+      const res = await fetch('/api/auth/signup/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: cleanEmail,
+          clientCredentialTokens: getAllStoredCredentialTokens(),
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        otpToken?: string;
+        recipient?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (!res.ok || !data?.ok) {
+        setSignupError(
+          data?.error || parsed.errorMessage || `Could not send verification OTP to ${cleanEmail}.`,
+        );
+        return;
+      }
+      setSignupEmail(cleanEmail);
+      setSignupOtpToken(data.otpToken || '');
+      setSignupOtp('');
+      setSignupNotice(data.message || `6-digit verification OTP sent to ${cleanEmail}.`);
+      setSignupStep('verify_otp');
+    } catch {
+      setSignupError('Network error while sending Gmail verification OTP.');
+    } finally {
+      setSignupLoading(false);
+    }
+  };
+
+  const handleVerifySignupOtp = async (e: FormEvent) => {
+    e.preventDefault();
+    const cleanedOtp = signupOtp.trim();
+    if (!/^\d{6}$/.test(cleanedOtp)) {
+      setSignupError(`Please enter the 6-digit OTP sent to ${signupEmail}.`);
+      return;
+    }
+
+    setSignupLoading(true);
+    setSignupError('');
+    try {
+      const res = await fetch('/api/auth/signup/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: signupEmail,
+          otp: cleanedOtp,
+          otpToken: signupOtpToken,
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        verifiedToken?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (!res.ok || !data?.ok || !data.verifiedToken) {
+        setSignupError(
+          data?.error || parsed.errorMessage || 'Invalid 6-digit OTP. Please check your Gmail inbox.',
+        );
+        return;
+      }
+      setSignupVerifiedToken(data.verifiedToken);
+      setSignupNotice(
+        data.message || 'Gmail verified successfully! Choose your User ID and Password below.',
+      );
+      setSignupStep('credentials');
+    } catch {
+      setSignupError('Network error while verifying Gmail OTP.');
+    } finally {
+      setSignupLoading(false);
+    }
+  };
+
+  const handleCompleteSignup = async (e: FormEvent) => {
+    e.preventDefault();
+    const cleanUsername = signupUsername.trim();
+    if (!/^[a-zA-Z0-9_.-]{3,40}$/.test(cleanUsername)) {
+      setSignupError(
+        'User ID must be 3 to 40 characters and contain only letters, numbers, "_", ".", or "-".',
+      );
+      return;
+    }
+    if (signupPassword.length < 6) {
+      setSignupError('Password must be at least 6 characters.');
+      return;
+    }
+    if (signupPassword !== signupConfirmPassword) {
+      setSignupError('Password and Confirm Password do not match.');
+      return;
+    }
+
+    setSignupLoading(true);
+    setSignupError('');
+    try {
+      const res = await fetch('/api/auth/signup/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: signupEmail,
+          username: cleanUsername,
+          password: signupPassword,
+          verifiedToken: signupVerifiedToken,
+          clientCredentialTokens: getAllStoredCredentialTokens(),
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        user?: CrmUserSession;
+        credentialToken?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (!res.ok || !data?.ok || !data.user) {
+        setSignupError(data?.error || parsed.errorMessage || 'Could not create user account.');
+        return;
+      }
+
+      registerSecondaryUserAccount({
+        userId: data.user.userId,
+        username: data.user.username,
+        email: data.user.email,
+        password: signupPassword,
+        credentialToken: data.credentialToken,
+        createdAt: data.user.createdAt,
+      });
+
+      setCreatedUsernameLabel(data.user.username);
+      setSignupNotice(
+        data.message || 'Successful ID Creation! Returning to the Login screen...',
+      );
+      setSignupStep('success');
+    } catch (err) {
+      setSignupError(
+        err instanceof Error ? err.message : 'Network error while creating user account.',
+      );
+    } finally {
+      setSignupLoading(false);
     }
   };
 
@@ -610,14 +1045,14 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                 </p>
               </div>
 
-              {resetMode === 'none' ? (
+              {authView === 'login' ? (
                 <>
                   <div className="pt-5 pb-4 text-center">
                     <h2 className="font-display text-xl font-bold text-[#0B1E47]">
                       Login to Your Account
                     </h2>
                     <p className="text-xs text-slate-500 mt-1">
-                      Enter your credentials to continue
+                      Enter your User ID or Gmail credentials to continue
                     </p>
                   </div>
 
@@ -642,7 +1077,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
 
                     <div>
                       <label htmlFor="login-username" className="sr-only">
-                        Username / Email ID
+                        User ID / Email ID
                       </label>
                       <div className="relative">
                         <User
@@ -659,7 +1094,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                             setUsername(e.target.value);
                             if (errorMsg) setErrorMsg('');
                           }}
-                          placeholder="Username / Email ID"
+                          placeholder="User ID / Gmail ID"
                           className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8] focus:border-[#1665D8]"
                         />
                       </div>
@@ -734,37 +1169,348 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                   <div className="flex items-center gap-3 my-4">
                     <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
                     <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                      OR
+                      NEW TEAM MEMBER?
                     </span>
                     <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
                   </div>
 
-                  <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-[#F8FAFC] px-4 py-3">
+                  <button
+                    type="button"
+                    onClick={openCreateUserFlow}
+                    data-testid="open-create-user-btn"
+                    className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-blue-200 bg-blue-50/70 hover:bg-blue-100/80 text-[#0F49B8] text-xs sm:text-sm font-semibold transition-colors cursor-pointer"
+                  >
+                    <UserPlus className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>Create New User</span>
+                  </button>
+
+                  <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 bg-[#F8FAFC] px-4 py-3">
                     <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
                       <ShieldCheck className="h-4.5 w-4.5" aria-hidden="true" />
                     </div>
                     <div className="min-w-0">
                       <p className="text-xs font-bold text-slate-800">
-                        Secure &amp; Encrypted Access
+                        Isolated &amp; Encrypted Access
                       </p>
                       <p className="text-[11px] text-slate-500">
-                        Your data is safe with us · Cloud Ready
+                        Each user gets a private workspace · Gmail OTP verified
                       </p>
                     </div>
                   </div>
                 </>
-              ) : (
+              ) : authView === 'signup' ? (
                 <div className="pt-5 space-y-4">
                   <div className="flex items-center justify-between gap-2">
                     <button
                       type="button"
-                      onClick={() => setResetMode('none')}
+                      onClick={() => setAuthView('login')}
                       className="inline-flex items-center gap-1 text-xs font-medium text-[#1665D8] hover:underline cursor-pointer"
                     >
                       <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
                       <span>Back to Login</span>
                     </button>
-                    <span className="text-[11px] font-medium text-slate-400">Account: VanshSales</span>
+                    <span className="text-[11px] font-semibold text-blue-700">
+                      New Secondary User
+                    </span>
+                  </div>
+
+                  <div className="text-center">
+                    <h2 className="font-display text-lg font-bold text-[#0B1E47]">
+                      Create New CRM User
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {signupStep === 'email'
+                        ? 'Verify your Gmail address to create an isolated workspace'
+                        : signupStep === 'verify_otp'
+                          ? `Enter the 6-digit OTP sent to ${signupEmail}`
+                          : signupStep === 'credentials'
+                            ? `Verified: ${signupEmail}`
+                            : 'Your new CRM account is ready'}
+                    </p>
+                  </div>
+
+                  {signupError && (
+                    <div
+                      role="alert"
+                      className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs font-medium text-red-700"
+                    >
+                      {signupError}
+                    </div>
+                  )}
+
+                  {signupNotice && signupStep !== 'success' && (
+                    <div
+                      role="status"
+                      className="rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-xs font-medium text-blue-900"
+                    >
+                      {signupNotice}
+                    </div>
+                  )}
+
+                  {signupStep === 'email' && (
+                    <form onSubmit={handleSendSignupOtp} className="space-y-3.5">
+                      <div>
+                        <label
+                          htmlFor="signup-email"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          Your Gmail Address *
+                        </label>
+                        <div className="relative">
+                          <Mail
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="signup-email"
+                            type="email"
+                            required
+                            autoFocus
+                            value={signupEmail}
+                            onChange={(e) => {
+                              setSignupEmail(e.target.value);
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="yourname@gmail.com"
+                            className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          OTP will be emailed directly to this Gmail address only.
+                        </p>
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={signupLoading}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
+                      >
+                        <Mail className="h-4 w-4 shrink-0" aria-hidden="true" />
+                        <span>{signupLoading ? 'Sending OTP...' : 'Send Verification OTP'}</span>
+                      </button>
+                    </form>
+                  )}
+
+                  {signupStep === 'verify_otp' && (
+                    <form onSubmit={handleVerifySignupOtp} className="space-y-3.5">
+                      <div>
+                        <label
+                          htmlFor="signup-otp"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          6-Digit Gmail Verification OTP
+                        </label>
+                        <div className="relative">
+                          <KeyRound
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="signup-otp"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={6}
+                            required
+                            autoFocus
+                            value={signupOtp}
+                            onChange={(e) => {
+                              setSignupOtp(e.target.value.replace(/\D/g, '').slice(0, 6));
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="Enter 6-digit OTP"
+                            className="font-mono-num w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm tracking-widest text-slate-900 placeholder:tracking-normal focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={signupLoading}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
+                      >
+                        <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+                        <span>{signupLoading ? 'Verifying OTP...' : 'Verify OTP'}</span>
+                      </button>
+
+                      <div className="flex items-center justify-between text-xs pt-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSignupStep('email');
+                            setSignupError('');
+                            setSignupNotice('');
+                          }}
+                          className="text-slate-500 hover:text-slate-800 hover:underline cursor-pointer"
+                        >
+                          Change Gmail
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleSendSignupOtp()}
+                          disabled={signupLoading}
+                          className="font-medium text-[#1665D8] hover:underline cursor-pointer"
+                        >
+                          Resend OTP
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {signupStep === 'credentials' && (
+                    <form onSubmit={handleCompleteSignup} className="space-y-3.5">
+                      <div>
+                        <label
+                          htmlFor="signup-username"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          Create User ID *
+                        </label>
+                        <div className="relative">
+                          <User
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="signup-username"
+                            type="text"
+                            required
+                            autoFocus
+                            value={signupUsername}
+                            onChange={(e) => {
+                              setSignupUsername(e.target.value);
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="e.g. RohanOps or Priya.Sales"
+                            className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="signup-password"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          Create Password (min 6 characters) *
+                        </label>
+                        <div className="relative">
+                          <Lock
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="signup-password"
+                            type={showSignupPassword ? 'text' : 'password'}
+                            required
+                            minLength={6}
+                            value={signupPassword}
+                            onChange={(e) => {
+                              setSignupPassword(e.target.value);
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="Enter password"
+                            className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-10 py-2.5 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowSignupPassword((prev) => !prev)}
+                            aria-label={showSignupPassword ? 'Hide password' : 'Show password'}
+                            className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded text-slate-500 hover:text-slate-800"
+                          >
+                            {showSignupPassword ? (
+                              <EyeOff className="h-4 w-4" aria-hidden="true" />
+                            ) : (
+                              <Eye className="h-4 w-4" aria-hidden="true" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="signup-confirm-password"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          Confirm Password *
+                        </label>
+                        <div className="relative">
+                          <Lock
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="signup-confirm-password"
+                            type={showSignupPassword ? 'text' : 'password'}
+                            required
+                            minLength={6}
+                            value={signupConfirmPassword}
+                            onChange={(e) => {
+                              setSignupConfirmPassword(e.target.value);
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="Re-enter password"
+                            className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={signupLoading}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
+                      >
+                        <UserPlus className="h-4 w-4" aria-hidden="true" />
+                        <span>{signupLoading ? 'Creating Account...' : 'Create User ID'}</span>
+                      </button>
+                    </form>
+                  )}
+
+                  {signupStep === 'success' && (
+                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-center space-y-3">
+                      <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                        <CheckCircle2 className="h-6 w-6" aria-hidden="true" />
+                      </div>
+                      <div className="space-y-1">
+                        <p className="text-sm font-bold text-emerald-900">
+                          Successful ID Creation
+                        </p>
+                        <p className="text-xs text-emerald-800">
+                          User ID <span className="font-mono-num font-bold">{createdUsernameLabel}</span> linked to{' '}
+                          <span className="font-semibold">{signupEmail}</span>. Redirecting to Login...
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthView('login');
+                          setSignupStep('email');
+                          if (createdUsernameLabel) setUsername(createdUsernameLabel);
+                          setPassword('');
+                          setSuccessMsg(
+                            `Successful ID Creation! Log in with "${createdUsernameLabel}" and your new password.`,
+                          );
+                        }}
+                        className="w-full py-2 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold cursor-pointer"
+                      >
+                        Go to Login Screen Now
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="pt-5 space-y-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAuthView('login')}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#1665D8] hover:underline cursor-pointer"
+                    >
+                      <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>Back to Login</span>
+                    </button>
+                    <span className="text-[11px] font-medium text-slate-400">
+                      {resetTargetUser ? `Account: ${resetTargetUser.username}` : 'Account Recovery'}
+                    </span>
                   </div>
 
                   <div className="text-center">
@@ -772,8 +1518,16 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                       Reset CRM Password
                     </h2>
                     <p className="text-xs text-slate-500 mt-1">
-                      Verification mail target:{' '}
-                      <span className="font-semibold text-slate-700">{RECOVERY_EMAIL}</span>
+                      {resetTargetUser?.targetEmail ? (
+                        <>
+                          Verification mail target:{' '}
+                          <span className="font-semibold text-slate-700">
+                            {resetTargetUser.targetEmail}
+                          </span>
+                        </>
+                      ) : (
+                        'Enter your User ID or registered Gmail to send an OTP to your email'
+                      )}
                     </p>
                   </div>
 
@@ -801,6 +1555,47 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
 
                   {resetMode === 'request' && (
                     <div className="space-y-3">
+                      <div>
+                        <label
+                          htmlFor="reset-identifier"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          User ID or Registered Gmail ID *
+                        </label>
+                        <div className="relative">
+                          <User
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="reset-identifier"
+                            type="text"
+                            autoFocus
+                            value={resetIdentifier}
+                            onChange={(e) => {
+                              const nextVal = e.target.value;
+                              setResetIdentifier(nextVal);
+                              const local = nextVal.trim()
+                                ? findUserByIdentifier(nextVal.trim())
+                                : null;
+                              setResetTargetUser(
+                                local
+                                  ? {
+                                      userId: local.userId,
+                                      username: local.username,
+                                      targetEmail: local.email,
+                                      maskedEmail: local.email,
+                                    }
+                                  : null,
+                              );
+                              if (resetError) setResetError('');
+                            }}
+                            placeholder="Enter User ID or Gmail (e.g. VanshSales or your@gmail.com)"
+                            className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                      </div>
+
                       <button
                         type="button"
                         onClick={() => void handleSendResetEmail()}
@@ -810,61 +1605,95 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                         <Mail className="h-4 w-4 shrink-0" aria-hidden="true" />
                         <span>
                           {resetLoading
-                            ? 'Sending Reset Email...'
-                            : `Send Reset Code to ${RECOVERY_EMAIL}`}
+                            ? 'Sending Reset Code...'
+                            : resetTargetUser?.targetEmail
+                              ? `Send Reset Code to ${resetTargetUser.targetEmail}`
+                              : 'Send Reset Code'}
                         </span>
                       </button>
 
-                      <div className="flex items-center gap-3">
-                        <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
-                        <span className="text-[11px] font-semibold text-slate-400 uppercase">
-                          OR VERIFY INSTANTLY
-                        </span>
-                        <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
-                      </div>
+                      {resetTargetUser?.targetEmail && (
+                        <>
+                          <div className="flex items-center gap-3">
+                            <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
+                            <span className="text-[11px] font-semibold text-slate-400 uppercase">
+                              OR VERIFY INSTANTLY
+                            </span>
+                            <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
+                          </div>
 
-                      <button
-                        type="button"
-                        onClick={() => void handleVerifyGoogleForReset()}
-                        disabled={resetLoading}
-                        className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 disabled:opacity-60 text-slate-800 text-xs font-semibold cursor-pointer"
-                      >
-                        <ShieldCheck className="h-4 w-4 text-emerald-600 shrink-0" aria-hidden="true" />
-                        <span>Verify with Google ({RECOVERY_EMAIL})</span>
-                      </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleVerifyGoogleForReset()}
+                            disabled={resetLoading}
+                            className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 disabled:opacity-60 text-slate-800 text-xs font-semibold cursor-pointer"
+                          >
+                            <ShieldCheck
+                              className="h-4 w-4 text-emerald-600 shrink-0"
+                              aria-hidden="true"
+                            />
+                            <span>Verify with Google ({resetTargetUser.targetEmail})</span>
+                          </button>
+                        </>
+                      )}
                     </div>
                   )}
 
-                  {(resetMode === 'verify_otp' || resetMode === 'verify_google') && (
-                    <form onSubmit={handleConfirmResetPassword} className="space-y-3.5">
-                      {resetMode === 'verify_otp' && (
-                        <div>
-                          <label
-                            htmlFor="reset-otp"
-                            className="block text-xs font-medium text-slate-700 mb-1"
-                          >
-                            6-Digit Verification Code (Check {RECOVERY_EMAIL})
-                          </label>
-                          <div className="relative">
-                            <KeyRound
-                              className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
-                              aria-hidden="true"
-                            />
-                            <input
-                              id="reset-otp"
-                              type="text"
-                              inputMode="numeric"
-                              maxLength={6}
-                              required
-                              value={otpInput}
-                              onChange={(e) => setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                              placeholder="Enter 6-digit code"
-                              className="font-mono-num w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm tracking-widest text-slate-900 placeholder:tracking-normal focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
-                            />
-                          </div>
+                  {resetMode === 'verify_otp' && (
+                    <form onSubmit={handleVerifyResetCode} className="space-y-3.5">
+                      <div>
+                        <label
+                          htmlFor="reset-otp"
+                          className="block text-xs font-medium text-slate-700 mb-1"
+                        >
+                          6-Digit Verification Code (Check{' '}
+                          {resetTargetUser?.targetEmail || 'your Gmail'})
+                        </label>
+                        <div className="relative">
+                          <KeyRound
+                            className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3.5 top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                          <input
+                            id="reset-otp"
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={6}
+                            required
+                            autoFocus
+                            value={otpInput}
+                            onChange={(e) => {
+                              setOtpInput(e.target.value.replace(/\D/g, '').slice(0, 6));
+                              if (resetError) setResetError('');
+                            }}
+                            placeholder="Enter 6-digit code"
+                            className="font-mono-num w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm tracking-widest text-slate-900 placeholder:tracking-normal focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
                         </div>
-                      )}
+                      </div>
 
+                      <button
+                        type="submit"
+                        disabled={resetLoading}
+                        className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
+                      >
+                        <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+                        <span>{resetLoading ? 'Verifying Code...' : 'Verify Code'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => void handleSendResetEmail()}
+                        disabled={resetLoading}
+                        className="w-full text-center text-xs font-medium text-[#1665D8] hover:underline cursor-pointer"
+                      >
+                        Resend Verification Code to {resetTargetUser?.targetEmail || 'your Gmail'}
+                      </button>
+                    </form>
+                  )}
+
+                  {resetMode === 'set_password' && (
+                    <form onSubmit={handleConfirmResetPassword} className="space-y-3.5">
                       <div>
                         <label
                           htmlFor="reset-new-password"
@@ -882,6 +1711,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                             type={showNewPassword ? 'text' : 'password'}
                             required
                             minLength={6}
+                            autoFocus
                             value={newPassword}
                             onChange={(e) => setNewPassword(e.target.value)}
                             placeholder="Enter new password"
@@ -907,7 +1737,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                           htmlFor="reset-confirm-password"
                           className="block text-xs font-medium text-slate-700 mb-1"
                         >
-                          Confirm New Password
+                          Confirm Password
                         </label>
                         <div className="relative">
                           <Lock
@@ -933,19 +1763,8 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
                         className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
                       >
                         <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-                        <span>{resetLoading ? 'Saving Password...' : 'Save New Password'}</span>
+                        <span>{resetLoading ? 'Saving Password...' : 'Save Password'}</span>
                       </button>
-
-                      {resetMode === 'verify_otp' && (
-                        <button
-                          type="button"
-                          onClick={() => void handleSendResetEmail()}
-                          disabled={resetLoading}
-                          className="w-full text-center text-xs font-medium text-[#1665D8] hover:underline cursor-pointer"
-                        >
-                          Resend Verification Code to {RECOVERY_EMAIL}
-                        </button>
-                      )}
                     </form>
                   )}
                 </div>

@@ -255,7 +255,7 @@ export function computeEmdBgSummary(
 
 /**
  * Smart Notification Bell computation:
- * 1. Tenders with submission deadlines within next 48 hours (and not already submitted/closed)
+ * 1. Tenders with submission deadlines within next 5 days / 120 hours (and not already submitted/closed)
  * 2. Bank Guarantees (BG) or FDRs expiring within next 30 days (including expired but still Active/Extension Requested)
  * 3. EMDs pending refund for > 60 days after tender completion
  */
@@ -273,14 +273,26 @@ export function computeNotifications(
       t.stage === 'Doc Preparation'
     ) {
       const hours = getHoursRemaining(t.submissionDueDate, referenceNow);
-      if (hours >= 0 && hours <= 48) {
-        const hrsRounded = Math.max(1, Math.round(hours));
+      if (hours >= 0 && hours <= 120) {
+        let timeLabel: string;
+        if (hours <= 24) {
+          const hrsRounded = Math.max(1, Math.round(hours));
+          timeLabel = `${hrsRounded}h`;
+        } else {
+          let days = Math.floor(hours / 24);
+          let remHrs = Math.round(hours % 24);
+          if (remHrs >= 24) {
+            days += 1;
+            remHrs = 0;
+          }
+          timeLabel = remHrs > 0 ? `${days}d ${remHrs}h` : `${days}d`;
+        }
         items.push({
           id: `due-${t.id}`,
-          category: 'deadline_48h',
-          title: `Due in ${hrsRounded}h: ${t.tenderId}`,
+          category: 'deadline_5d',
+          title: `Due in ${timeLabel}: ${t.tenderId}`,
           subtitle: `${t.department} · ${t.title}`,
-          daysOrHoursLabel: hrsRounded <= 24 ? `${hrsRounded}h left` : `${Math.ceil(hrsRounded / 24)}d left`,
+          daysOrHoursLabel: `${timeLabel} left`,
           targetTab: 'tenders',
           targetId: t.id,
         });

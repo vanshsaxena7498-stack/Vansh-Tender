@@ -8,26 +8,27 @@ import {
   CloudCheck,
   FileSpreadsheet,
   LogOut,
+  Mail,
   Menu,
-  MessageCircle,
   Moon,
   RefreshCw,
   Sun,
 } from 'lucide-react';
 import type {
+  CrmUserSession,
+  EmailAlertLog,
+  EmailAlertSettings,
   FirmProfile,
   NotificationItem,
   SheetSyncStatus,
   TabKey,
   Tender,
-  WhatsAppAlertLog,
-  WhatsAppSettings,
 } from '../types/crm';
 import {
-  buildTenderWhatsAppMessage,
-  buildWhatsAppWebUrl,
-  DEFAULT_WHATSAPP_SETTINGS,
-} from '../utils/whatsappAlerts';
+  buildEmailSlotKey,
+  DEFAULT_EMAIL_ALERT_SETTINGS,
+  getIstDateTimeParts,
+} from '../utils/emailAlerts';
 
 export interface CloudUserSummary {
   uid: string;
@@ -54,8 +55,10 @@ interface HeaderProps {
   sheetSyncError?: string | null;
   onOpenSheetSettings?: () => void;
   tenders?: Tender[];
-  whatsappSettings?: WhatsAppSettings;
-  whatsappLogs?: WhatsAppAlertLog[];
+  emailSettings?: EmailAlertSettings;
+  emailLogs?: EmailAlertLog[];
+  onSendReminderEmailNow?: (tender: Tender) => void;
+  currentUser?: CrmUserSession | null;
 }
 
 const TAB_TITLES: Record<TabKey, string> = {
@@ -85,8 +88,10 @@ export function Header({
   sheetSyncError = null,
   onOpenSheetSettings,
   tenders = [],
-  whatsappSettings = DEFAULT_WHATSAPP_SETTINGS,
-  whatsappLogs = [],
+  emailSettings = DEFAULT_EMAIL_ALERT_SETTINGS,
+  emailLogs = [],
+  onSendReminderEmailNow,
+  currentUser,
 }: HeaderProps) {
   const [notifOpen, setNotifOpen] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -116,10 +121,12 @@ export function Header({
         </button>
         <div className="min-w-0">
           <h1 className="font-display text-base sm:text-lg font-semibold text-slate-900 dark:text-white truncate">
-            {TAB_TITLES[activeTab]}
+            {activeTab === 'settings' && currentUser?.role === 'secondary'
+              ? 'Workspace Settings & Backups'
+              : TAB_TITLES[activeTab]}
           </h1>
           <p className="hidden sm:block text-xs text-slate-500 dark:text-slate-400 truncate">
-            {firmProfile.firmName} · {firmProfile.adminName}
+            {firmProfile.firmName} · {firmProfile.adminName || currentUser?.username || 'Tender Desk'}
           </p>
         </div>
       </div>
@@ -269,7 +276,7 @@ export function Header({
                   Compliance & Deadline Alerts ({notifications.length})
                 </span>
                 <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                  48h Due · 30d BG · 60d EMD
+                  5d Due · 30d BG · 60d EMD
                 </span>
               </div>
 
@@ -281,24 +288,27 @@ export function Header({
                 <ul className="max-h-80 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
                   {notifications.map((item) => {
                     const linkedTender =
-                      item.category === 'deadline_48h'
+                      item.category === 'deadline_5d'
                         ? tenders.find((t) => t.id === item.targetId)
                         : undefined;
-                    const tenderWaLogs = linkedTender
-                      ? whatsappLogs.filter((l) => l.tenderRefId === linkedTender.id)
+                    const istDateKey = getIstDateTimeParts().dateKey;
+                    const tenderEmailLogs = linkedTender
+                      ? emailLogs.filter((l) => l.tenderRefId === linkedTender.id)
                       : [];
-                    const has4h = tenderWaLogs.some((l) => l.milestone === 'urgent_4h');
-                    const has48h = tenderWaLogs.some((l) => l.milestone === 'alert_48h');
-                    const waUrl = linkedTender
-                      ? buildWhatsAppWebUrl(
-                          whatsappSettings.recipientPhone,
-                          buildTenderWhatsAppMessage(
-                            linkedTender,
-                            has4h ? 'urgent_4h' : 'alert_48h',
-                            whatsappSettings.recipientName,
-                          ),
+                    const sent11am = linkedTender
+                      ? tenderEmailLogs.some(
+                          (l) =>
+                            l.slotKey === buildEmailSlotKey(linkedTender, istDateKey, 'slot_11am') &&
+                            l.status === 'sent',
                         )
-                      : null;
+                      : false;
+                    const sent4pm = linkedTender
+                      ? tenderEmailLogs.some(
+                          (l) =>
+                            l.slotKey === buildEmailSlotKey(linkedTender, istDateKey, 'slot_4pm') &&
+                            l.status === 'sent',
+                        )
+                      : false;
 
                     return (
                       <li key={item.id} className="px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/70 transition-colors">
@@ -311,7 +321,7 @@ export function Header({
                           className="w-full text-left flex items-start justify-between gap-3"
                         >
                           <div className="flex items-start gap-2.5 min-w-0">
-                            {item.category === 'deadline_48h' ? (
+                            {item.category === 'deadline_5d' ? (
                               <Clock className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
                             ) : (
                               <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
@@ -327,7 +337,7 @@ export function Header({
                           </div>
                           <span
                             className={`font-mono-num text-[11px] font-medium whitespace-nowrap shrink-0 ${
-                              item.category === 'deadline_48h'
+                              item.category === 'deadline_5d'
                                 ? 'text-amber-700 dark:text-amber-400'
                                 : 'text-red-600 dark:text-red-400'
                             }`}
@@ -336,24 +346,25 @@ export function Header({
                           </span>
                         </button>
 
-                        {linkedTender && waUrl && (
+                        {linkedTender && (
                           <div className="mt-2 pl-6 flex flex-wrap items-center justify-between gap-2">
-                            <span className="text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
-                              {has4h
-                                ? 'WhatsApp 2/2 (4h Urgent Triggered)'
-                                : has48h
-                                  ? 'WhatsApp 1/2 (48h Alert Triggered)'
-                                  : 'WhatsApp Alert Ready'}
+                            <span className="text-[10px] font-medium text-blue-700 dark:text-blue-400">
+                              {!emailSettings.enabled
+                                ? 'Daily Email Reminders Paused'
+                                : `Daily Email: 11 AM ${sent11am ? 'Sent' : 'Scheduled'} · 4 PM ${sent4pm ? 'Sent' : 'Scheduled'}`}
                             </span>
-                            <a
-                              href={waUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 rounded-md border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60"
-                            >
-                              <MessageCircle className="h-3 w-3" aria-hidden="true" />
-                              <span>WhatsApp {whatsappSettings.recipientName}</span>
-                            </a>
+                            {onSendReminderEmailNow && (
+                              <button
+                                type="button"
+                                onClick={() => onSendReminderEmailNow(linkedTender)}
+                                className="inline-flex items-center gap-1 rounded-md border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/50 px-2 py-0.5 text-[10px] font-semibold text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/60 cursor-pointer"
+                              >
+                                <Mail className="h-3 w-3" aria-hidden="true" />
+                                <span>
+                                  Email {emailSettings.recipientName || currentUser?.username || 'Recipient'}
+                                </span>
+                              </button>
+                            )}
                           </div>
                         )}
                       </li>

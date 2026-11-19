@@ -31,6 +31,10 @@ import {
 import { auth, firebaseConfig, googleProvider } from './lib/firebase';
 import type {
   CrmBackupPayload,
+  CrmUserSession,
+  EmailAlertLog,
+  EmailAlertSettings,
+  EmailReminderSlot,
   EmdBgRecord,
   FirmProfile,
   GoogleSheetSettings,
@@ -38,16 +42,24 @@ import type {
   MafLineItem,
   MafTrackerRecord,
   NotificationItem,
+  SecondaryUserSummary,
   SheetSyncAction,
   SheetSyncEntityType,
   SheetSyncStatus,
   TabKey,
   Tender,
   UserPreferences,
-  WhatsAppAlertLog,
-  WhatsAppMilestone,
-  WhatsAppSettings,
 } from './types/crm';
+import {
+  ADMIN_RECOVERY_EMAIL,
+  ADMIN_USER_ID,
+  buildEmptySecondaryWorkspace,
+  listSecondaryUsers,
+  loadSecondaryWorkspaceSnapshot,
+  recordUserLoginActivity,
+  saveSecondaryWorkspaceSnapshot,
+  type SecondaryWorkspaceSnapshot,
+} from './utils/authCredentials';
 import { computeNotifications } from './utils/calculations';
 import {
   backupAllToCloud,
@@ -57,16 +69,18 @@ import {
   deleteTenderFromCloud,
   ensureUserRootDocument,
   fetchAllFromCloud,
+  fetchSecondaryUsersFromCloud,
   replaceCloudDataset,
   subscribeToUserCloudData,
+  syncEmailAlertLogToCloud,
+  syncEmailConfigToCloud,
   syncEmdRecordToCloud,
   syncMafTrackerToCloud,
   syncPreferencesToCloud,
   syncProfileToCloud,
+  syncSecondaryUserToCloud,
   syncSheetConfigToCloud,
   syncTenderToCloud,
-  syncWhatsAppAlertLogToCloud,
-  syncWhatsAppConfigToCloud,
   uploadMafDocumentFile,
 } from './utils/cloudSync';
 import {
@@ -76,10 +90,20 @@ import {
   mergeCloudTendersWithFiles,
 } from './utils/cloudSyncHelpers';
 import {
+  buildTenderEmailMessage,
+  computePendingEmailAlerts,
+  DEFAULT_EMAIL_ALERT_SETTINGS,
+  formatSlotLabel,
+  recordEmailDispatchFailure,
+  shouldAttemptEmailDispatch,
+  type EmailRetryRecord,
+} from './utils/emailAlerts';
+import {
   buildSheetSyncPayload,
   DEFAULT_GOOGLE_SHEET_SETTINGS,
   isValidAppsScriptWebhookUrl,
 } from './utils/googleSheetSync';
+import { safeReadJsonResponse } from './utils/httpHelpers';
 import {
   buildTenderAttachmentExtractionSignature,
   findTenderAttachmentSlot,
@@ -87,13 +111,6 @@ import {
   type ExtractedSpecItem,
 } from './utils/mafAutoGenerate';
 import { findMatchingDailyTender } from './utils/mafCalculations';
-import {
-  buildTenderWhatsAppMessage,
-  buildWhatsAppMilestoneKey,
-  computePendingWhatsAppAlerts,
-  DEFAULT_WHATSAPP_SETTINGS,
-  normalizeIndianWhatsAppPhone,
-} from './utils/whatsappAlerts';
 import { estimateCloudStorageUsage } from './utils/storageUsage';
 
 interface ToastNotice {
@@ -161,11 +178,11 @@ export default function App() {
   const [firmProfile, setFirmProfile] = useState<FirmProfile>(DEFAULT_FIRM_PROFILE);
   const [adminPin, setAdminPin] = useState<string>('1234');
   const [darkMode, setDarkMode] = useState<boolean>(false);
-  const [whatsappSettings, setWhatsappSettings] = useState<WhatsAppSettings>(
-    DEFAULT_WHATSAPP_SETTINGS,
+  const [emailSettings, setEmailSettings] = useState<EmailAlertSettings>(
+    DEFAULT_EMAIL_ALERT_SETTINGS,
   );
-  const [whatsappLogs, setWhatsappLogs] = useState<WhatsAppAlertLog[]>([]);
-  const [whatsappGatewayInfo, setWhatsappGatewayInfo] = useState<{
+  const [emailLogs, setEmailLogs] = useState<EmailAlertLog[]>([]);
+  const [emailGatewayInfo, setEmailGatewayInfo] = useState<{
     automatedConfigured: boolean;
     provider: string;
   }>({ automatedConfigured: false, provider: 'none' });
@@ -177,7 +194,12 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CrmUserSession | null>(null);
+  const [adminSessionToken, setAdminSessionToken] = useState('');
+  const [secondaryUsers, setSecondaryUsers] = useState<SecondaryUserSummary[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  const workspaceTenantId = currentUser?.role === 'secondary' ? currentUser.userId : null;
 
   // Firebase Firestore State
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
@@ -205,10 +227,15 @@ export default function App() {
     item: MafLineItem | null;
   } | null>(null);
 
-  // In-memory refs for async Firestore listeners and attachment payloads
+  // In-memory refs for async Firestore listeners, admin offline snapshot, and attachment payloads
   const attachmentFilesRef = useRef<Map<string, string>>(new Map());
-  const dispatchedWaKeysRef = useRef<Set<string>>(new Set());
+  const dispatchedEmailKeysRef = useRef<Set<string>>(new Set());
+  const emailRetryStateRef = useRef<Map<string, EmailRetryRecord>>(new Map());
   const mafExtractionSignatureRef = useRef<Map<string, string>>(new Map());
+  const adminOfflineSnapshotRef = useRef<SecondaryWorkspaceSnapshot | null>(null);
+  const activeRoleRef = useRef<'admin' | 'secondary' | null>(null);
+  const activeCrmUserIdRef = useRef<string | null>(null);
+
   const stateRef = useRef({
     tenders,
     emdRecords,
@@ -216,9 +243,12 @@ export default function App() {
     firmProfile,
     adminPin,
     darkMode,
-    whatsappSettings,
+    emailSettings,
+    emailLogs,
     sheetSettings,
     firebaseUser,
+    currentUser,
+    workspaceTenantId,
   });
   useEffect(() => {
     stateRef.current = {
@@ -228,9 +258,12 @@ export default function App() {
       firmProfile,
       adminPin,
       darkMode,
-      whatsappSettings,
+      emailSettings,
+      emailLogs,
       sheetSettings,
       firebaseUser,
+      currentUser,
+      workspaceTenantId,
     };
   }, [
     tenders,
@@ -239,22 +272,27 @@ export default function App() {
     firmProfile,
     adminPin,
     darkMode,
-    whatsappSettings,
+    emailSettings,
+    emailLogs,
     sheetSettings,
     firebaseUser,
+    currentUser,
+    workspaceTenantId,
   ]);
 
-  const mergeWhatsappLogs = (
-    incoming: WhatsAppAlertLog[],
-    existing: WhatsAppAlertLog[],
-  ): WhatsAppAlertLog[] => {
-    const byKey = new Map<string, WhatsAppAlertLog>();
+  const mergeEmailLogs = (
+    incoming: EmailAlertLog[],
+    existing: EmailAlertLog[],
+  ): EmailAlertLog[] => {
+    const byKey = new Map<string, EmailAlertLog>();
     for (const item of [...incoming, ...existing]) {
-      if (item.milestone !== 'test' && item.milestoneKey) {
-        dispatchedWaKeysRef.current.add(item.milestoneKey);
+      if (item.slot !== 'test' && item.slot !== 'manual' && item.slotKey && item.status === 'sent') {
+        dispatchedEmailKeysRef.current.add(item.slotKey);
       }
       const dedupeKey =
-        item.milestone === 'test' ? `id:${item.id}` : `mk:${item.milestoneKey || item.id}`;
+        item.slot === 'test' || item.slot === 'manual'
+          ? `id:${item.id}`
+          : `sk:${item.slotKey || item.id}`;
       if (!byKey.has(dedupeKey)) {
         byKey.set(dedupeKey, item);
       }
@@ -301,20 +339,78 @@ export default function App() {
     return () => unsub();
   }, []);
 
+  // Persist isolated secondary user workspace offline without affecting Admin or clearing localStorage
+  useEffect(() => {
+    if (!isAuthenticated || currentUser?.role !== 'secondary') return;
+    saveSecondaryWorkspaceSnapshot(currentUser.userId, {
+      firmProfile,
+      preferences: { adminPin, darkMode },
+      tenders,
+      emdRecords,
+      mafTrackers,
+      emailSettings,
+      emailLogs,
+      sheetSettings,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [
+    isAuthenticated,
+    currentUser?.userId,
+    currentUser?.role,
+    firmProfile,
+    adminPin,
+    darkMode,
+    tenders,
+    emdRecords,
+    mafTrackers,
+    emailSettings,
+    emailLogs,
+    sheetSettings,
+  ]);
+
   // Initial Firestore load/seed + real-time Firestore subscription when authenticated
   useEffect(() => {
-    if (!authReady || !firebaseUser) return;
+    if (!isAuthenticated || !currentUser || !authReady || !firebaseUser) return;
 
+    const activeTenantId = currentUser.role === 'secondary' ? currentUser.userId : null;
     let cancelled = false;
     let unsubCloud: (() => void) | null = null;
 
     const initializeFirestoreSession = async () => {
+      // Strictly forbid Secondary users from accidentally syncing into the Primary Admin Google account
+      if (
+        currentUser.role === 'secondary' &&
+        (firebaseUser.email || '').trim().toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()
+      ) {
+        await signOut(auth).catch(() => {});
+        clearCloudSessionCache();
+        if (!cancelled) {
+          setCloudFeedback({
+            type: 'err',
+            msg: 'Admin Google account cannot be linked to a secondary user workspace. Please sign in with your own Google account.',
+          });
+        }
+        return;
+      }
+
       setCloudSyncing(true);
       try {
-        await ensureUserRootDocument(firebaseUser);
+        await ensureUserRootDocument(firebaseUser, activeTenantId, currentUser);
         if (cancelled) return;
 
-        const cloud = await fetchAllFromCloud(firebaseUser.uid);
+        if (currentUser.role === 'secondary') {
+          void syncSecondaryUserToCloud(firebaseUser, {
+            userId: currentUser.userId,
+            username: currentUser.username,
+            email: currentUser.email,
+            role: 'secondary',
+            createdAt: currentUser.createdAt || new Date().toISOString(),
+            lastLoginAt: currentUser.lastLoginAt,
+            isActive: true,
+          });
+        }
+
+        const cloud = await fetchAllFromCloud(firebaseUser.uid, activeTenantId);
         if (cancelled) return;
 
         attachmentFilesRef.current = cloud.attachmentFiles;
@@ -334,18 +430,26 @@ export default function App() {
             mafTrackers: curMaf,
             adminPin: curPin,
             darkMode: curDark,
-            whatsappSettings: curWaSettings,
+            emailSettings: curEmailSettings,
             sheetSettings: curSheetSettings,
           } = stateRef.current;
           const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
-          await backupAllToCloud(firebaseUser, curProfile, prefs, curTenders, curEmd, curMaf);
-          await syncWhatsAppConfigToCloud(firebaseUser, curWaSettings);
-          await syncSheetConfigToCloud(firebaseUser, curSheetSettings);
+          await backupAllToCloud(
+            firebaseUser,
+            curProfile,
+            prefs,
+            curTenders,
+            curEmd,
+            curMaf,
+            activeTenantId,
+          );
+          await syncEmailConfigToCloud(firebaseUser, curEmailSettings, activeTenantId);
+          await syncSheetConfigToCloud(firebaseUser, curSheetSettings, activeTenantId);
           if (!cancelled) {
             markSyncedNow();
             setCloudFeedback({
               type: 'ok',
-              msg: `Connected as ${firebaseUser.email}. All data is now stored exclusively in Firebase Firestore.`,
+              msg: `Connected as ${firebaseUser.email}. All data is stored in your isolated Firebase Firestore workspace.`,
             });
           }
         } else {
@@ -356,8 +460,8 @@ export default function App() {
             setAdminPin(cloud.preferences.adminPin);
             setDarkMode(cloud.preferences.darkMode);
           }
-          if (cloud.whatsappConfig) {
-            setWhatsappSettings(cloud.whatsappConfig);
+          if (cloud.emailConfig) {
+            setEmailSettings(cloud.emailConfig);
           }
           if (cloud.sheetConfig) {
             setSheetSettings(cloud.sheetConfig);
@@ -369,8 +473,8 @@ export default function App() {
                 : 'unconfigured',
             );
           }
-          if (cloud.whatsappAlerts.length > 0) {
-            setWhatsappLogs((prev) => mergeWhatsappLogs(cloud.whatsappAlerts, prev));
+          if (cloud.emailAlerts.length > 0) {
+            setEmailLogs((prev) => mergeEmailLogs(cloud.emailAlerts, prev));
           }
           setTenders((prev) =>
             mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
@@ -389,62 +493,66 @@ export default function App() {
 
         if (cancelled) return;
 
-        unsubCloud = subscribeToUserCloudData(firebaseUser.uid, {
-          onProfile: (remoteProfile) => {
-            setFirmProfile((prev) => mergeCloudProfileWithLocal(remoteProfile, prev));
-            markSyncedNow();
+        unsubCloud = subscribeToUserCloudData(
+          firebaseUser.uid,
+          {
+            onProfile: (remoteProfile) => {
+              setFirmProfile((prev) => mergeCloudProfileWithLocal(remoteProfile, prev));
+              markSyncedNow();
+            },
+            onPreferences: (remotePrefs) => {
+              setAdminPin(remotePrefs.adminPin);
+              setDarkMode(remotePrefs.darkMode);
+              markSyncedNow();
+            },
+            onEmailConfig: (remoteConfig) => {
+              setEmailSettings(remoteConfig);
+              markSyncedNow();
+            },
+            onSheetConfig: (remoteSheetConfig) => {
+              setSheetSettings(remoteSheetConfig);
+              setSheetSyncStatus((prev) => {
+                if (prev === 'syncing') return prev;
+                if (!remoteSheetConfig.webhookUrl) return 'unconfigured';
+                return remoteSheetConfig.lastSyncedAt ? 'synced' : 'idle';
+              });
+              markSyncedNow();
+            },
+            onEmailAlerts: (remoteLogs) => {
+              setEmailLogs((prev) => mergeEmailLogs(remoteLogs, prev));
+              markSyncedNow();
+            },
+            onTenders: (remoteTenders) => {
+              setTenders((prev) =>
+                mergeCloudTendersWithFiles(remoteTenders, attachmentFilesRef.current, prev),
+              );
+              markSyncedNow();
+            },
+            onEmdRecords: (remoteEmd) => {
+              setEmdRecords((prev) =>
+                mergeCloudEmdWithFiles(remoteEmd, attachmentFilesRef.current, prev),
+              );
+              markSyncedNow();
+            },
+            onMafTrackers: (remoteMaf) => {
+              setMafTrackers((prev) =>
+                mergeCloudMafTrackersWithFiles(remoteMaf, attachmentFilesRef.current, prev),
+              );
+              markSyncedNow();
+            },
+            onAttachmentFiles: (remoteFiles) => {
+              attachmentFilesRef.current = remoteFiles;
+              setTenders((prev) => mergeCloudTendersWithFiles(prev, remoteFiles, prev));
+              setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, remoteFiles, prev));
+              setMafTrackers((prev) => mergeCloudMafTrackersWithFiles(prev, remoteFiles, prev));
+              markSyncedNow();
+            },
+            onError: (err) => {
+              setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
+            },
           },
-          onPreferences: (remotePrefs) => {
-            setAdminPin(remotePrefs.adminPin);
-            setDarkMode(remotePrefs.darkMode);
-            markSyncedNow();
-          },
-          onWhatsAppConfig: (remoteConfig) => {
-            setWhatsappSettings(remoteConfig);
-            markSyncedNow();
-          },
-          onSheetConfig: (remoteSheetConfig) => {
-            setSheetSettings(remoteSheetConfig);
-            setSheetSyncStatus((prev) => {
-              if (prev === 'syncing') return prev;
-              if (!remoteSheetConfig.webhookUrl) return 'unconfigured';
-              return remoteSheetConfig.lastSyncedAt ? 'synced' : 'idle';
-            });
-            markSyncedNow();
-          },
-          onWhatsAppAlerts: (remoteLogs) => {
-            setWhatsappLogs((prev) => mergeWhatsappLogs(remoteLogs, prev));
-            markSyncedNow();
-          },
-          onTenders: (remoteTenders) => {
-            setTenders((prev) =>
-              mergeCloudTendersWithFiles(remoteTenders, attachmentFilesRef.current, prev),
-            );
-            markSyncedNow();
-          },
-          onEmdRecords: (remoteEmd) => {
-            setEmdRecords((prev) =>
-              mergeCloudEmdWithFiles(remoteEmd, attachmentFilesRef.current, prev),
-            );
-            markSyncedNow();
-          },
-          onMafTrackers: (remoteMaf) => {
-            setMafTrackers((prev) =>
-              mergeCloudMafTrackersWithFiles(remoteMaf, attachmentFilesRef.current, prev),
-            );
-            markSyncedNow();
-          },
-          onAttachmentFiles: (remoteFiles) => {
-            attachmentFilesRef.current = remoteFiles;
-            setTenders((prev) => mergeCloudTendersWithFiles(prev, remoteFiles, prev));
-            setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, remoteFiles, prev));
-            setMafTrackers((prev) => mergeCloudMafTrackersWithFiles(prev, remoteFiles, prev));
-            markSyncedNow();
-          },
-          onError: (err) => {
-            setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
-          },
-        });
+          activeTenantId,
+        );
       } catch (err) {
         if (!cancelled) {
           setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
@@ -462,7 +570,7 @@ export default function App() {
       cancelled = true;
       if (unsubCloud) unsubCloud();
     };
-  }, [authReady, firebaseUser]);
+  }, [authReady, firebaseUser, isAuthenticated, currentUser?.userId, currentUser?.role]);
 
   const runCloudTask = async (task: (user: User) => Promise<void>, successMessage?: string) => {
     if (!firebaseUser) return;
@@ -518,18 +626,21 @@ export default function App() {
       mafTrackers: curMaf,
       adminPin: curPin,
       darkMode: curDark,
+      workspaceTenantId: tenantId,
     } = stateRef.current;
     const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
     void runCloudTask(
-      (user) => replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf),
+      (user) => replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId),
       `Synced ${curTenders.length} tenders, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
     );
   };
 
   const handleRestoreFromCloud = () => {
+    const tenantId = stateRef.current.workspaceTenantId;
+    const userSession = stateRef.current.currentUser;
     void runCloudTask(async (user) => {
-      await ensureUserRootDocument(user);
-      const cloud = await fetchAllFromCloud(user.uid);
+      await ensureUserRootDocument(user, tenantId, userSession);
+      const cloud = await fetchAllFromCloud(user.uid, tenantId);
       attachmentFilesRef.current = cloud.attachmentFiles;
       if (cloud.profile) {
         setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
@@ -559,142 +670,248 @@ export default function App() {
       }
     : null;
 
-  const dispatchWhatsAppMilestone = async (
-    tender: Tender,
-    milestone: WhatsAppMilestone | 'test',
-    explicitMilestoneKey?: string,
-  ): Promise<void> => {
-    const { whatsappSettings: curSettings, firebaseUser: curUser } = stateRef.current;
-    const milestoneKey =
-      explicitMilestoneKey ||
-      (milestone === 'test'
-        ? `wa_test_${Date.now()}`
-        : buildWhatsAppMilestoneKey(tender, milestone));
-
-    if (milestone !== 'test') {
-      dispatchedWaKeysRef.current.add(milestoneKey);
+  const refreshSecondaryUsers = async () => {
+    if (stateRef.current.currentUser?.role !== 'admin') {
+      setSecondaryUsers([]);
+      return;
     }
 
-    const message = buildTenderWhatsAppMessage(tender, milestone, curSettings.recipientName);
-    const normalizedPhone = normalizeIndianWhatsAppPhone(curSettings.recipientPhone);
+    const merged = new Map<string, SecondaryUserSummary>();
+    const upsertAll = (items: SecondaryUserSummary[]) => {
+      for (const item of items) {
+        if (!item?.userId || !item.email) continue;
+        const key = item.userId.trim().toLowerCase();
+        const prev = merged.get(key);
+        const pickLatestLogin =
+          item.lastLoginAt && (!prev?.lastLoginAt || item.lastLoginAt > prev.lastLoginAt)
+            ? item.lastLoginAt
+            : prev?.lastLoginAt;
+        merged.set(key, {
+          ...prev,
+          ...item,
+          role: 'secondary',
+          lastLoginAt: pickLatestLogin,
+        });
+      }
+    };
 
-    let logEntry: WhatsAppAlertLog = {
-      id: milestone === 'test' ? milestoneKey : milestoneKey,
-      milestoneKey,
+    upsertAll(listSecondaryUsers());
+
+    if (adminSessionToken) {
+      try {
+        const res = await fetch('/api/auth/secondary-users', {
+          headers: { 'x-crm-admin-token': adminSessionToken },
+        });
+        const parsed = await safeReadJsonResponse<{
+          ok?: boolean;
+          users?: SecondaryUserSummary[];
+        }>(res);
+        if (parsed.ok && Array.isArray(parsed.data?.users)) {
+          upsertAll(parsed.data.users);
+        }
+      } catch {
+        // Non-fatal fallback to local + cloud lists
+      }
+    }
+
+    const fbUser = stateRef.current.firebaseUser;
+    if (fbUser && (fbUser.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()) {
+      try {
+        const cloudUsers = await fetchSecondaryUsersFromCloud(fbUser);
+        upsertAll(cloudUsers);
+      } catch {
+        // Non-fatal if rules/network delay occurs
+      }
+    }
+
+    setSecondaryUsers(
+      Array.from(merged.values()).sort((a, b) =>
+        (b.createdAt || '').localeCompare(a.createdAt || ''),
+      ),
+    );
+  };
+
+  useEffect(() => {
+    if (!isAuthenticated || currentUser?.role !== 'admin') {
+      setSecondaryUsers([]);
+      return;
+    }
+    void refreshSecondaryUsers();
+  }, [isAuthenticated, currentUser?.role, adminSessionToken, firebaseUser?.uid]);
+
+  const dispatchEmailReminder = async (
+    tender: Tender,
+    slot: EmailReminderSlot | 'manual' | 'test',
+    explicitSlotKey?: string,
+  ): Promise<void> => {
+    const {
+      emailSettings: curSettings,
+      firebaseUser: curUser,
+      currentUser: curSession,
+      workspaceTenantId: tenantId,
+    } = stateRef.current;
+    const activeTenantKey = curSession?.userId || ADMIN_USER_ID;
+    const slotKey =
+      explicitSlotKey ||
+      (slot === 'test' || slot === 'manual'
+        ? `email_${slot}_${tender.id}_${Date.now()}`
+        : `email_${tender.id}_${slot}`);
+
+    if (slot !== 'test' && slot !== 'manual') {
+      dispatchedEmailKeysRef.current.add(slotKey);
+    }
+
+    const { subject, text, html } = buildTenderEmailMessage(
+      tender,
+      slot,
+      curSettings.recipientName,
+    );
+
+    let logEntry: EmailAlertLog = {
+      id: slotKey,
+      slotKey,
       tenderRefId: tender.id,
       tenderId: tender.tenderId,
-      milestone,
+      slot,
       recipientName: curSettings.recipientName,
-      recipientPhone: normalizedPhone,
+      recipientEmail: curSettings.recipientEmail,
       dueDateIso: tender.submissionDueDate,
-      status: 'manual_ready',
-      provider: 'manual_ready',
-      message,
+      status: 'failed',
+      provider: 'none',
+      subject,
+      message: text,
       createdAt: new Date().toISOString(),
     };
 
     try {
-      const res = await fetch('/api/notifications/whatsapp', {
+      const res = await fetch('/api/notifications/email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          milestoneKey,
+          tenantId: activeTenantKey,
+          slotKey,
           tenderRefId: tender.id,
           tenderId: tender.tenderId,
-          milestone,
+          slot,
           recipientName: curSettings.recipientName,
-          recipientPhone: curSettings.recipientPhone,
+          recipientEmail: curSettings.recipientEmail,
           dueDateIso: tender.submissionDueDate,
-          message,
+          subject,
+          message: text,
+          html,
         }),
       });
-      if (res.ok) {
-        const data = (await res.json()) as {
-          ok?: boolean;
-          deduplicated?: boolean;
-          delivered?: boolean;
-          logEntry?: WhatsAppAlertLog;
-        };
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        deduplicated?: boolean;
+        delivered?: boolean;
+        errorDetail?: string;
+        error?: string;
+        logEntry?: EmailAlertLog;
+      }>(res);
+      if (parsed.ok && parsed.data) {
+        const data = parsed.data;
         if (data.logEntry) {
           logEntry = data.logEntry;
         }
-        if (!data.deduplicated) {
-          const milestoneLabel =
-            milestone === 'urgent_4h'
-              ? '4h Urgent Reminder'
-              : milestone === 'test'
-                ? 'Test WhatsApp Alert'
-                : 'Alerts Entry (48h)';
-          showToast(
-            'ok',
-            data.delivered
-              ? `WhatsApp ${milestoneLabel} sent to ${curSettings.recipientName} (+${normalizedPhone}) for ${tender.tenderId}.`
-              : `WhatsApp ${milestoneLabel} prepared for ${curSettings.recipientName} (${tender.tenderId}). Open Alerts or Admin Settings to launch WhatsApp.`,
-          );
+        if (data.delivered) {
+          emailRetryStateRef.current.delete(slotKey);
+        } else if (slot !== 'test' && slot !== 'manual') {
+          recordEmailDispatchFailure(emailRetryStateRef.current, slotKey);
+          dispatchedEmailKeysRef.current.delete(slotKey);
         }
+        if (!data.deduplicated) {
+          const slotLabel = formatSlotLabel(slot);
+          if (data.delivered) {
+            showToast(
+              'ok',
+              `Email ${slotLabel} sent to ${curSettings.recipientEmail} for ${tender.tenderId}.`,
+            );
+          } else {
+            showToast(
+              'err',
+              data.errorDetail ||
+                data.error ||
+                `Could not send email reminder to ${curSettings.recipientEmail}. Check SMTP settings.`,
+            );
+          }
+        }
+      } else if (slot !== 'test' && slot !== 'manual') {
+        recordEmailDispatchFailure(emailRetryStateRef.current, slotKey);
+        dispatchedEmailKeysRef.current.delete(slotKey);
       }
     } catch {
-      // Keep local logEntry fallback if network temporarily interrupted
+      if (slot !== 'test' && slot !== 'manual') {
+        recordEmailDispatchFailure(emailRetryStateRef.current, slotKey);
+        dispatchedEmailKeysRef.current.delete(slotKey);
+      }
     }
 
-    setWhatsappLogs((prev) => mergeWhatsappLogs([logEntry], prev));
+    setEmailLogs((prev) => mergeEmailLogs([logEntry], prev));
     if (curUser) {
-      void syncWhatsAppAlertLogToCloud(curUser, logEntry).catch(() => {
+      void syncEmailAlertLogToCloud(curUser, logEntry, tenantId).catch(() => {
         // Handled cleanly via subsequent cloud sync
       });
     }
   };
 
-  // Load initial server WhatsApp gateway capabilities & persisted logs on authentication
+  // Load initial server Email gateway capabilities & persisted logs on authentication
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || !currentUser) return;
     let cancelled = false;
-    const loadWhatsappStatus = async () => {
+    const loadEmailStatus = async () => {
       try {
-        const res = await fetch('/api/notifications/whatsapp/status');
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as {
+        const res = await fetch(
+          `/api/notifications/email/status?tenantId=${encodeURIComponent(currentUser.userId || ADMIN_USER_ID)}`,
+        );
+        const parsed = await safeReadJsonResponse<{
           provider?: string;
           automatedConfigured?: boolean;
-          logs?: WhatsAppAlertLog[];
-        };
-        if (cancelled) return;
-        setWhatsappGatewayInfo({
+          logs?: EmailAlertLog[];
+        }>(res);
+        if (!parsed.ok || !parsed.data || cancelled) return;
+        const data = parsed.data;
+        setEmailGatewayInfo({
           automatedConfigured: Boolean(data.automatedConfigured),
           provider: data.provider || 'none',
         });
         if (Array.isArray(data.logs) && data.logs.length > 0) {
-          setWhatsappLogs((prev) => mergeWhatsappLogs(data.logs!, prev));
+          setEmailLogs((prev) => mergeEmailLogs(data.logs!, prev));
         }
       } catch {
         // Ignore transient network errors
       }
     };
-    void loadWhatsappStatus();
+    void loadEmailStatus();
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, currentUser?.userId]);
 
-  // 2-Milestone WhatsApp Tender Alert Scheduler (checks immediately and every 30 seconds)
+  // Twice-Daily Email Tender Alert Scheduler (11:00 AM IST & 4:00 PM IST for tenders due within 5 days)
   useEffect(() => {
-    if (!isAuthenticated || !whatsappSettings.enabled) return;
+    if (!isAuthenticated || !emailSettings.enabled) return;
 
     const evaluateAndDispatch = () => {
-      const pending = computePendingWhatsAppAlerts(
+      const now = new Date();
+      const nowMs = now.getTime();
+      const pending = computePendingEmailAlerts(
         stateRef.current.tenders,
-        dispatchedWaKeysRef.current,
-        new Date(),
+        dispatchedEmailKeysRef.current,
+        now,
       );
       for (const item of pending) {
-        void dispatchWhatsAppMilestone(item.tender, item.milestone, item.milestoneKey);
+        if (!shouldAttemptEmailDispatch(emailRetryStateRef.current, item.slotKey, nowMs)) {
+          continue;
+        }
+        void dispatchEmailReminder(item.tender, item.slot, item.slotKey);
       }
     };
 
     evaluateAndDispatch();
     const timer = window.setInterval(evaluateAndDispatch, 30_000);
     return () => window.clearInterval(timer);
-  }, [isAuthenticated, whatsappSettings.enabled, tenders]);
+  }, [isAuthenticated, emailSettings.enabled]);
 
   const notifications = useMemo(
     () => computeNotifications(tenders, emdRecords),
@@ -715,8 +932,8 @@ export default function App() {
         tenders,
         emdRecords,
         mafTrackers,
-        whatsappSettings,
-        whatsappLogs,
+        emailSettings,
+        emailLogs,
         sheetSettings,
         attachmentFiles: attachmentFilesRef.current,
       }),
@@ -728,8 +945,8 @@ export default function App() {
       tenders,
       emdRecords,
       mafTrackers,
-      whatsappSettings,
-      whatsappLogs,
+      emailSettings,
+      emailLogs,
       sheetSettings,
       lastCloudSyncAt,
     ],
@@ -867,16 +1084,17 @@ export default function App() {
         }),
       });
 
-      const data = (await res.json().catch(() => ({}))) as {
+      const parsed = await safeReadJsonResponse<{
         ok?: boolean;
         department?: string;
         items?: ExtractedSpecItem[];
         error?: string;
-      };
+      }>(res);
+      const data = parsed.data;
 
-      if (!res.ok || !data.ok) {
-        if (data.error) {
-          showToast('err', `MAF auto-extraction: ${data.error}`);
+      if (!parsed.ok || !data?.ok) {
+        if (data?.error || parsed.errorMessage) {
+          showToast('err', `MAF auto-extraction: ${data?.error || parsed.errorMessage}`);
         }
         return;
       }
@@ -903,7 +1121,8 @@ export default function App() {
       setMafTrackers(merged.nextTrackers);
 
       if (merged.targetTracker && stateRef.current.firebaseUser) {
-        void runCloudTask((user) => syncMafTrackerToCloud(user, merged.targetTracker!));
+        const activeTenant = stateRef.current.workspaceTenantId;
+        void runCloudTask((user) => syncMafTrackerToCloud(user, merged.targetTracker!, activeTenant));
       }
 
       if (merged.addedCount > 0) {
@@ -932,7 +1151,7 @@ export default function App() {
 
     if (!webhookUrl || !isValidAppsScriptWebhookUrl(webhookUrl)) {
       if (opts.force) {
-        const msg = 'Configure a valid Google Apps Script Webhook URL in Admin Settings first.';
+        const msg = 'Configure a valid Google Apps Script Webhook URL in Settings first.';
         setSheetSyncStatus('error');
         setSheetSyncError(msg);
         showToast('err', msg);
@@ -952,7 +1171,10 @@ export default function App() {
       entityType: opts.entityType,
       sheetName: cfg.sheetName,
       firmName: stateRef.current.firmProfile.firmName,
-      assignedOwner: stateRef.current.firmProfile.adminName,
+      assignedOwner:
+        stateRef.current.firmProfile.adminName ||
+        stateRef.current.currentUser?.username ||
+        'Tender Owner',
       tender: opts.tender ?? null,
       emdRecord: opts.emdRecord ?? null,
       tenders: opts.tendersSnapshot ?? stateRef.current.tenders,
@@ -968,22 +1190,26 @@ export default function App() {
           payload,
         }),
       });
-      const data = (await res.json()) as {
+      const parsed = await safeReadJsonResponse<{
         ok?: boolean;
         error?: string;
         syncedAt?: string;
         scriptResponse?: { message?: string; spreadsheetName?: string };
-      };
+      }>(res);
+      const data = parsed.data;
 
-      if (!res.ok || data.ok === false) {
-        const errMsg = data.error || `Google Sheet webhook returned HTTP ${res.status}.`;
+      if (!parsed.ok || data?.ok === false) {
+        const errMsg =
+          data?.error ||
+          parsed.errorMessage ||
+          `Google Sheet webhook returned HTTP ${res.status}.`;
         setSheetSyncStatus('error');
         setSheetSyncError(errMsg);
         showToast('err', errMsg);
         return false;
       }
 
-      const syncedAt = data.syncedAt || new Date().toISOString();
+      const syncedAt = data?.syncedAt || new Date().toISOString();
       const updatedCfg: GoogleSheetSettings = {
         ...cfg,
         webhookUrl,
@@ -995,15 +1221,18 @@ export default function App() {
       setSheetSyncError(null);
 
       if (stateRef.current.firebaseUser) {
-        void syncSheetConfigToCloud(stateRef.current.firebaseUser, updatedCfg).catch(() => {
-          // Non-fatal: already updated in-memory
-        });
+        const activeTenant = stateRef.current.workspaceTenantId;
+        void syncSheetConfigToCloud(stateRef.current.firebaseUser, updatedCfg, activeTenant).catch(
+          () => {
+            // Non-fatal: already updated in-memory
+          },
+        );
       }
 
       if (opts.force) {
         const label =
           opts.action === 'PING'
-            ? data.scriptResponse?.message ||
+            ? data?.scriptResponse?.message ||
               `Connected to Google Sheet "${updatedCfg.sheetName}" successfully.`
             : `Synced ${payload.tenders.length} tenders & ${payload.emdRecords.length} EMD/BG records to "${updatedCfg.sheetName}".`;
         showToast('ok', label);
@@ -1099,16 +1328,17 @@ export default function App() {
 
     setTenderModalTarget(undefined);
 
+    const activeTenant = stateRef.current.workspaceTenantId;
     void runCloudTask(async (user) => {
-      await syncTenderToCloud(user, saved);
+      await syncTenderToCloud(user, saved, activeTenant);
       if (linkedRecordToSync) {
-        await syncEmdRecordToCloud(user, linkedRecordToSync);
+        await syncEmdRecordToCloud(user, linkedRecordToSync, activeTenant);
       }
       if (linkedMafToSync) {
-        await syncMafTrackerToCloud(user, linkedMafToSync);
+        await syncMafTrackerToCloud(user, linkedMafToSync, activeTenant);
       }
       for (const updatedMaf of changedTrackers) {
-        await syncMafTrackerToCloud(user, updatedMaf);
+        await syncMafTrackerToCloud(user, updatedMaf, activeTenant);
       }
     });
 
@@ -1145,10 +1375,11 @@ export default function App() {
       stateRef.current.mafTrackers = syncedResult.nextTrackers;
       setMafTrackers(syncedResult.nextTrackers);
     }
+    const activeTenant = stateRef.current.workspaceTenantId;
     void runCloudTask(async (user) => {
-      await syncTenderToCloud(user, updated);
+      await syncTenderToCloud(user, updated, activeTenant);
       for (const updatedMaf of changedTrackers) {
-        await syncMafTrackerToCloud(user, updatedMaf);
+        await syncMafTrackerToCloud(user, updatedMaf, activeTenant);
       }
     });
 
@@ -1172,7 +1403,8 @@ export default function App() {
     if (selectedTenderId === id) {
       setSelectedTenderId(null);
     }
-    void runCloudTask((user) => deleteTenderFromCloud(user, id));
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user) => deleteTenderFromCloud(user, id, activeTenant));
 
     if (deletedTender) {
       void pushToGoogleSheet({
@@ -1194,7 +1426,8 @@ export default function App() {
       const nextEmdRecords = [linked, ...stateRef.current.emdRecords];
       stateRef.current.emdRecords = nextEmdRecords;
       setEmdRecords(nextEmdRecords);
-      void runCloudTask((user) => syncEmdRecordToCloud(user, linked));
+      const activeTenant = stateRef.current.workspaceTenantId;
+      void runCloudTask((user) => syncEmdRecordToCloud(user, linked, activeTenant));
       void pushToGoogleSheet({
         action: 'CREATE',
         entityType: 'EMD_BG',
@@ -1215,7 +1448,8 @@ export default function App() {
     stateRef.current.emdRecords = nextEmdRecords;
     setEmdRecords(nextEmdRecords);
     setEmdModalTarget(undefined);
-    void runCloudTask((user) => syncEmdRecordToCloud(user, saved));
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user) => syncEmdRecordToCloud(user, saved, activeTenant));
 
     void pushToGoogleSheet({
       action: isExisting ? 'UPDATE' : 'CREATE',
@@ -1231,7 +1465,8 @@ export default function App() {
     const nextEmdRecords = stateRef.current.emdRecords.filter((r) => r.id !== id);
     stateRef.current.emdRecords = nextEmdRecords;
     setEmdRecords(nextEmdRecords);
-    void runCloudTask((user) => deleteEmdRecordFromCloud(user, id));
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user) => deleteEmdRecordFromCloud(user, id, activeTenant));
 
     if (deletedRecord) {
       void pushToGoogleSheet({
@@ -1298,11 +1533,12 @@ export default function App() {
     const nextList = exists
       ? prevSnapshot.map((t) => (t.id === canonicalTracker.id ? canonicalTracker : t))
       : [canonicalTracker, ...prevSnapshot];
+    const activeTenant = stateRef.current.workspaceTenantId;
     setMafTrackerModalTarget(undefined);
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, canonicalTracker),
+      (user) => syncMafTrackerToCloud(user, canonicalTracker, activeTenant),
       exists
         ? `Updated MAF tracker for ${canonicalTracker.tenderId}.`
         : `Created MAF tracker for ${canonicalTracker.tenderId} (${canonicalTracker.itemsMAF.length} item(s)).`,
@@ -1313,10 +1549,11 @@ export default function App() {
     const prevSnapshot = stateRef.current.mafTrackers;
     const target = prevSnapshot.find((t) => t.id === trackerId);
     const nextList = prevSnapshot.filter((t) => t.id !== trackerId);
+    const activeTenant = stateRef.current.workspaceTenantId;
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => deleteMafTrackerFromCloud(user, trackerId),
+      (user) => deleteMafTrackerFromCloud(user, trackerId, activeTenant),
       `Removed MAF tracker ${target?.tenderId ?? ''}.`,
     );
   };
@@ -1337,12 +1574,13 @@ export default function App() {
       updatedAt: nowIso,
     };
     const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+    const activeTenant = stateRef.current.workspaceTenantId;
     setMafItemModalTarget(null);
 
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, updatedTracker),
+      (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
       itemExists
         ? `Updated "${savedItem.itemName}" (${savedItem.oemName}).`
         : `Added "${savedItem.itemName}" (${savedItem.oemName}) to ${target.tenderId}.`,
@@ -1367,17 +1605,19 @@ export default function App() {
       updatedAt: nowIso,
     };
     const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+    const activeTenant = stateRef.current.workspaceTenantId;
 
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, updatedTracker),
+      (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
       `${item?.oemName ?? 'OEM'} MAF status set to "${nextStatus}".`,
     );
   };
 
   const handleUploadMafFile = async (trackerId: string, itemId: string, file: File) => {
-    const result = await uploadMafDocumentFile(firebaseUser, trackerId, itemId, file);
+    const activeTenant = stateRef.current.workspaceTenantId;
+    const result = await uploadMafDocumentFile(firebaseUser, trackerId, itemId, file, activeTenant);
     if (result.mafAttachmentId && result.mafDocumentUrl.startsWith('data:')) {
       attachmentFilesRef.current.set(result.mafAttachmentId, result.mafDocumentUrl);
     }
@@ -1407,10 +1647,11 @@ export default function App() {
         updatedAt: nowIso,
       };
       const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+      const activeTenant = stateRef.current.workspaceTenantId;
       await syncMafOptimistic(
         prevSnapshot,
         nextList,
-        (user) => syncMafTrackerToCloud(user, updatedTracker),
+        (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
         `Uploaded "${uploaded.mafDocumentName}" successfully.`,
       );
     } catch (err) {
@@ -1430,23 +1671,28 @@ export default function App() {
       updatedAt: nowIso,
     };
     const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
+    const activeTenant = stateRef.current.workspaceTenantId;
 
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, updatedTracker),
+      (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
       `Removed "${removed?.itemName ?? 'item'}" from ${target.tenderId}.`,
     );
   };
 
   const handleSaveProfile = (nextProfile: FirmProfile) => {
+    stateRef.current.firmProfile = nextProfile;
     setFirmProfile(nextProfile);
-    void runCloudTask((user) => syncProfileToCloud(user, nextProfile));
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user) => syncProfileToCloud(user, nextProfile, activeTenant));
   };
 
-  const handleSaveWhatsAppSettings = (nextSettings: WhatsAppSettings) => {
-    setWhatsappSettings(nextSettings);
-    void runCloudTask((user) => syncWhatsAppConfigToCloud(user, nextSettings));
+  const handleSaveEmailSettings = (nextSettings: EmailAlertSettings) => {
+    stateRef.current.emailSettings = nextSettings;
+    setEmailSettings(nextSettings);
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user) => syncEmailConfigToCloud(user, nextSettings, activeTenant));
   };
 
   const handleSaveSheetSettings = async (nextSettings: GoogleSheetSettings) => {
@@ -1454,7 +1700,8 @@ export default function App() {
     setSheetSettings(nextSettings);
     setSheetSyncError(null);
     if (stateRef.current.firebaseUser) {
-      void runCloudTask((user) => syncSheetConfigToCloud(user, nextSettings));
+      const activeTenant = stateRef.current.workspaceTenantId;
+      void runCloudTask((user) => syncSheetConfigToCloud(user, nextSettings, activeTenant));
     }
     if (!nextSettings.webhookUrl.trim()) {
       setSheetSyncStatus('unconfigured');
@@ -1487,29 +1734,167 @@ export default function App() {
     });
   };
 
-  const handleTriggerTestWhatsApp = async () => {
+  const handleTriggerTestEmail = async () => {
     const sampleTender =
       stateRef.current.tenders.find(
         (t) => t.stage === 'Identified / Reviewing' || t.stage === 'Doc Preparation',
       ) ?? stateRef.current.tenders[0];
     if (!sampleTender) {
-      showToast('err', 'Add at least one tender first to generate a WhatsApp tender alert.');
+      showToast('err', 'Add at least one tender first to send a test tender reminder email.');
       return;
     }
-    await dispatchWhatsAppMilestone(sampleTender, 'test');
+    await dispatchEmailReminder(sampleTender, 'test');
   };
 
   const handleToggleDarkMode = () => {
     setDarkMode((prev) => {
       const next = !prev;
+      const activeTenant = stateRef.current.workspaceTenantId;
       void runCloudTask((user) =>
-        syncPreferencesToCloud(user, { adminPin: stateRef.current.adminPin, darkMode: next }),
+        syncPreferencesToCloud(
+          user,
+          { adminPin: stateRef.current.adminPin, darkMode: next },
+          activeTenant,
+        ),
       );
       return next;
     });
   };
 
+  const handleLoginSuccess = async (
+    session: CrmUserSession,
+    _rememberMe: boolean,
+    serverMeta?: { credentialToken?: string; adminSessionToken?: string },
+  ) => {
+    recordUserLoginActivity(session.username);
+
+    // Snapshot Admin offline workspace before switching to secondary workspace if needed
+    if (activeRoleRef.current === 'admin' || (!activeRoleRef.current && session.role === 'secondary')) {
+      adminOfflineSnapshotRef.current = {
+        firmProfile: stateRef.current.firmProfile,
+        preferences: {
+          adminPin: stateRef.current.adminPin,
+          darkMode: stateRef.current.darkMode,
+        },
+        tenders: stateRef.current.tenders,
+        emdRecords: stateRef.current.emdRecords,
+        mafTrackers: stateRef.current.mafTrackers,
+        emailSettings: stateRef.current.emailSettings,
+        emailLogs: stateRef.current.emailLogs,
+        sheetSettings: stateRef.current.sheetSettings,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    const prevUserId = activeCrmUserIdRef.current;
+    const isSwitchingCrmAccount = Boolean(prevUserId && prevUserId !== session.userId);
+    const activeFbUser = stateRef.current.firebaseUser;
+    const isSecondaryWithAdminGoogle =
+      session.role === 'secondary' &&
+      Boolean(activeFbUser) &&
+      (activeFbUser?.email || '').trim().toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase();
+
+    clearCloudSessionCache();
+    attachmentFilesRef.current.clear();
+    dispatchedEmailKeysRef.current.clear();
+    emailRetryStateRef.current.clear();
+    mafExtractionSignatureRef.current.clear();
+    setSelectedTenderId(null);
+    setActiveTab('dashboard');
+    setCloudFeedback(null);
+
+    if ((isSwitchingCrmAccount || isSecondaryWithAdminGoogle) && activeFbUser) {
+      await signOut(auth).catch(() => {});
+    }
+
+    if (session.role === 'secondary') {
+      const emptyOrSaved =
+        loadSecondaryWorkspaceSnapshot(session.userId) ?? buildEmptySecondaryWorkspace(session);
+
+      setFirmProfile(emptyOrSaved.firmProfile);
+      setAdminPin(emptyOrSaved.preferences.adminPin);
+      setDarkMode(emptyOrSaved.preferences.darkMode);
+      setTenders(emptyOrSaved.tenders);
+      setEmdRecords(emptyOrSaved.emdRecords);
+      setMafTrackers(emptyOrSaved.mafTrackers);
+      setEmailSettings(emptyOrSaved.emailSettings);
+      setEmailLogs(emptyOrSaved.emailLogs);
+      setSheetSettings(emptyOrSaved.sheetSettings);
+      setSheetSyncStatus(
+        emptyOrSaved.sheetSettings.webhookUrl
+          ? emptyOrSaved.sheetSettings.lastSyncedAt
+            ? 'synced'
+            : 'idle'
+          : 'unconfigured',
+      );
+      setSheetSyncError(null);
+      stateRef.current = {
+        ...stateRef.current,
+        firmProfile: emptyOrSaved.firmProfile,
+        adminPin: emptyOrSaved.preferences.adminPin,
+        darkMode: emptyOrSaved.preferences.darkMode,
+        tenders: emptyOrSaved.tenders,
+        emdRecords: emptyOrSaved.emdRecords,
+        mafTrackers: emptyOrSaved.mafTrackers,
+        emailSettings: emptyOrSaved.emailSettings,
+        emailLogs: emptyOrSaved.emailLogs,
+        sheetSettings: emptyOrSaved.sheetSettings,
+        currentUser: session,
+        workspaceTenantId: session.userId,
+      };
+      setAdminSessionToken('');
+    } else {
+      if (activeRoleRef.current === 'secondary' && adminOfflineSnapshotRef.current) {
+        const snap = adminOfflineSnapshotRef.current;
+        setFirmProfile(snap.firmProfile);
+        setAdminPin(snap.preferences.adminPin);
+        setDarkMode(snap.preferences.darkMode);
+        setTenders(snap.tenders);
+        setEmdRecords(snap.emdRecords);
+        setMafTrackers(snap.mafTrackers);
+        setEmailSettings(snap.emailSettings);
+        setEmailLogs(snap.emailLogs);
+        setSheetSettings(snap.sheetSettings);
+        setSheetSyncStatus(
+          snap.sheetSettings.webhookUrl
+            ? snap.sheetSettings.lastSyncedAt
+              ? 'synced'
+              : 'idle'
+            : 'unconfigured',
+        );
+        setSheetSyncError(null);
+        stateRef.current = {
+          ...stateRef.current,
+          firmProfile: snap.firmProfile,
+          adminPin: snap.preferences.adminPin,
+          darkMode: snap.preferences.darkMode,
+          tenders: snap.tenders,
+          emdRecords: snap.emdRecords,
+          mafTrackers: snap.mafTrackers,
+          emailSettings: snap.emailSettings,
+          emailLogs: snap.emailLogs,
+          sheetSettings: snap.sheetSettings,
+          currentUser: session,
+          workspaceTenantId: null,
+        };
+      }
+      setAdminSessionToken(serverMeta?.adminSessionToken || '');
+    }
+
+    activeRoleRef.current = session.role;
+    activeCrmUserIdRef.current = session.userId;
+    setCurrentUser(session);
+    setIsAuthenticated(true);
+  };
+
   const handleLogout = () => {
+    clearCloudSessionCache();
+    attachmentFilesRef.current.clear();
+    dispatchedEmailKeysRef.current.clear();
+    emailRetryStateRef.current.clear();
+    mafExtractionSignatureRef.current.clear();
+    setAdminSessionToken('');
+    setCloudFeedback(null);
     setIsAuthenticated(false);
     setMobileMenuOpen(false);
     setTenderModalTarget(undefined);
@@ -1534,6 +1919,7 @@ export default function App() {
     const nextMaf = payload.mafTrackers ?? [];
     stateRef.current.tenders = payload.tenders;
     stateRef.current.emdRecords = payload.emdRecords;
+    stateRef.current.mafTrackers = nextMaf;
     stateRef.current.firmProfile = payload.profile;
     setFirmProfile(payload.profile);
     setTenders(payload.tenders);
@@ -1544,6 +1930,7 @@ export default function App() {
       adminPin: stateRef.current.adminPin,
       darkMode: stateRef.current.darkMode,
     };
+    const activeTenant = stateRef.current.workspaceTenantId;
     void runCloudTask((user) =>
       replaceCloudDataset(
         user,
@@ -1552,6 +1939,7 @@ export default function App() {
         payload.tenders,
         payload.emdRecords,
         nextMaf,
+        activeTenant,
       ),
     );
     void pushToGoogleSheet({
@@ -1563,9 +1951,11 @@ export default function App() {
   };
 
   const handleResetDemoData = () => {
+    if (stateRef.current.currentUser?.role !== 'admin') return;
     stateRef.current.firmProfile = DEFAULT_FIRM_PROFILE;
     stateRef.current.tenders = SEED_TENDERS;
     stateRef.current.emdRecords = SEED_EMD_RECORDS;
+    stateRef.current.mafTrackers = SEED_MAF_TRACKERS;
     setFirmProfile(DEFAULT_FIRM_PROFILE);
     setTenders(SEED_TENDERS);
     setEmdRecords(SEED_EMD_RECORDS);
@@ -1583,6 +1973,7 @@ export default function App() {
         SEED_TENDERS,
         SEED_EMD_RECORDS,
         SEED_MAF_TRACKERS,
+        null,
       ),
     );
     void pushToGoogleSheet({
@@ -1597,6 +1988,7 @@ export default function App() {
     attachmentFilesRef.current.clear();
     stateRef.current.tenders = [];
     stateRef.current.emdRecords = [];
+    stateRef.current.mafTrackers = [];
     setTenders([]);
     setEmdRecords([]);
     setMafTrackers([]);
@@ -1605,8 +1997,9 @@ export default function App() {
       adminPin: stateRef.current.adminPin,
       darkMode: stateRef.current.darkMode,
     };
+    const activeTenant = stateRef.current.workspaceTenantId;
     void runCloudTask((user) =>
-      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], []),
+      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], [], activeTenant),
     );
     void pushToGoogleSheet({
       action: 'FULL_SYNC',
@@ -1619,8 +2012,8 @@ export default function App() {
   if (!isAuthenticated) {
     return (
       <LoginPage
-        onLoginSuccess={() => {
-          setIsAuthenticated(true);
+        onLoginSuccess={(session, rememberMe, meta) => {
+          void handleLoginSuccess(session, rememberMe, meta);
         }}
       />
     );
@@ -1632,6 +2025,7 @@ export default function App() {
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         firmProfile={firmProfile}
+        currentUser={currentUser}
         tenderCount={tenders.length}
         mafCount={mafTrackers.length}
         emdCount={emdRecords.length}
@@ -1644,13 +2038,15 @@ export default function App() {
         <Header
           activeTab={activeTab}
           firmProfile={firmProfile}
+          currentUser={currentUser}
           darkMode={darkMode}
           onToggleDarkMode={handleToggleDarkMode}
           onLogout={handleLogout}
           notifications={notifications}
           tenders={tenders}
-          whatsappSettings={whatsappSettings}
-          whatsappLogs={whatsappLogs}
+          emailSettings={emailSettings}
+          emailLogs={emailLogs}
+          onSendReminderEmailNow={(tender) => void dispatchEmailReminder(tender, 'manual')}
           onNavigateFromNotification={handleNavigateFromNotification}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           cloudUser={cloudUserSummary}
@@ -1806,11 +2202,11 @@ export default function App() {
               onDisconnectCloud={handleDisconnectCloud}
               onBackupToCloudNow={handleBackupToCloudNow}
               onRestoreFromCloud={handleRestoreFromCloud}
-              whatsappSettings={whatsappSettings}
-              whatsappLogs={whatsappLogs}
-              whatsappGatewayInfo={whatsappGatewayInfo}
-              onSaveWhatsAppSettings={handleSaveWhatsAppSettings}
-              onTriggerTestWhatsApp={handleTriggerTestWhatsApp}
+              emailSettings={emailSettings}
+              emailLogs={emailLogs}
+              emailGatewayInfo={emailGatewayInfo}
+              onSaveEmailSettings={handleSaveEmailSettings}
+              onTriggerTestEmail={handleTriggerTestEmail}
               sheetSettings={sheetSettings}
               sheetSyncStatus={sheetSyncStatus}
               sheetSyncError={sheetSyncError}
@@ -1818,6 +2214,9 @@ export default function App() {
               onTestSheetWebhook={handleTestSheetWebhook}
               onFullSyncToSheet={handleFullSyncToSheet}
               storageUsage={cloudStorageSummary}
+              currentUser={currentUser}
+              secondaryUsers={secondaryUsers}
+              onRefreshSecondaryUsers={() => void refreshSecondaryUsers()}
             />
           )}
         </main>
@@ -1826,6 +2225,7 @@ export default function App() {
       {/* Modals & Slide-over Drawers */}
       {selectedTender && (
         <TenderDetailDrawer
+          key={selectedTender.id}
           tender={selectedTender}
           linkedEmdRecord={emdRecords.find(
             (r) => r.tenderId.toLowerCase() === selectedTender.tenderId.toLowerCase(),
@@ -1848,6 +2248,7 @@ export default function App() {
       {tenderModalTarget !== undefined && (
         <TenderFormModal
           initialTender={tenderModalTarget}
+          existingTenders={tenders}
           onClose={() => setTenderModalTarget(undefined)}
           onSave={handleSaveTender}
         />

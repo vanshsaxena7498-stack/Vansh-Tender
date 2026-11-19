@@ -6,6 +6,7 @@ import type {
   Tender,
 } from '../types/crm';
 import { ACTIVE_LOCKED_STATUSES } from './calculations';
+import { getLatestRemarkText } from './formatters';
 
 export const DEFAULT_GOOGLE_SHEET_SETTINGS: GoogleSheetSettings = {
   enabled: true,
@@ -359,13 +360,12 @@ export function serializeTenderForSheet(
   t: Tender,
   opts?: { serialNo?: number; firmName?: string; assignedOwner?: string },
 ): SheetTenderRowPayload {
-  const latestRemark =
-    t.remarks && t.remarks.length > 0 ? t.remarks[t.remarks.length - 1]?.text?.trim() || '' : '';
+  const latestRemark = getLatestRemarkText(t.remarks);
   const combinedRemarks = [latestRemark, (t.resultInfo || '').trim()].filter(Boolean).join(' | ');
   const isWon = t.stage === 'L1 / Won';
   const isLost = t.stage === 'Lost (L2/L3)';
   const firmLabel = (opts?.firmName || '').trim() || 'Self';
-  const ownerLabel = (opts?.assignedOwner || '').trim() || 'Vansh Saxena';
+  const ownerLabel = (opts?.assignedOwner || '').trim() || 'Tender Owner';
   const locationDepartment = [t.location?.trim(), t.department?.trim()].filter(Boolean).join(' / ');
   const rawInteractionTimestamp = getTenderInteractionTimestamp(t);
 
@@ -600,7 +600,7 @@ export function buildSheetSyncPayload(params: {
   triggeredAt?: string;
 }): GoogleSheetSyncPayload {
   const firmName = (params.firmName || '').trim() || 'Corporate Tender Desk';
-  const assignedOwner = (params.assignedOwner || '').trim() || 'Vansh Saxena';
+  const assignedOwner = (params.assignedOwner || '').trim() || 'Tender Owner';
   const triggeredAt = formatIndianDateTimeForSheet(
     params.triggeredAt || new Date().toISOString(),
   );

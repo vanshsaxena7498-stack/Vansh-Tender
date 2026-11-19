@@ -13,7 +13,7 @@ import {
   FileSpreadsheet,
   HardDrive,
   LogOut,
-  MessageCircle,
+  Mail,
   RefreshCw,
   RotateCcw,
   Send,
@@ -21,27 +21,30 @@ import {
   Trash2,
   Upload,
   User,
+  Users,
 } from 'lucide-react';
 import { firebaseConfig } from '../lib/firebase';
 import type {
   CrmBackupPayload,
+  CrmUserSession,
+  EmailAlertLog,
+  EmailAlertSettings,
   EmdBgRecord,
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
+  SecondaryUserSummary,
   SheetSyncStatus,
   Tender,
-  WhatsAppAlertLog,
-  WhatsAppSettings,
 } from '../types/crm';
 import { compressProfilePhotoDataUrl } from '../utils/attachments';
+import { formatSlotLabel, isValidNotificationEmail } from '../utils/emailAlerts';
 import { buildCsvContent, downloadTextFile, formatDateTime } from '../utils/formatters';
 import {
   GOOGLE_APPS_SCRIPT_CODE_GS,
   isValidAppsScriptWebhookUrl,
 } from '../utils/googleSheetSync';
 import { formatStorageSize, type CloudStorageSummary } from '../utils/storageUsage';
-import { buildWhatsAppWebUrl, normalizeIndianWhatsAppPhone } from '../utils/whatsappAlerts';
 import type { CloudUserSummary } from './Header';
 
 interface SettingsTabProps {
@@ -62,11 +65,11 @@ interface SettingsTabProps {
   onDisconnectCloud: () => void;
   onBackupToCloudNow: () => void;
   onRestoreFromCloud: () => void;
-  whatsappSettings: WhatsAppSettings;
-  whatsappLogs: WhatsAppAlertLog[];
-  whatsappGatewayInfo: { automatedConfigured: boolean; provider: string };
-  onSaveWhatsAppSettings: (settings: WhatsAppSettings) => void;
-  onTriggerTestWhatsApp: () => Promise<void> | void;
+  emailSettings: EmailAlertSettings;
+  emailLogs: EmailAlertLog[];
+  emailGatewayInfo: { automatedConfigured: boolean; provider: string };
+  onSaveEmailSettings: (settings: EmailAlertSettings) => void;
+  onTriggerTestEmail: () => Promise<void> | void;
   sheetSettings: GoogleSheetSettings;
   sheetSyncStatus: SheetSyncStatus;
   sheetSyncError: string | null;
@@ -74,6 +77,9 @@ interface SettingsTabProps {
   onTestSheetWebhook: (settingsOverride?: GoogleSheetSettings) => Promise<void>;
   onFullSyncToSheet: (settingsOverride?: GoogleSheetSettings) => Promise<void>;
   storageUsage: CloudStorageSummary;
+  currentUser?: CrmUserSession | null;
+  secondaryUsers?: SecondaryUserSummary[];
+  onRefreshSecondaryUsers?: () => void;
 }
 
 export function SettingsTab({
@@ -94,11 +100,11 @@ export function SettingsTab({
   onDisconnectCloud,
   onBackupToCloudNow,
   onRestoreFromCloud,
-  whatsappSettings,
-  whatsappLogs,
-  whatsappGatewayInfo,
-  onSaveWhatsAppSettings,
-  onTriggerTestWhatsApp,
+  emailSettings,
+  emailLogs,
+  emailGatewayInfo,
+  onSaveEmailSettings,
+  onTriggerTestEmail,
   sheetSettings,
   sheetSyncStatus,
   sheetSyncError,
@@ -106,6 +112,9 @@ export function SettingsTab({
   onTestSheetWebhook,
   onFullSyncToSheet,
   storageUsage,
+  currentUser,
+  secondaryUsers = [],
+  onRefreshSecondaryUsers,
 }: SettingsTabProps) {
   const [firmName, setFirmName] = useState(profile.firmName);
   const [gstin, setGstin] = useState(profile.gstin);
@@ -128,44 +137,44 @@ export function SettingsTab({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
 
-  const [waEnabled, setWaEnabled] = useState(whatsappSettings.enabled);
-  const [waName, setWaName] = useState(whatsappSettings.recipientName);
-  const [waPhone, setWaPhone] = useState(whatsappSettings.recipientPhone);
-  const [waSavedMsg, setWaSavedMsg] = useState('');
-  const [waErrorMsg, setWaErrorMsg] = useState('');
-  const [waTesting, setWaTesting] = useState(false);
+  const [emailEnabled, setEmailEnabled] = useState(emailSettings.enabled);
+  const [emailRecipientName, setEmailRecipientName] = useState(emailSettings.recipientName);
+  const [emailAddress, setEmailAddress] = useState(emailSettings.recipientEmail);
+  const [emailSavedMsg, setEmailSavedMsg] = useState('');
+  const [emailErrorMsg, setEmailErrorMsg] = useState('');
+  const [emailTesting, setEmailTesting] = useState(false);
   const [copiedLogId, setCopiedLogId] = useState<string | null>(null);
 
   useEffect(() => {
-    setWaEnabled(whatsappSettings.enabled);
-    setWaName(whatsappSettings.recipientName);
-    setWaPhone(whatsappSettings.recipientPhone);
-  }, [whatsappSettings]);
+    setEmailEnabled(emailSettings.enabled);
+    setEmailRecipientName(emailSettings.recipientName);
+    setEmailAddress(emailSettings.recipientEmail);
+  }, [emailSettings]);
 
-  const handleSaveWhatsAppForm = (e: FormEvent) => {
+  const handleSaveEmailForm = (e: FormEvent) => {
     e.preventDefault();
-    const digits = normalizeIndianWhatsAppPhone(waPhone);
-    if (digits.length < 10) {
-      setWaErrorMsg('Please enter a valid 10-digit WhatsApp mobile number.');
+    const trimmedEmail = emailAddress.trim();
+    if (!isValidNotificationEmail(trimmedEmail)) {
+      setEmailErrorMsg('Please enter a valid notification email address.');
       return;
     }
-    setWaErrorMsg('');
-    onSaveWhatsAppSettings({
-      enabled: waEnabled,
-      recipientName: waName.trim() || 'Vansh',
-      recipientPhone: waPhone.trim() || '9717690890',
+    setEmailErrorMsg('');
+    onSaveEmailSettings({
+      enabled: emailEnabled,
+      recipientName: emailRecipientName.trim() || currentUser?.username || 'User',
+      recipientEmail: trimmedEmail,
     });
-    setWaSavedMsg('WhatsApp alert settings saved & synced.');
-    setTimeout(() => setWaSavedMsg(''), 3000);
+    setEmailSavedMsg('Daily email alert settings saved & synced.');
+    setTimeout(() => setEmailSavedMsg(''), 3000);
   };
 
   const handleSendTestAlert = async () => {
-    setWaErrorMsg('');
-    setWaTesting(true);
+    setEmailErrorMsg('');
+    setEmailTesting(true);
     try {
-      await onTriggerTestWhatsApp();
+      await onTriggerTestEmail();
     } finally {
-      setWaTesting(false);
+      setEmailTesting(false);
     }
   };
 
@@ -242,10 +251,10 @@ export function SettingsTab({
         firmName: firmName.trim() || 'Corporate Tender Desk',
         gstin: gstin.trim(),
         udyamNumber: udyamNumber.trim(),
-        adminName: adminName.trim() || 'Vansh Saxena',
+        adminName: adminName.trim() || currentUser?.username || 'Tender Desk User',
         adminPhotoUrl: dataUrl,
       });
-      setProfileSavedMsg('Admin photo compressed and saved.');
+      setProfileSavedMsg('Profile photo compressed and saved.');
       setTimeout(() => setProfileSavedMsg(''), 3000);
     } catch (err) {
       setPhotoError(
@@ -261,10 +270,10 @@ export function SettingsTab({
       firmName: firmName.trim() || 'Corporate Tender Desk',
       gstin: gstin.trim(),
       udyamNumber: udyamNumber.trim(),
-      adminName: adminName.trim() || 'Vansh Saxena',
+      adminName: adminName.trim() || currentUser?.username || 'Tender Desk User',
       adminPhotoUrl: '',
     });
-    setProfileSavedMsg('Admin photo removed.');
+    setProfileSavedMsg('Profile photo removed.');
     setTimeout(() => setProfileSavedMsg(''), 3000);
   };
 
@@ -274,7 +283,7 @@ export function SettingsTab({
       firmName: firmName.trim() || 'Corporate Tender Desk',
       gstin: gstin.trim(),
       udyamNumber: udyamNumber.trim(),
-      adminName: adminName.trim() || 'Vansh Saxena',
+      adminName: adminName.trim() || currentUser?.username || 'Tender Desk User',
       adminPhotoUrl,
     });
     setProfileSavedMsg('Firm profile updated and persisted.');
@@ -792,9 +801,29 @@ export function SettingsTab({
 
           <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 p-4 space-y-3 text-xs">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-500 dark:text-slate-400">Authorized CRM Username</span>
+              <span className="text-slate-500 dark:text-slate-400">Authorized CRM User ID</span>
               <span className="font-mono-num font-semibold text-slate-900 dark:text-slate-100">
-                VanshSales
+                {currentUser?.username || 'User'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-slate-500 dark:text-slate-400">Account Role &amp; Workspace</span>
+              <span
+                className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+                  currentUser?.role === 'secondary'
+                    ? 'bg-blue-50 dark:bg-blue-950/50 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
+                    : 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                }`}
+              >
+                {currentUser?.role === 'secondary'
+                  ? 'Secondary User (Isolated)'
+                  : 'Primary Admin'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-slate-500 dark:text-slate-400">Registered Gmail</span>
+              <span className="font-mono-num text-slate-700 dark:text-slate-300 truncate max-w-[200px]">
+                {currentUser?.email || '—'}
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
@@ -804,7 +833,9 @@ export function SettingsTab({
               </span>
             </div>
             <p className="text-slate-600 dark:text-slate-400 leading-relaxed pt-1">
-              Session access is kept strictly in memory (zero browser storage). Closing the CRM tab or clicking Log Out immediately requires signing in again on the Vansh Tender Software login screen.
+              {currentUser?.role === 'secondary'
+                ? 'Your secondary CRM workspace is completely isolated from the Primary Admin tenders, files, emails, and Google Sheet.'
+                : 'Session access is kept strictly in memory (zero browser storage). Closing the CRM tab or clicking Log Out immediately requires signing in again on the login screen.'}
             </p>
           </div>
         </div>
@@ -821,107 +852,192 @@ export function SettingsTab({
         </div>
       </section>
 
-      {/* WhatsApp Tender Alert Dispatch (2-Milestone Notifications) */}
+      {/* Admin-Only Secondary Users Directory */}
+      {currentUser?.role === 'admin' && (
+        <section
+          data-testid="admin-secondary-users-section"
+          className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
+            <div className="flex items-center gap-2.5">
+              <Users
+                className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400"
+                aria-hidden="true"
+              />
+              <div>
+                <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                  Secondary Users ({secondaryUsers.length})
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Self-registered secondary CRM accounts. Each user operates in an isolated workspace with their own tenders, email alerts, and Google Sheet.
+                </p>
+              </div>
+            </div>
+
+            {onRefreshSecondaryUsers && (
+              <button
+                type="button"
+                onClick={onRefreshSecondaryUsers}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200"
+              >
+                <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Refresh List</span>
+              </button>
+            )}
+          </div>
+
+          {secondaryUsers.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 px-4 py-6 text-center text-xs text-slate-500 dark:text-slate-400">
+              No secondary users have registered yet. New users can self-register via &ldquo;Create New User&rdquo; on the Login screen using Gmail OTP verification.
+            </div>
+          ) : (
+            <div className="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead className="bg-slate-50 dark:bg-slate-800/90 text-[11px] uppercase tracking-wider text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-700">
+                  <tr>
+                    <th className="py-2.5 px-3 font-semibold">User ID</th>
+                    <th className="py-2.5 px-3 font-semibold">Attached Gmail</th>
+                    <th className="py-2.5 px-3 font-semibold">Role</th>
+                    <th className="py-2.5 px-3 font-semibold">Registered On</th>
+                    <th className="py-2.5 px-3 font-semibold">Last Login</th>
+                    <th className="py-2.5 px-3 font-semibold">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {secondaryUsers.map((sec) => (
+                    <tr key={sec.userId} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                      <td className="py-2.5 px-3 font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                        {sec.username}
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                        {sec.email}
+                      </td>
+                      <td className="py-2.5 px-3 whitespace-nowrap">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 font-medium text-[11px]">
+                          Secondary
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                        {sec.createdAt ? new Date(sec.createdAt).toLocaleString('en-IN') : '—'}
+                      </td>
+                      <td className="py-2.5 px-3 font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                        {sec.lastLoginAt ? new Date(sec.lastLoginAt).toLocaleString('en-IN') : 'Never logged in yet'}
+                      </td>
+                      <td className="py-2.5 px-3 whitespace-nowrap">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 font-medium text-[11px]">
+                          {sec.isActive ? 'Active' : 'Inactive'}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Daily Email Tender Alerts (5-Day Window · 11:00 AM & 4:00 PM IST) */}
       <section className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
           <div className="flex items-center gap-2.5">
-            <MessageCircle
-              className="h-5 w-5 text-emerald-600 dark:text-emerald-400"
+            <Mail
+              className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400"
               aria-hidden="true"
             />
             <div>
               <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
-                WhatsApp Tender Alert Dispatch ({waName.trim() || 'Vansh'} · {waPhone.trim() || '9717690890'})
+                Daily Email Tender Alerts ({emailRecipientName.trim() || currentUser?.username || 'Recipient'} · {emailAddress.trim() || currentUser?.email || 'No email configured'})
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Sends complete tender details &amp; filing deadline twice per alert tender: (1) on Alerts entry (&le;48h), and (2) 4 hours before deadline
+                Automatically emails tenders due within 5 days twice daily at 11:00 AM IST &amp; 4:00 PM IST
               </p>
             </div>
           </div>
 
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-medium ${
-              whatsappGatewayInfo.automatedConfigured
+              emailGatewayInfo.automatedConfigured
                 ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
                 : 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300'
             }`}
           >
-            {whatsappGatewayInfo.automatedConfigured
-              ? `Automated Gateway: ${whatsappGatewayInfo.provider.toUpperCase()}`
-              : 'Manual WhatsApp Link Mode (Configure Meta/Twilio/Webhook in .env)'}
+            {emailGatewayInfo.automatedConfigured
+              ? `Automated Email Gateway: ${emailGatewayInfo.provider.toUpperCase()}`
+              : 'SMTP / Resend Gateway Not Configured in .env'}
           </span>
         </div>
 
-        <form onSubmit={handleSaveWhatsAppForm} className="space-y-4">
+        <form onSubmit={handleSaveEmailForm} className="space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
             <div>
               <label
-                htmlFor="wa-recipient-name"
+                htmlFor="email-recipient-name"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
                 Recipient Name
               </label>
               <input
-                id="wa-recipient-name"
+                id="email-recipient-name"
                 type="text"
                 required
-                value={waName}
-                onChange={(e) => setWaName(e.target.value)}
+                value={emailRecipientName}
+                onChange={(e) => setEmailRecipientName(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
               />
             </div>
 
             <div>
               <label
-                htmlFor="wa-recipient-phone"
+                htmlFor="email-recipient-address"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                WhatsApp Mobile Number
+                Notification Email Address
               </label>
               <input
-                id="wa-recipient-phone"
-                type="tel"
+                id="email-recipient-address"
+                type="email"
                 required
-                value={waPhone}
-                onChange={(e) => setWaPhone(e.target.value)}
-                placeholder="9717690890"
-                className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                value={emailAddress}
+                onChange={(e) => setEmailAddress(e.target.value)}
+                placeholder={currentUser?.email || 'yourname@gmail.com'}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
               />
             </div>
 
             <div className="flex items-center justify-between rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 px-3.5 py-2">
               <label
-                htmlFor="wa-auto-dispatch"
+                htmlFor="email-auto-dispatch"
                 className="text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer select-none"
               >
-                Auto-Dispatch on Milestones
+                Auto-Send at 11 AM &amp; 4 PM IST
               </label>
               <input
-                id="wa-auto-dispatch"
+                id="email-auto-dispatch"
                 type="checkbox"
-                checked={waEnabled}
-                onChange={(e) => setWaEnabled(e.target.checked)}
-                className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-600 cursor-pointer"
+                checked={emailEnabled}
+                onChange={(e) => setEmailEnabled(e.target.checked)}
+                className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-600 cursor-pointer"
               />
             </div>
           </div>
 
-          {waErrorMsg && (
+          {emailErrorMsg && (
             <p role="alert" className="text-xs text-red-600 dark:text-red-400">
-              {waErrorMsg}
+              {emailErrorMsg}
             </p>
           )}
 
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="text-xs text-slate-500 dark:text-slate-400">
-              {waSavedMsg ? (
+              {emailSavedMsg ? (
                 <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-400">
                   <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-                  {waSavedMsg}
+                  {emailSavedMsg}
                 </span>
               ) : (
                 <span>
-                  Normalized WhatsApp Target: +{normalizeIndianWhatsAppPhone(waPhone || '9717690890')}
+                  Daily Schedule: 11:00 AM IST &amp; 4:00 PM IST &rarr; {emailAddress.trim() || currentUser?.email || 'Configure notification email above'}
                 </span>
               )}
             </div>
@@ -930,44 +1046,44 @@ export function SettingsTab({
               <button
                 type="button"
                 onClick={() => void handleSendTestAlert()}
-                disabled={waTesting}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 disabled:opacity-60 text-emerald-800 dark:text-emerald-300 text-xs font-medium cursor-pointer"
+                disabled={emailTesting}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 disabled:opacity-60 text-blue-800 dark:text-blue-300 text-xs font-medium cursor-pointer"
               >
                 <Send className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>{waTesting ? 'Sending Test...' : 'Send Test WhatsApp Alert'}</span>
+                <span>{emailTesting ? 'Sending Test...' : 'Send Test Email Alert'}</span>
               </button>
 
               <button
                 type="submit"
                 className="px-4 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium cursor-pointer"
               >
-                Save WhatsApp Settings
+                Save Email Alert Settings
               </button>
             </div>
           </div>
         </form>
 
-        {/* Milestone Dispatch History */}
+        {/* Email Reminder Dispatch Log */}
         <div className="space-y-2.5 pt-2">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
-              Milestone Dispatch Log ({whatsappLogs.length})
+              Email Reminder Dispatch Log ({emailLogs.length})
             </h3>
             <span className="text-[11px] text-slate-500 dark:text-slate-400">
-              Deduplicated by Tender + Due Date + Milestone (48h Entry &amp; 4h Urgent)
+              Deduplicated by Tender + IST Date + Slot (11 AM / 4 PM IST · &le;5 Days Window)
             </span>
           </div>
 
-          {whatsappLogs.length === 0 ? (
+          {emailLogs.length === 0 ? (
             <div className="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 px-4 py-6 text-center text-xs text-slate-500 dark:text-slate-400">
-              No WhatsApp tender alerts dispatched yet. Active pre-submission tenders due within 48 hours automatically generate 1st Alert Entry &amp; 2nd Final 4h Urgent dispatches here.
+              No email tender alerts dispatched yet. Active pre-submission tenders due within 5 days automatically send email reminders at 11:00 AM IST &amp; 4:00 PM IST.
             </div>
           ) : (
             <div className="overflow-x-auto max-h-72 overflow-y-auto rounded-lg border border-slate-200 dark:border-slate-800">
               <table className="w-full text-left border-collapse text-xs">
                 <thead className="sticky top-0 bg-slate-50 dark:bg-slate-800/90 text-[11px] uppercase tracking-wider text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-700">
                   <tr>
-                    <th className="py-2.5 px-3 font-semibold">Milestone</th>
+                    <th className="py-2.5 px-3 font-semibold">Schedule Slot</th>
                     <th className="py-2.5 px-3 font-semibold">Tender ID &amp; Filing Due</th>
                     <th className="py-2.5 px-3 font-semibold">Recipient</th>
                     <th className="py-2.5 px-3 font-semibold">Status</th>
@@ -976,23 +1092,19 @@ export function SettingsTab({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-                  {whatsappLogs.map((log) => (
+                  {emailLogs.map((log) => (
                     <tr key={log.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         <span
                           className={`inline-flex items-center px-2 py-0.5 rounded font-medium text-[11px] ${
-                            log.milestone === 'urgent_4h'
-                              ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
-                              : log.milestone === 'test'
-                                ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
-                                : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                            log.slot === 'slot_4pm'
+                              ? 'bg-indigo-100 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300'
+                              : log.slot === 'slot_11am'
+                                ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                                : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
                           }`}
                         >
-                          {log.milestone === 'urgent_4h'
-                            ? '2/2 · Final 4h Urgent'
-                            : log.milestone === 'test'
-                              ? 'Test Dispatch'
-                              : '1/2 · Alert Entry (48h)'}
+                          {formatSlotLabel(log.slot)}
                         </span>
                       </td>
                       <td className="py-2.5 px-3">
@@ -1009,8 +1121,8 @@ export function SettingsTab({
                         <p className="font-medium text-slate-800 dark:text-slate-200">
                           {log.recipientName}
                         </p>
-                        <p className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400">
-                          +{log.recipientPhone}
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {log.recipientEmail}
                         </p>
                       </td>
                       <td className="py-2.5 px-3 whitespace-nowrap">
@@ -1018,41 +1130,26 @@ export function SettingsTab({
                           className={`inline-flex items-center px-2 py-0.5 rounded font-medium text-[11px] ${
                             log.status === 'sent'
                               ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
-                              : log.status === 'failed'
-                                ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
-                                : 'bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300'
+                              : 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
                           }`}
                         >
                           {log.status === 'sent'
-                            ? 'Sent via Gateway'
-                            : log.status === 'failed'
-                              ? 'Gateway Failed'
-                              : 'Ready for WhatsApp'}
+                            ? `Sent (${log.provider.toUpperCase()})`
+                            : 'Delivery Failed'}
                         </span>
                       </td>
                       <td className="py-2.5 px-3 whitespace-nowrap text-slate-600 dark:text-slate-400">
                         {new Date(log.createdAt).toLocaleString('en-IN')}
                       </td>
                       <td className="py-2.5 px-3 whitespace-nowrap text-right">
-                        <div className="inline-flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => void handleCopyMessage(log.id, log.message)}
-                            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200"
-                          >
-                            <Copy className="h-3 w-3" aria-hidden="true" />
-                            <span>{copiedLogId === log.id ? 'Copied' : 'Copy'}</span>
-                          </button>
-                          <a
-                            href={buildWhatsAppWebUrl(log.recipientPhone, log.message)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-medium"
-                          >
-                            <span>Open WhatsApp</span>
-                            <ExternalLink className="h-3 w-3" aria-hidden="true" />
-                          </a>
-                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyMessage(log.id, log.message)}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200"
+                        >
+                          <Copy className="h-3 w-3" aria-hidden="true" />
+                          <span>{copiedLogId === log.id ? 'Copied' : 'Copy Body'}</span>
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -1313,7 +1410,9 @@ export function SettingsTab({
           <Database className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
           <div>
             <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
-              Data Backup, CSV Reports & Demo Reset
+              {currentUser?.role === 'admin'
+                ? 'Data Backup, CSV Reports & Demo Reset'
+                : 'Data Backup & CSV Reports'}
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
               All data, preferences, and attachments persist exclusively via Firebase Firestore · Export CSV or JSON snapshots anytime
@@ -1371,14 +1470,16 @@ export function SettingsTab({
           </button>
 
           <div className="ml-auto flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={() => setConfirmAction('reset')}
-              className="flex items-center gap-2 px-4 py-2.5 rounded-lg border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40 text-xs font-medium"
-            >
-              <RotateCcw className="h-4 w-4" aria-hidden="true" />
-              <span>Reset Demo Data</span>
-            </button>
+            {currentUser?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={() => setConfirmAction('reset')}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-lg border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40 text-xs font-medium"
+              >
+                <RotateCcw className="h-4 w-4" aria-hidden="true" />
+                <span>Reset Demo Data</span>
+              </button>
+            )}
 
             <button
               type="button"

@@ -49,6 +49,11 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(userId)).data.ownerUid == userId;
     }
 
+    function hasValidWorkspace(userId, tenantId) {
+      return exists(/databases/$(database)/documents/users/$(userId)/workspaces/$(tenantId)) &&
+        get(/databases/$(database)/documents/users/$(userId)/workspaces/$(tenantId)).data.ownerUid == userId;
+    }
+
     function isValidPortal(portal) {
       return portal in ['GeM', 'CPPP / eProcure', 'State Portal', 'PSU / Direct', 'Private'];
     }
@@ -99,12 +104,12 @@ service cloud.firestore {
       return status in ['Refunded / Released', 'Forfeited'];
     }
 
-    function isValidWhatsAppMilestone(milestone) {
-      return milestone in ['alert_48h', 'urgent_4h', 'test'];
+    function isValidEmailSlot(slot) {
+      return slot in ['slot_11am', 'slot_4pm', 'manual', 'test'];
     }
 
-    function isValidWhatsAppStatus(status) {
-      return status in ['sent', 'manual_ready', 'failed'];
+    function isValidEmailStatus(status) {
+      return status in ['sent', 'failed'];
     }
 
     // -------------------------------------------------------------------------
@@ -489,12 +494,12 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
-    function isValidWhatsAppConfig(data, userId) {
+    function isValidEmailConfig(data, userId) {
       return data.keys().hasAll([
           'ownerUid',
           'enabled',
           'recipientName',
-          'recipientPhone',
+          'recipientEmail',
           'createdAt',
           'updatedAt'
         ]) &&
@@ -502,7 +507,7 @@ service cloud.firestore {
           'ownerUid',
           'enabled',
           'recipientName',
-          'recipientPhone',
+          'recipientEmail',
           'createdAt',
           'updatedAt'
         ]) &&
@@ -513,26 +518,27 @@ service cloud.firestore {
         data.recipientName is string &&
         data.recipientName.size() >= 1 &&
         data.recipientName.size() <= 100 &&
-        data.recipientPhone is string &&
-        data.recipientPhone.size() >= 10 &&
-        data.recipientPhone.size() <= 20 &&
+        data.recipientEmail is string &&
+        data.recipientEmail.size() >= 5 &&
+        data.recipientEmail.size() <= 160 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
 
-    function isValidWhatsAppAlertLog(data, userId, alertId) {
+    function isValidEmailAlertLog(data, userId, alertId) {
       return data.keys().hasAll([
           'ownerUid',
           'id',
-          'milestoneKey',
+          'slotKey',
           'tenderRefId',
           'tenderId',
-          'milestone',
+          'slot',
           'recipientName',
-          'recipientPhone',
+          'recipientEmail',
           'dueDateIso',
           'status',
           'provider',
+          'subject',
           'message',
           'clientCreatedAt',
           'createdAt',
@@ -541,15 +547,16 @@ service cloud.firestore {
         data.keys().hasOnly([
           'ownerUid',
           'id',
-          'milestoneKey',
+          'slotKey',
           'tenderRefId',
           'tenderId',
-          'milestone',
+          'slot',
           'recipientName',
-          'recipientPhone',
+          'recipientEmail',
           'dueDateIso',
           'status',
           'provider',
+          'subject',
           'message',
           'clientCreatedAt',
           'createdAt',
@@ -560,30 +567,32 @@ service cloud.firestore {
         data.ownerUid == request.auth.uid &&
         isValidId(data.id) &&
         data.id == alertId &&
-        data.milestoneKey is string &&
-        data.milestoneKey.size() >= 1 &&
-        data.milestoneKey.size() <= 150 &&
+        data.slotKey is string &&
+        data.slotKey.size() >= 1 &&
+        data.slotKey.size() <= 150 &&
         data.tenderRefId is string &&
         data.tenderRefId.size() <= 128 &&
         data.tenderId is string &&
         data.tenderId.size() >= 1 &&
         data.tenderId.size() <= 120 &&
-        data.milestone is string &&
-        data.milestone.size() <= 24 &&
-        isValidWhatsAppMilestone(data.milestone) &&
+        data.slot is string &&
+        data.slot.size() <= 24 &&
+        isValidEmailSlot(data.slot) &&
         data.recipientName is string &&
         data.recipientName.size() <= 100 &&
-        data.recipientPhone is string &&
-        data.recipientPhone.size() <= 24 &&
+        data.recipientEmail is string &&
+        data.recipientEmail.size() <= 160 &&
         data.dueDateIso is string &&
         data.dueDateIso.size() <= 40 &&
         data.status is string &&
         data.status.size() <= 24 &&
-        isValidWhatsAppStatus(data.status) &&
+        isValidEmailStatus(data.status) &&
         data.provider is string &&
         data.provider.size() <= 40 &&
+        data.subject is string &&
+        data.subject.size() <= 240 &&
         data.message is string &&
-        data.message.size() <= 3000 &&
+        data.message.size() <= 4000 &&
         data.clientCreatedAt is string &&
         data.clientCreatedAt.size() <= 40 &&
         data.createdAt is timestamp &&
@@ -621,6 +630,81 @@ service cloud.firestore {
         data.sheetName.size() <= 120 &&
         data.lastSyncedAt is string &&
         data.lastSyncedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSecondaryUserRecord(data, secondaryUserId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'userId',
+          'username',
+          'email',
+          'role',
+          'isActive',
+          'clientCreatedAt',
+          'clientLastLoginAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'userId',
+          'username',
+          'email',
+          'role',
+          'isActive',
+          'clientCreatedAt',
+          'clientLastLoginAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        isValidId(data.userId) &&
+        data.userId == secondaryUserId &&
+        data.username is string &&
+        data.username.size() >= 1 &&
+        data.username.size() <= 64 &&
+        data.email is string &&
+        data.email.size() >= 5 &&
+        data.email.size() <= 160 &&
+        data.role == 'secondary' &&
+        data.isActive is bool &&
+        data.clientCreatedAt is string &&
+        data.clientCreatedAt.size() <= 40 &&
+        data.clientLastLoginAt is string &&
+        data.clientLastLoginAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWorkspaceRoot(data, userId, tenantId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'tenantId',
+          'username',
+          'email',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'tenantId',
+          'username',
+          'email',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        isValidId(data.tenantId) &&
+        data.tenantId == tenantId &&
+        data.username is string &&
+        data.username.size() >= 1 &&
+        data.username.size() <= 64 &&
+        data.email is string &&
+        data.email.size() <= 160 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -1009,7 +1093,7 @@ service cloud.firestore {
           hasValidParentUser(userId);
       }
 
-      match /whatsappConfig/{configId} {
+      match /emailConfig/{configId} {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
@@ -1023,7 +1107,7 @@ service cloud.firestore {
           isValidId(configId) &&
           configId == 'default' &&
           isOwner(userId) &&
-          isValidWhatsAppConfig(incoming(), userId) &&
+          isValidEmailConfig(incoming(), userId) &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
           hasValidParentUser(userId);
@@ -1031,7 +1115,7 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(configId) &&
           configId == 'default' &&
-          isValidWhatsAppConfig(incoming(), userId) &&
+          isValidEmailConfig(incoming(), userId) &&
           (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
           (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
@@ -1042,7 +1126,7 @@ service cloud.firestore {
                 'ownerUid',
                 'enabled',
                 'recipientName',
-                'recipientPhone',
+                'recipientEmail',
                 'createdAt',
                 'updatedAt'
               ])
@@ -1057,7 +1141,7 @@ service cloud.firestore {
           hasValidParentUser(userId);
       }
 
-      match /whatsappAlerts/{alertId} {
+      match /emailAlerts/{alertId} {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(alertId) &&
@@ -1070,14 +1154,14 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(alertId) &&
           isOwner(userId) &&
-          isValidWhatsAppAlertLog(incoming(), userId, alertId) &&
+          isValidEmailAlertLog(incoming(), userId, alertId) &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
           hasValidParentUser(userId);
         allow update: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(alertId) &&
-          isValidWhatsAppAlertLog(incoming(), userId, alertId) &&
+          isValidEmailAlertLog(incoming(), userId, alertId) &&
           (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
           (!('id' in existing()) || incoming().id == existing().id) &&
           (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
@@ -1149,6 +1233,565 @@ service cloud.firestore {
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
       }
+
+      match /workspaces/{tenantId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(tenantId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          request.auth.uid == userId &&
+          resource.data.ownerUid == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(tenantId) &&
+          isOwner(userId) &&
+          isValidWorkspaceRoot(incoming(), userId, tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(tenantId) &&
+          isValidWorkspaceRoot(incoming(), userId, tenantId) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().tenantId == existing().tenantId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['username', 'email', 'updatedAt'])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(tenantId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+
+        match /profile/{profileId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(profileId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(profileId) &&
+            profileId == 'firm' &&
+            isOwner(userId) &&
+            isValidFirmProfile(incoming(), userId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(profileId) &&
+            profileId == 'firm' &&
+            isValidFirmProfile(incoming(), userId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'firmName',
+                  'gstin',
+                  'udyamNumber',
+                  'adminName',
+                  'adminPhotoUrl',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(profileId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /settings/{settingId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(settingId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(settingId) &&
+            settingId == 'preferences' &&
+            isOwner(userId) &&
+            isValidUserPreferences(incoming(), userId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(settingId) &&
+            settingId == 'preferences' &&
+            isValidUserPreferences(incoming(), userId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'adminPin',
+                  'darkMode',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(settingId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /attachmentFiles/{attachmentId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(attachmentId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(attachmentId) &&
+            isOwner(userId) &&
+            isValidAttachmentFile(incoming(), userId, attachmentId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(attachmentId) &&
+            isValidAttachmentFile(incoming(), userId, attachmentId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().id == existing().id &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'fileName',
+                  'fileType',
+                  'fileSize',
+                  'dataUrl',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(attachmentId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /tenders/{tenderDocId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(tenderDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(tenderDocId) &&
+            isOwner(userId) &&
+            isValidTender(incoming(), userId, tenderDocId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(tenderDocId) &&
+            isValidTender(incoming(), userId, tenderDocId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().id == existing().id &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                !isTerminalTenderStage(existing().stage) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'tenderId',
+                  'portal',
+                  'department',
+                  'location',
+                  'category',
+                  'title',
+                  'publishDate',
+                  'submissionDueDate',
+                  'preBidDate',
+                  'estimatedValue',
+                  'quotedValue',
+                  'emdStatus',
+                  'emdAmount',
+                  'stage',
+                  'resultInfo',
+                  'completionDate',
+                  'checklist',
+                  'remarks',
+                  'attachments',
+                  'clientUpdatedAt',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(tenderDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /emdRecords/{emdDocId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(emdDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(emdDocId) &&
+            isOwner(userId) &&
+            isValidEmdRecord(incoming(), userId, emdDocId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(emdDocId) &&
+            isValidEmdRecord(incoming(), userId, emdDocId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().id == existing().id &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                !isTerminalFinancialStatus(existing().status) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'tenderRefId',
+                  'tenderId',
+                  'department',
+                  'instrumentType',
+                  'referenceNo',
+                  'bankName',
+                  'amount',
+                  'issueDate',
+                  'expiryDate',
+                  'claimEndDate',
+                  'status',
+                  'refundDate',
+                  'refundRef',
+                  'remarks',
+                  'attachments',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(emdDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /maf_tracker/{mafDocId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(mafDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(mafDocId) &&
+            isOwner(userId) &&
+            isValidMafTracker(incoming(), userId, mafDocId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(mafDocId) &&
+            isValidMafTracker(incoming(), userId, mafDocId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().id == existing().id &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'tenderRefId',
+                  'tenderId',
+                  'tenderTitle',
+                  'department',
+                  'tenderDueDate',
+                  'itemsMAF',
+                  'clientUpdatedAt',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(mafDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /emailConfig/{configId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            configId == 'default' &&
+            isOwner(userId) &&
+            isValidEmailConfig(incoming(), userId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            configId == 'default' &&
+            isValidEmailConfig(incoming(), userId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'enabled',
+                  'recipientName',
+                  'recipientEmail',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /emailAlerts/{alertId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(alertId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(alertId) &&
+            isOwner(userId) &&
+            isValidEmailAlertLog(incoming(), userId, alertId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(alertId) &&
+            isValidEmailAlertLog(incoming(), userId, alertId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().id == existing().id &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'status',
+                  'provider',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(alertId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /sheetConfig/{configId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            configId == 'default' &&
+            isOwner(userId) &&
+            isValidSheetConfig(incoming(), userId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            configId == 'default' &&
+            isValidSheetConfig(incoming(), userId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'enabled',
+                  'webhookUrl',
+                  'sheetName',
+                  'lastSyncedAt',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(configId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+      }
+    }
+
+    match /secondaryUsers/{secondaryUserId} {
+      allow get: if isVerifiedUser() &&
+        isValidId(secondaryUserId) &&
+        (isAdmin() || existing().ownerUid == request.auth.uid);
+      allow list: if isVerifiedUser() &&
+        (isAdmin() || resource.data.ownerUid == request.auth.uid);
+      allow create: if isVerifiedUser() &&
+        isValidId(secondaryUserId) &&
+        isValidSecondaryUserRecord(incoming(), secondaryUserId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser() &&
+        isValidId(secondaryUserId) &&
+        isValidSecondaryUserRecord(incoming(), secondaryUserId) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            existing().ownerUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'username',
+              'email',
+              'isActive',
+              'clientLastLoginAt',
+              'updatedAt'
+            ])
+          ) ||
+          isAdmin()
+        );
+      allow delete: if isVerifiedUser() &&
+        isValidId(secondaryUserId) &&
+        isAdmin();
     }
   }
 }

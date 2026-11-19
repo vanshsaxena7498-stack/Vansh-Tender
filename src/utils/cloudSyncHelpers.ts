@@ -1,5 +1,7 @@
 import type {
   AttachmentItem,
+  EmailAlertLog,
+  EmailAlertSettings,
   EmdBgRecord,
   FirmProfile,
   GoogleSheetSettings,
@@ -7,9 +9,8 @@ import type {
   MafTrackerRecord,
   Tender,
   UserPreferences,
-  WhatsAppAlertLog,
-  WhatsAppSettings,
 } from '../types/crm';
+import { isSafeHttpUrl } from './mafCalculations';
 
 export const CLOUD_LIMITS = {
   ID_MAX: 128,
@@ -63,7 +64,15 @@ export function sanitizeDocId(rawId: string): string {
 
 export function sanitizePhotoForCloud(photoUrl: string | undefined): string {
   if (!photoUrl || typeof photoUrl !== 'string') return '';
-  return photoUrl.length <= CLOUD_LIMITS.PHOTO_URL_MAX ? photoUrl : '';
+  const trimmed = photoUrl.trim();
+  if (trimmed.length > CLOUD_LIMITS.PHOTO_URL_MAX) return '';
+  if (
+    isSafeHttpUrl(trimmed) ||
+    /^data:image\/(?:png|jpeg|jpg|webp|gif);base64,[a-zA-Z0-9+/=]+$/i.test(trimmed)
+  ) {
+    return trimmed;
+  }
+  return '';
 }
 
 /**
@@ -131,7 +140,7 @@ export function buildCloudProfilePayload<TTime>(
     firmName: clampStr(profile.firmName.trim() || 'Corporate Tender Desk', CLOUD_LIMITS.FIRM_NAME_MAX),
     gstin: clampStr(profile.gstin, CLOUD_LIMITS.GSTIN_MAX),
     udyamNumber: clampStr(profile.udyamNumber, CLOUD_LIMITS.UDYAM_MAX),
-    adminName: clampStr(profile.adminName.trim() || 'Vansh Saxena', CLOUD_LIMITS.ADMIN_NAME_MAX),
+    adminName: clampStr(profile.adminName.trim() || 'Tender Desk User', CLOUD_LIMITS.ADMIN_NAME_MAX),
     adminPhotoUrl: sanitizePhotoForCloud(profile.adminPhotoUrl),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
@@ -283,7 +292,7 @@ export function mergeCloudEmdWithFiles(
 
 export function sanitizeMafLineItemForCloud(item: MafLineItem): MafLineItem {
   const rawUrl = typeof item.mafDocumentUrl === 'string' ? item.mafDocumentUrl.trim() : '';
-  const safeUrl = rawUrl.startsWith('data:') ? '' : clampStr(rawUrl, CLOUD_LIMITS.MAF_URL_MAX);
+  const safeUrl = isSafeHttpUrl(rawUrl) ? clampStr(rawUrl, CLOUD_LIMITS.MAF_URL_MAX) : '';
   const concernedPersonName = clampStr(item.concernedPersonName, CLOUD_LIMITS.MAF_PERSON_NAME_MAX);
   const contactNo = clampStr(item.contactNo, CLOUD_LIMITS.MAF_PHONE_MAX);
   const mailId = clampStr(item.mailId, CLOUD_LIMITS.MAF_EMAIL_MAX);
@@ -370,8 +379,8 @@ export function mergeCloudMafTrackersWithFiles(
   });
 }
 
-export function buildCloudWhatsAppConfigPayload<TTime>(
-  config: WhatsAppSettings,
+export function buildCloudEmailConfigPayload<TTime>(
+  config: EmailAlertSettings,
   ownerUid: string,
   serverTimeToken: TTime,
   existingCreatedAt?: unknown,
@@ -379,15 +388,15 @@ export function buildCloudWhatsAppConfigPayload<TTime>(
   return {
     ownerUid: sanitizeDocId(ownerUid),
     enabled: Boolean(config.enabled),
-    recipientName: clampStr(config.recipientName.trim() || 'Vansh', 100),
-    recipientPhone: clampStr(config.recipientPhone.trim() || '9717690890', 20),
+    recipientName: clampStr(config.recipientName.trim() || 'Alert Recipient', 100),
+    recipientEmail: clampStr(config.recipientEmail.trim() || 'alerts@example.com', 160),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
   };
 }
 
-export function buildCloudWhatsAppAlertLogPayload<TTime>(
-  log: WhatsAppAlertLog,
+export function buildCloudEmailAlertLogPayload<TTime>(
+  log: EmailAlertLog,
   ownerUid: string,
   serverTimeToken: TTime,
   existingCreatedAt?: unknown,
@@ -396,16 +405,17 @@ export function buildCloudWhatsAppAlertLogPayload<TTime>(
   return {
     ownerUid: sanitizeDocId(ownerUid),
     id: safeId,
-    milestoneKey: clampStr(log.milestoneKey || safeId, 150),
+    slotKey: clampStr(log.slotKey || safeId, 150),
     tenderRefId: clampStr(log.tenderRefId, 128),
     tenderId: clampStr(log.tenderId || safeId, 120),
-    milestone: log.milestone,
-    recipientName: clampStr(log.recipientName || 'Vansh', 100),
-    recipientPhone: clampStr(log.recipientPhone || '919717690890', 24),
+    slot: log.slot,
+    recipientName: clampStr(log.recipientName || 'Alert Recipient', 100),
+    recipientEmail: clampStr(log.recipientEmail || 'alerts@example.com', 160),
     dueDateIso: clampStr(log.dueDateIso, 40),
     status: log.status,
-    provider: clampStr(log.provider || 'manual_ready', 40),
-    message: clampStr(log.message, 3000),
+    provider: clampStr(log.provider || 'smtp', 40),
+    subject: clampStr(log.subject || 'Tender Alert Notification', 240),
+    message: clampStr(log.message, 4000),
     clientCreatedAt: clampStr(log.createdAt || new Date().toISOString(), 40),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
@@ -431,5 +441,51 @@ export function buildCloudSheetConfigPayload<TTime>(
   };
 }
 
+export function buildWorkspaceRootPayload<TTime>(
+  params: {
+    ownerUid: string;
+    tenantId: string;
+    username: string;
+    email: string;
+  },
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  return {
+    ownerUid: sanitizeDocId(params.ownerUid),
+    tenantId: sanitizeDocId(params.tenantId),
+    username: clampStr(params.username.trim() || 'User', 64),
+    email: clampStr(params.email.trim().toLowerCase(), 160),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
 
+export function buildSecondaryUserCloudPayload<TTime>(
+  params: {
+    ownerUid: string;
+    userId: string;
+    username: string;
+    email: string;
+    isActive?: boolean;
+    createdAtIso?: string;
+    lastLoginAtIso?: string;
+  },
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  const safeEmail = params.email.trim().toLowerCase();
+  return {
+    ownerUid: sanitizeDocId(params.ownerUid),
+    userId: sanitizeDocId(params.userId),
+    username: clampStr(params.username.trim() || 'User', 64),
+    email: clampStr(safeEmail.length >= 5 ? safeEmail : 'user@example.com', 160),
+    role: 'secondary',
+    isActive: params.isActive !== false,
+    clientCreatedAt: clampStr(params.createdAtIso || new Date().toISOString(), 40),
+    clientLastLoginAt: clampStr(params.lastLoginAtIso || '', 40),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
 

@@ -1,23 +1,23 @@
 import type {
+  EmailAlertLog,
+  EmailAlertSettings,
   EmdBgRecord,
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
   Tender,
   UserPreferences,
-  WhatsAppAlertLog,
-  WhatsAppSettings,
 } from '../types/crm';
 import {
   buildCloudAttachmentFilePayload,
+  buildCloudEmailAlertLogPayload,
+  buildCloudEmailConfigPayload,
   buildCloudEmdPayload,
   buildCloudMafTrackerPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudSheetConfigPayload,
   buildCloudTenderPayload,
-  buildCloudWhatsAppAlertLogPayload,
-  buildCloudWhatsAppConfigPayload,
   sanitizeDocId,
 } from './cloudSyncHelpers';
 
@@ -67,8 +67,8 @@ export interface EstimateCloudStorageInput {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
-  whatsappSettings: WhatsAppSettings;
-  whatsappLogs: WhatsAppAlertLog[];
+  emailSettings: EmailAlertSettings;
+  emailLogs: EmailAlertLog[];
   sheetSettings: GoogleSheetSettings;
   attachmentFiles?: ReadonlyMap<string, string>;
 }
@@ -222,9 +222,9 @@ export function estimateCloudStorageUsage(
     attachmentBytes += measureJsonBytes(payload);
   }
 
-  // 5. Profile, Preferences, WhatsApp Settings/Logs & Sheet Config
+  // 5. Profile, Preferences, Email Alert Settings/Logs & Sheet Config
   let systemBytes = 0;
-  let systemDocs = 5; // root user doc + profile + preferences + whatsappConfig + sheetConfig
+  let systemDocs = 5; // root user doc + profile + preferences + emailConfig + sheetConfig
 
   systemBytes += measureJsonBytes({
     ownerUid,
@@ -244,8 +244,8 @@ export function estimateCloudStorageUsage(
     ),
   );
   systemBytes += measureJsonBytes(
-    buildCloudWhatsAppConfigPayload(
-      input.whatsappSettings,
+    buildCloudEmailConfigPayload(
+      input.emailSettings,
       ownerUid,
       SAMPLE_ISO_TIMESTAMP,
       SAMPLE_ISO_TIMESTAMP,
@@ -260,10 +260,10 @@ export function estimateCloudStorageUsage(
     ),
   );
 
-  for (const log of input.whatsappLogs) {
+  for (const log of input.emailLogs) {
     systemDocs += 1;
     systemBytes += measureJsonBytes(
-      buildCloudWhatsAppAlertLogPayload(log, ownerUid, SAMPLE_ISO_TIMESTAMP, SAMPLE_ISO_TIMESTAMP),
+      buildCloudEmailAlertLogPayload(log, ownerUid, SAMPLE_ISO_TIMESTAMP, SAMPLE_ISO_TIMESTAMP),
     );
   }
 

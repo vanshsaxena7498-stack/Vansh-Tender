@@ -9,7 +9,10 @@ import {
   findMatchingDailyTender,
   getMafContactDetails,
   getMafRequestedDate,
+  isSafeHttpUrl,
+  isSafeMafDataUrl,
   resolveAndFilterMafTrackers,
+  sanitizeMafDocumentUrl,
   validateMafItemDraft,
   validateMafUploadFile,
 } from './mafCalculations';
@@ -256,5 +259,23 @@ test('resolveAndFilterMafTrackers matches Concerned Person Name, Contact No., an
       statusFilter: 'ALL',
     }).length,
     1,
+  );
+});
+
+test('URL safety helpers allow https/http and safe PDF/image data URIs while blocking XSS schemes', () => {
+  assert.equal(isSafeHttpUrl('https://drive.google.com/file/d/123'), true);
+  assert.equal(isSafeHttpUrl('http://intranet.local/maf.pdf'), true);
+  assert.equal(isSafeHttpUrl('javascript:alert(1)'), false);
+  assert.equal(isSafeHttpUrl('vbscript:msgbox(1)'), false);
+
+  assert.equal(isSafeMafDataUrl('data:application/pdf;base64,JVBERi0xLjQ='), true);
+  assert.equal(isSafeMafDataUrl('data:image/png;base64,iVBORw0KGgo='), true);
+  assert.equal(isSafeMafDataUrl('data:text/html;base64,PHNjcmlwdD4='), false);
+
+  assert.equal(sanitizeMafDocumentUrl('javascript:alert(document.cookie)'), '');
+  assert.equal(sanitizeMafDocumentUrl('data:text/html;base64,PHNjcmlwdD4='), '');
+  assert.equal(
+    sanitizeMafDocumentUrl(' https://example.com/signed-maf.pdf '),
+    'https://example.com/signed-maf.pdf',
   );
 });

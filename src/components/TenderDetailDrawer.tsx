@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import {
   Calculator,
   CheckSquare,
@@ -10,7 +10,12 @@ import {
 } from 'lucide-react';
 import type { EmdBgRecord, Tender, TenderStage } from '../types/crm';
 import { calculateBidQuote } from '../utils/calculations';
-import { formatDateTime, formatINR, formatShortDate } from '../utils/formatters';
+import {
+  formatDateTime,
+  formatINR,
+  formatShortDate,
+  getLocalDateInputValue,
+} from '../utils/formatters';
 import {
   buildInitialAttachmentSlots,
   extractSavedAttachments,
@@ -53,6 +58,7 @@ export function TenderDetailDrawer({
   onGoToEmdTab,
 }: TenderDetailDrawerProps) {
   const [newRemark, setNewRemark] = useState('');
+  const [resultInfoDraft, setResultInfoDraft] = useState(tender.resultInfo);
   const [baseCostInput, setBaseCostInput] = useState<string>(
     tender.quotedValue > 0
       ? String(Math.round(tender.quotedValue / 1.18))
@@ -61,6 +67,10 @@ export function TenderDetailDrawer({
   const [gstPct, setGstPct] = useState<number>(18);
   const [marginPct, setMarginPct] = useState<number>(12);
   const [confirmDelete, setConfirmDelete] = useState(false);
+
+  useEffect(() => {
+    setResultInfoDraft(tender.resultInfo);
+  }, [tender.id, tender.resultInfo]);
 
   const calcResult = calculateBidQuote(Number(baseCostInput) || 0, gstPct, marginPct);
 
@@ -96,7 +106,7 @@ export function TenderDetailDrawer({
     e.preventDefault();
     if (!newRemark.trim()) return;
     const now = new Date();
-    const stamp = `${now.toISOString().slice(0, 10)} ${now.toTimeString().slice(0, 5)}`;
+    const stamp = `${getLocalDateInputValue(now)} ${now.toTimeString().slice(0, 5)}`;
     const entry = {
       id: `rem-${Date.now()}`,
       timestamp: stamp,
@@ -306,8 +316,9 @@ export function TenderDetailDrawer({
                 <input
                   id="drawer-result-info"
                   type="text"
-                  defaultValue={tender.resultInfo}
-                  onBlur={(e) => handleResultBlur(e.target.value)}
+                  value={resultInfoDraft}
+                  onChange={(e) => setResultInfoDraft(e.target.value)}
+                  onBlur={() => handleResultBlur(resultInfoDraft)}
                   placeholder="Record L1 price or reason for loss..."
                   className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                 />

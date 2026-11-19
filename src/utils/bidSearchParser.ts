@@ -212,13 +212,50 @@ export function normalizePortal(rawPortal: unknown, tenderId = ''): PortalType {
   return 'GeM';
 }
 
+export function detectMsmeEmdExemption(
+  rawText: unknown,
+  opts?: { includeBareMse?: boolean },
+): boolean {
+  if (typeof rawText !== 'string') return false;
+  const text = rawText.trim();
+  if (!text) return false;
+
+  if (/\bmsme\b/i.test(text)) return true;
+  if (/\budyam\b|\buam\b/i.test(text)) return true;
+  if (/exempt(?:ed)?\s*[-–:]?\s*msme\/?startup/i.test(text)) return true;
+  if (/\bemd\b[^\n.]{0,40}\bexempt(?:ed|ion)?\b|\bexempt(?:ed|ion)?\b[^\n.]{0,40}\bemd\b/i.test(text)) {
+    return true;
+  }
+  if (/\bstartup\b(?=[^\n.]{0,50}\b(emd|exempt|exemption|relaxation|bid\s*security)\b)|\b(emd|exempt|exemption|relaxation|bid\s*security)\b(?=[^\n.]{0,50}\bstartup\b)/i.test(text)) {
+    return true;
+  }
+  if (opts?.includeBareMse) {
+    if (/\bmse\b/i.test(text)) return true;
+  } else if (/\bmse\b(?=[^\n.]{0,50}\b(emd|exempt|exemption|relaxation|bid\s*security)\b)|\b(emd|exempt|exemption|relaxation|bid\s*security)\b(?=[^\n.]{0,50}\bmse\b)/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
 export function normalizeEmdSecurity(
   rawRequired: unknown,
   emdAmount: number,
+  msmeExemptHint = false,
 ): EmdSecurityType {
   const text = typeof rawRequired === 'string' ? rawRequired.trim().toLowerCase() : '';
+  const hasExplicitExemption =
+    msmeExemptHint ||
+    detectMsmeEmdExemption(text, { includeBareMse: true }) ||
+    text.includes('exempt');
+
+  if (hasExplicitExemption && emdAmount === 0) {
+    return 'Exempted - MSME/Startup';
+  }
 
   if (emdAmount > 0) {
+    if (hasExplicitExemption) {
+      return 'Exempted - MSME/Startup';
+    }
     if (text.includes('bg') || text.includes('bank guarantee') || text.includes('e-pbg')) {
       return 'BG Submitted';
     }
@@ -250,6 +287,7 @@ export interface RawGeminiBidExtraction {
   emdRequired?: unknown;
   emdStatus?: unknown;
   emdAmount?: unknown;
+  msmeExempt?: unknown;
   resultInfo?: unknown;
 }
 
@@ -274,8 +312,27 @@ export function normalizeExtractedBidDraft(
   const preBidDate = normalizeToIsoDate(raw.preBidDate);
 
   const estimatedValue = parseNumericAmount(raw.estimatedValue);
-  const emdAmount = parseNumericAmount(raw.emdAmount);
-  const emdStatus = normalizeEmdSecurity(raw.emdRequired ?? raw.emdStatus, emdAmount);
+  const rawEmdAmount = parseNumericAmount(raw.emdAmount);
+
+  const explicitMsmeFlag =
+    raw.msmeExempt === true ||
+    (typeof raw.msmeExempt === 'string' && raw.msmeExempt.trim().toLowerCase() === 'true');
+  const textSignals = [raw.emdRequired, raw.emdStatus, raw.title, raw.category, raw.resultInfo]
+    .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+    .join(' ');
+  const emdFieldHasMse = detectMsmeEmdExemption(
+    [raw.emdRequired, raw.emdStatus].filter((v): v is string => typeof v === 'string').join(' '),
+    { includeBareMse: true },
+  );
+  const msmeExemptDetected =
+    explicitMsmeFlag || emdFieldHasMse || detectMsmeEmdExemption(textSignals);
+
+  const emdStatus = normalizeEmdSecurity(
+    raw.emdRequired ?? raw.emdStatus,
+    rawEmdAmount,
+    msmeExemptDetected,
+  );
+  const emdAmount = emdStatus === 'Exempted - MSME/Startup' || emdStatus === 'No EMD' ? 0 : rawEmdAmount;
 
   return {
     tenderId,

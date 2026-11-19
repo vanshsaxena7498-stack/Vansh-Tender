@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import path from 'node:path';
 import express, { type Request, type Response } from 'express';
 import { apiJsonErrorMiddleware, createApiRouter } from './server-core.ts';
@@ -10,6 +11,9 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '12mb' }));
   app.use('/api', createApiRouter());
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ ok: false, error: 'API endpoint not found.' });
+  });
   app.use('/api', apiJsonErrorMiddleware);
 
   if (process.env.NODE_ENV !== 'production') {

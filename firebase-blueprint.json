@@ -537,9 +537,9 @@
         "updatedAt"
       ]
     },
-    "WhatsAppConfig": {
-      "title": "WhatsAppConfig",
-      "description": "WhatsApp recipient and automated tender alert notification settings.",
+    "EmailAlertConfig": {
+      "title": "EmailAlertConfig",
+      "description": "Email recipient and twice-daily automated tender alert settings (11 AM & 4 PM IST).",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -556,10 +556,10 @@
           "minLength": 1,
           "maxLength": 100
         },
-        "recipientPhone": {
+        "recipientEmail": {
           "type": "string",
-          "minLength": 10,
-          "maxLength": 20
+          "minLength": 5,
+          "maxLength": 160
         },
         "createdAt": {
           "type": "string",
@@ -574,14 +574,14 @@
         "ownerUid",
         "enabled",
         "recipientName",
-        "recipientPhone",
+        "recipientEmail",
         "createdAt",
         "updatedAt"
       ]
     },
-    "WhatsAppAlertLog": {
-      "title": "WhatsAppAlertLog",
-      "description": "Deduplicated WhatsApp milestone dispatch records (48h alert entry and 4h urgent reminder) per tender.",
+    "EmailAlertLog": {
+      "title": "EmailAlertLog",
+      "description": "Deduplicated twice-daily email reminder dispatch logs (11:00 AM IST & 4:00 PM IST) per tender.",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -596,7 +596,7 @@
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
-        "milestoneKey": {
+        "slotKey": {
           "type": "string",
           "minLength": 1,
           "maxLength": 150
@@ -610,18 +610,18 @@
           "minLength": 1,
           "maxLength": 120
         },
-        "milestone": {
+        "slot": {
           "type": "string",
-          "enum": ["alert_48h", "urgent_4h", "test"],
+          "enum": ["slot_11am", "slot_4pm", "manual", "test"],
           "maxLength": 24
         },
         "recipientName": {
           "type": "string",
           "maxLength": 100
         },
-        "recipientPhone": {
+        "recipientEmail": {
           "type": "string",
-          "maxLength": 24
+          "maxLength": 160
         },
         "dueDateIso": {
           "type": "string",
@@ -629,16 +629,20 @@
         },
         "status": {
           "type": "string",
-          "enum": ["sent", "manual_ready", "failed"],
+          "enum": ["sent", "failed"],
           "maxLength": 24
         },
         "provider": {
           "type": "string",
           "maxLength": 40
         },
+        "subject": {
+          "type": "string",
+          "maxLength": 240
+        },
         "message": {
           "type": "string",
-          "maxLength": 3000
+          "maxLength": 4000
         },
         "clientCreatedAt": {
           "type": "string",
@@ -656,15 +660,16 @@
       "required": [
         "ownerUid",
         "id",
-        "milestoneKey",
+        "slotKey",
         "tenderRefId",
         "tenderId",
-        "milestone",
+        "slot",
         "recipientName",
-        "recipientPhone",
+        "recipientEmail",
         "dueDateIso",
         "status",
         "provider",
+        "subject",
         "message",
         "clientCreatedAt",
         "createdAt",
@@ -713,6 +718,117 @@
         "webhookUrl",
         "sheetName",
         "lastSyncedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SecondaryUserRecord": {
+      "title": "SecondaryUserRecord",
+      "description": "Directory entry for a self-registered secondary CRM user visible to Admin without affecting Admin workspace records.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 5,
+          "maxLength": 160
+        },
+        "role": {
+          "type": "string",
+          "enum": ["secondary"],
+          "maxLength": 20
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "clientCreatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "clientLastLoginAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "userId",
+        "username",
+        "email",
+        "role",
+        "isActive",
+        "clientCreatedAt",
+        "clientLastLoginAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WorkspaceRoot": {
+      "title": "WorkspaceRoot",
+      "description": "Tenant isolation root document under /users/{userId}/workspaces/{tenantId} keeping secondary CRM data strictly separated.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "tenantId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "tenantId",
+        "username",
+        "email",
         "createdAt",
         "updatedAt"
       ]
@@ -767,23 +883,89 @@
       },
       "description": "Tender-OEM MAF tracker records with nested itemsMAF line items stored exclusively in Firestore."
     },
-    "/users/{userId}/whatsappConfig/{configId}": {
+    "/users/{userId}/emailConfig/{configId}": {
       "schema": {
-        "$ref": "#/entities/WhatsAppConfig"
+        "$ref": "#/entities/EmailAlertConfig"
       },
-      "description": "User WhatsApp recipient and auto-alert settings."
+      "description": "User email recipient and twice-daily auto-alert settings."
     },
-    "/users/{userId}/whatsappAlerts/{alertId}": {
+    "/users/{userId}/emailAlerts/{alertId}": {
       "schema": {
-        "$ref": "#/entities/WhatsAppAlertLog"
+        "$ref": "#/entities/EmailAlertLog"
       },
-      "description": "Deduplicated 48h and 4h tender WhatsApp notification logs."
+      "description": "Deduplicated 11 AM & 4 PM IST tender email notification logs."
     },
     "/users/{userId}/sheetConfig/{configId}": {
       "schema": {
         "$ref": "#/entities/GoogleSheetConfig"
       },
       "description": "Google Apps Script Webhook configuration for real-time MIS Monthly Report synchronization."
+    },
+    "/secondaryUsers/{secondaryUserId}": {
+      "schema": {
+        "$ref": "#/entities/SecondaryUserRecord"
+      },
+      "description": "Secondary user account directory records readable by Admin."
+    },
+    "/users/{userId}/workspaces/{tenantId}": {
+      "schema": {
+        "$ref": "#/entities/WorkspaceRoot"
+      },
+      "description": "Isolated tenant workspace root for secondary CRM accounts."
+    },
+    "/users/{userId}/workspaces/{tenantId}/profile/{profileId}": {
+      "schema": {
+        "$ref": "#/entities/FirmProfile"
+      },
+      "description": "Isolated firm profile for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/settings/{settingId}": {
+      "schema": {
+        "$ref": "#/entities/UserPreferences"
+      },
+      "description": "Isolated user preferences for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/tenders/{tenderDocId}": {
+      "schema": {
+        "$ref": "#/entities/Tender"
+      },
+      "description": "Isolated tender records for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/emdRecords/{emdDocId}": {
+      "schema": {
+        "$ref": "#/entities/EmdBgRecord"
+      },
+      "description": "Isolated EMD & BG records for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/attachmentFiles/{attachmentId}": {
+      "schema": {
+        "$ref": "#/entities/AttachmentFile"
+      },
+      "description": "Isolated attachment file payloads for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/maf_tracker/{mafDocId}": {
+      "schema": {
+        "$ref": "#/entities/MafTracker"
+      },
+      "description": "Isolated MAF tracker records for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/emailConfig/{configId}": {
+      "schema": {
+        "$ref": "#/entities/EmailAlertConfig"
+      },
+      "description": "Isolated email alert config for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/emailAlerts/{alertId}": {
+      "schema": {
+        "$ref": "#/entities/EmailAlertLog"
+      },
+      "description": "Isolated email alert logs for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/sheetConfig/{configId}": {
+      "schema": {
+        "$ref": "#/entities/GoogleSheetConfig"
+      },
+      "description": "Isolated Google Apps Script Webhook configuration for a secondary CRM workspace."
     }
   }
 }

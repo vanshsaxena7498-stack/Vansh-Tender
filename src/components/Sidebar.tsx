@@ -10,12 +10,13 @@ import {
   User,
   X,
 } from 'lucide-react';
-import type { FirmProfile, TabKey } from '../types/crm';
+import type { CrmUserSession, FirmProfile, TabKey } from '../types/crm';
 
 interface SidebarProps {
   activeTab: TabKey;
   onSelectTab: (tab: TabKey) => void;
   firmProfile: FirmProfile;
+  currentUser?: CrmUserSession | null;
   tenderCount: number;
   mafCount?: number;
   emdCount: number;
@@ -37,6 +38,7 @@ export function Sidebar({
   activeTab,
   onSelectTab,
   firmProfile,
+  currentUser,
   tenderCount,
   mafCount = 0,
   emdCount,
@@ -65,7 +67,7 @@ export function Sidebar({
             </div>
           )}
           <span className="font-display text-base font-bold tracking-tight text-white truncate">
-            Vansh Saxena
+            {firmProfile.adminName || currentUser?.username || 'Tender Desk'}
           </span>
         </div>
         <button
@@ -108,7 +110,11 @@ export function Sidebar({
             >
               <span className="flex items-center gap-2.5 min-w-0">
                 <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                <span className="truncate">{item.label}</span>
+                <span className="truncate">
+                  {item.key === 'settings' && currentUser?.role === 'secondary'
+                    ? 'Workspace Settings'
+                    : item.label}
+                </span>
               </span>
               {countLabel !== null && (
                 <span
@@ -133,7 +139,8 @@ export function Sidebar({
             GSTIN: {firmProfile.gstin || 'Not Set'}
           </p>
           <p className="text-slate-500 truncate">
-            Admin: {firmProfile.adminName || 'Tender Desk'}
+            {currentUser?.role === 'secondary' ? 'Secondary User' : 'Primary Admin'}:{' '}
+            {firmProfile.adminName || currentUser?.username || 'Tender Desk'}
           </p>
         </div>
         {onLogout && (

@@ -246,41 +246,42 @@ test('buildCloudMafTrackerPayload bounds itemsMAF <= 50, strips dataUrl, and pre
   assert.equal(merged[0].itemsMAF[1].mafDocumentUrl, 'https://drive.google.com/file/d/abc/view');
 });
 
-test('buildCloudWhatsAppConfigPayload and buildCloudWhatsAppAlertLogPayload validate blueprint fields', async () => {
-  const { buildCloudWhatsAppConfigPayload, buildCloudWhatsAppAlertLogPayload } = await import(
+test('buildCloudEmailConfigPayload and buildCloudEmailAlertLogPayload validate blueprint fields', async () => {
+  const { buildCloudEmailConfigPayload, buildCloudEmailAlertLogPayload } = await import(
     './cloudSyncHelpers'
   );
-  const cfgPayload = buildCloudWhatsAppConfigPayload(
-    { enabled: true, recipientName: 'Vansh', recipientPhone: '9717690890' },
+  const cfgPayload = buildCloudEmailConfigPayload(
+    { enabled: true, recipientName: 'Vansh', recipientEmail: 'vanshsaxena7498@gmail.com' },
     'uid-1',
     TOKEN,
   );
   assert.equal(cfgPayload.ownerUid, 'uid-1');
   assert.equal(cfgPayload.enabled, true);
   assert.equal(cfgPayload.recipientName, 'Vansh');
-  assert.equal(cfgPayload.recipientPhone, '9717690890');
+  assert.equal(cfgPayload.recipientEmail, 'vanshsaxena7498@gmail.com');
 
-  const logPayload = buildCloudWhatsAppAlertLogPayload(
+  const logPayload = buildCloudEmailAlertLogPayload(
     {
-      id: 'wa_tnd1_urgent_4h',
-      milestoneKey: 'wa_tnd1_urgent_4h',
+      id: 'email_tnd1_2026-11-14_slot_11am',
+      slotKey: 'email_tnd1_2026-11-14_slot_11am',
       tenderRefId: 'tnd-1',
       tenderId: 'GEM/2026/B/123',
-      milestone: 'urgent_4h',
+      slot: 'slot_11am',
       recipientName: 'Vansh',
-      recipientPhone: '919717690890',
+      recipientEmail: 'vanshsaxena7498@gmail.com',
       dueDateIso: '2026-11-15T14:00',
-      status: 'manual_ready',
-      provider: 'manual_ready',
-      message: 'URGENT TENDER REMINDER',
-      createdAt: '2026-11-15T10:05:00.000Z',
+      status: 'sent',
+      provider: 'smtp',
+      subject: 'NEW TENDER ALERT NOTIFICATION (DUE WITHIN 5 DAYS)',
+      message: 'Tender ID: GEM/2026/B/123',
+      createdAt: '2026-11-14T05:30:00.000Z',
     },
     'uid-1',
     TOKEN,
   );
   assert.equal(logPayload.ownerUid, 'uid-1');
-  assert.equal(logPayload.milestone, 'urgent_4h');
-  assert.equal(logPayload.recipientPhone, '919717690890');
+  assert.equal(logPayload.slot, 'slot_11am');
+  assert.equal(logPayload.recipientEmail, 'vanshsaxena7498@gmail.com');
 });
 
 test('buildCloudSheetConfigPayload enforces blueprint keys and HTTPS webhook URL constraint', async () => {
@@ -313,5 +314,48 @@ test('buildCloudSheetConfigPayload enforces blueprint keys and HTTPS webhook URL
   assert.equal(strippedHttp.webhookUrl, '');
   assert.equal(strippedHttp.sheetName, 'MIS Monthly Report');
 });
+
+test('buildWorkspaceRootPayload and buildSecondaryUserCloudPayload enforce bounds, lowercase emails, and secondary role', async () => {
+  const { buildWorkspaceRootPayload, buildSecondaryUserCloudPayload } = await import(
+    './cloudSyncHelpers'
+  );
+
+  const rootPayload = buildWorkspaceRootPayload(
+    {
+      ownerUid: 'uid-admin-1',
+      tenantId: 'sec_rohan/1',
+      username: 'RohanDesk',
+      email: 'Rohan.Desk@GMAIL.COM',
+    },
+    TOKEN,
+  );
+  assert.equal(rootPayload.ownerUid, 'uid-admin-1');
+  assert.equal(rootPayload.tenantId, 'sec_rohan_1');
+  assert.equal(rootPayload.username, 'RohanDesk');
+  assert.equal(rootPayload.email, 'rohan.desk@gmail.com');
+  assert.equal(rootPayload.createdAt, TOKEN);
+  assert.equal(rootPayload.updatedAt, TOKEN);
+
+  const secUserPayload = buildSecondaryUserCloudPayload(
+    {
+      ownerUid: 'uid-admin-1',
+      userId: 'sec_rohan_1',
+      username: '  RohanDesk  ',
+      email: '  Rohan.Desk@GMAIL.COM ',
+      isActive: true,
+      createdAtIso: '2026-11-18T10:00:00.000Z',
+    },
+    TOKEN,
+  );
+  assert.equal(secUserPayload.ownerUid, 'uid-admin-1');
+  assert.equal(secUserPayload.userId, 'sec_rohan_1');
+  assert.equal(secUserPayload.username, 'RohanDesk');
+  assert.equal(secUserPayload.email, 'rohan.desk@gmail.com');
+  assert.equal(secUserPayload.role, 'secondary');
+  assert.equal(secUserPayload.isActive, true);
+  assert.equal(secUserPayload.clientCreatedAt, '2026-11-18T10:00:00.000Z');
+  assert.equal(secUserPayload.clientLastLoginAt, '');
+});
+
 
 

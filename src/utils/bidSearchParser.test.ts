@@ -4,6 +4,7 @@ import type { AttachmentItem, Tender } from '../types/crm';
 import {
   buildTenderFromBidDraft,
   DEFAULT_TENDER_ATTACHMENT_1_LABEL,
+  detectMsmeEmdExemption,
   findDuplicateTender,
   normalizeEmdSecurity,
   normalizeExtractedBidDraft,
@@ -42,6 +43,38 @@ test('normalizeEmdSecurity maps Required/Exempted/Not Required into Firestore-va
   assert.equal(normalizeEmdSecurity('Bank Guarantee Required', 250000), 'BG Submitted');
   assert.equal(normalizeEmdSecurity('Exempted - MSME/Startup', 0), 'Exempted - MSME/Startup');
   assert.equal(normalizeEmdSecurity('Not Required', 0), 'No EMD');
+});
+
+test('detectMsmeEmdExemption identifies MSME, Udyam, Startup, and MSE exemption cues without false positives', () => {
+  assert.equal(detectMsmeEmdExemption('Supply of LED Displays (MSME Exemption: Yes)'), true);
+  assert.equal(detectMsmeEmdExemption('Valid Udyam Registration Certificate required'), true);
+  assert.equal(detectMsmeEmdExemption('DPIIT Startup Exemption applicable for EMD'), true);
+  assert.equal(detectMsmeEmdExemption('MSE Bidder EMD Exemption: Yes'), true);
+  assert.equal(detectMsmeEmdExemption('MSE Supply', { includeBareMse: true }), true);
+  assert.equal(detectMsmeEmdExemption('Supply of Workstation and Monitor'), false);
+  assert.equal(detectMsmeEmdExemption(''), false);
+});
+
+test('normalizeExtractedBidDraft overrides numeric emdAmount to 0 and Exempted when msmeExempt is detected', () => {
+  const byFlag = normalizeExtractedBidDraft({
+    tenderId: 'GEM/2026/B/900111',
+    title: 'Supply of Servers',
+    emdRequired: 'Required',
+    emdAmount: 120000,
+    msmeExempt: true,
+  });
+  assert.equal(byFlag.emdStatus, 'Exempted - MSME/Startup');
+  assert.equal(byFlag.emdAmount, 0);
+
+  const byText = normalizeExtractedBidDraft({
+    tenderId: 'GEM/2026/B/900222',
+    title: 'Supply of UPS with MSME EMD Exemption',
+    emdRequired: 'Required',
+    emdAmount: 85000,
+    msmeExempt: false,
+  });
+  assert.equal(byText.emdStatus, 'Exempted - MSME/Startup');
+  assert.equal(byText.emdAmount, 0);
 });
 
 test('normalizeExtractedBidDraft maps all 16 schema fields cleanly with safe defaults', () => {

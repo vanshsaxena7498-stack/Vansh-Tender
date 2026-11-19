@@ -177,7 +177,7 @@ export interface MafTrackerRecord {
   updatedAt: string;
 }
 
-export type NotificationCategory = 'deadline_48h' | 'bg_expiry_30d' | 'emd_refund_60d';
+export type NotificationCategory = 'deadline_5d' | 'bg_expiry_30d' | 'emd_refund_60d';
 
 export interface NotificationItem {
   id: string;
@@ -189,25 +189,26 @@ export interface NotificationItem {
   targetId: string;
 }
 
-export type WhatsAppMilestone = 'alert_48h' | 'urgent_4h';
+export type EmailReminderSlot = 'slot_11am' | 'slot_4pm';
 
-export interface WhatsAppSettings {
+export interface EmailAlertSettings {
   enabled: boolean;
   recipientName: string;
-  recipientPhone: string;
+  recipientEmail: string;
 }
 
-export interface WhatsAppAlertLog {
+export interface EmailAlertLog {
   id: string;
-  milestoneKey: string;
+  slotKey: string;
   tenderRefId: string;
   tenderId: string;
-  milestone: WhatsAppMilestone | 'test';
+  slot: EmailReminderSlot | 'manual' | 'test';
   recipientName: string;
-  recipientPhone: string;
+  recipientEmail: string;
   dueDateIso: string;
-  status: 'sent' | 'manual_ready' | 'failed';
+  status: 'sent' | 'failed';
   provider: string;
+  subject: string;
   message: string;
   createdAt: string;
 }
@@ -234,4 +235,23 @@ export interface CrmBackupPayload {
   mafTrackers?: MafTrackerRecord[];
 }
 
+export type CrmUserRole = 'admin' | 'secondary';
 
+export interface CrmUserSession {
+  userId: string;
+  username: string;
+  email: string;
+  role: CrmUserRole;
+  createdAt?: string;
+  lastLoginAt?: string;
+}
+
+export interface SecondaryUserSummary {
+  userId: string;
+  username: string;
+  email: string;
+  role: CrmUserRole;
+  createdAt: string;
+  lastLoginAt?: string;
+  isActive: boolean;
+}

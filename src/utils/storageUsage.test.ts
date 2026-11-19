@@ -12,7 +12,7 @@ import {
   FIRESTORE_FREE_QUOTA_BYTES,
   formatStorageSize,
 } from './storageUsage';
-import { DEFAULT_WHATSAPP_SETTINGS } from './whatsappAlerts';
+import { DEFAULT_EMAIL_ALERT_SETTINGS } from './emailAlerts';
 
 test('formatStorageSize formats bytes, KB, MB, and GB cleanly', () => {
   assert.equal(formatStorageSize(0), '0 B');
@@ -30,8 +30,8 @@ test('estimateCloudStorageUsage accurately computes seed dataset below 1 MB', ()
     tenders: SEED_TENDERS,
     emdRecords: SEED_EMD_RECORDS,
     mafTrackers: SEED_MAF_TRACKERS,
-    whatsappSettings: DEFAULT_WHATSAPP_SETTINGS,
-    whatsappLogs: [],
+    emailSettings: DEFAULT_EMAIL_ALERT_SETTINGS,
+    emailLogs: [],
     sheetSettings: DEFAULT_GOOGLE_SHEET_SETTINGS,
   });
 
@@ -79,8 +79,8 @@ test('estimateCloudStorageUsage includes deduplicated Firestore attachments and 
     tenders: [tenderWithAttachment],
     emdRecords: [],
     mafTrackers: [mafWithExternalUrl],
-    whatsappSettings: DEFAULT_WHATSAPP_SETTINGS,
-    whatsappLogs: [],
+    emailSettings: DEFAULT_EMAIL_ALERT_SETTINGS,
+    emailLogs: [],
     sheetSettings: DEFAULT_GOOGLE_SHEET_SETTINGS,
     attachmentFiles: new Map([['att-nit-1', fakePdfDataUrl]]),
   });

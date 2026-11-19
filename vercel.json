@@ -2,14 +2,14 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/index.ts": {
-      "includeFiles": "firebase-applet-config.json",
+      "includeFiles": "{server-core.ts,firebase-applet-config.json,src/utils/**}",
       "maxDuration": 60
     }
   },
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "/api/index"
+      "destination": "/api/index?__api_path=/$1"
     },
     {
       "source": "/((?!api/).*)",

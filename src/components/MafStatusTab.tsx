@@ -14,11 +14,18 @@ import {
   Upload,
 } from 'lucide-react';
 import type { MafItemStatus, MafLineItem, MafTrackerRecord, Tender } from '../types/crm';
-import { buildCsvContent, downloadTextFile, formatShortDate } from '../utils/formatters';
+import {
+  buildCsvContent,
+  downloadTextFile,
+  formatShortDate,
+  getLocalDateInputValue,
+} from '../utils/formatters';
 import {
   computeMafSummaryMetrics,
   getMafContactDetails,
   getMafRequestedDate,
+  isSafeHttpUrl,
+  isSafeMafDataUrl,
   MAF_STATUS_OPTIONS,
   resolveAndFilterMafTrackers,
   validateMafUploadFile,
@@ -211,7 +218,7 @@ export function MafStatusTab({
       }
     }
     downloadTextFile(
-      `MAF_Tracker_${new Date().toISOString().slice(0, 10)}.csv`,
+      `MAF_Tracker_${getLocalDateInputValue()}.csv`,
       buildCsvContent(headers, rows),
       'text/csv;charset=utf-8;',
     );
@@ -552,7 +559,8 @@ export function MafStatusTab({
                                     {visibleItems.map((item, idx) => {
                                       const itemKey = `${tracker.id}:${item.itemId}`;
                                       const isUploading = uploadingKey === itemKey;
-                                      const isDataUri = item.mafDocumentUrl.startsWith('data:');
+                                      const isSafeDataUri = isSafeMafDataUrl(item.mafDocumentUrl);
+                                      const isSafeExternalUrl = isSafeHttpUrl(item.mafDocumentUrl);
                                       const contact = getMafContactDetails(item);
                                       const requestedDate = getMafRequestedDate(item);
 
@@ -663,7 +671,7 @@ export function MafStatusTab({
                                           <td className="py-2.5 px-3 whitespace-nowrap">
                                             <div className="flex items-center gap-1.5">
                                               {item.mafDocumentUrl ? (
-                                                isDataUri ? (
+                                                isSafeDataUri ? (
                                                   <a
                                                     href={item.mafDocumentUrl}
                                                     download={
@@ -679,7 +687,7 @@ export function MafStatusTab({
                                                       {item.mafDocumentName || 'maf_signed.pdf'}
                                                     </span>
                                                   </a>
-                                                ) : (
+                                                ) : isSafeExternalUrl ? (
                                                   <a
                                                     href={item.mafDocumentUrl}
                                                     target="_blank"
@@ -698,6 +706,10 @@ export function MafStatusTab({
                                                       aria-hidden="true"
                                                     />
                                                   </a>
+                                                ) : (
+                                                  <span className="inline-flex items-center px-2 py-1 rounded-md border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/30 text-[11px] font-medium text-red-700 dark:text-red-300">
+                                                    Invalid link blocked
+                                                  </span>
                                                 )
                                               ) : (
                                                 <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-[11px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer">

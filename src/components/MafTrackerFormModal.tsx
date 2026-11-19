@@ -18,6 +18,8 @@ import {
   findMatchingDailyTender,
   getMafContactDetails,
   getMafRequestedDate,
+  isSafeHttpUrl,
+  isSafeMafDataUrl,
   MAF_STATUS_OPTIONS,
   validateMafItemDraft,
   validateMafUploadFile,
@@ -141,6 +143,13 @@ export function MafTrackerFormModal({
     }
   };
 
+  const isUnlinkedEditFallback = Boolean(
+    isEdit &&
+      initialTracker &&
+      !matchedTender &&
+      tenderId.trim().toLowerCase() === initialTracker.tenderId.trim().toLowerCase(),
+  );
+
   const handleTenderIdChange = (rawValue: string) => {
     setTenderId(rawValue);
     const found = findDailyTenderByCode(tenders, rawValue);
@@ -150,6 +159,15 @@ export function MafTrackerFormModal({
       setDepartment(found.department);
       setTenderDueDate(found.submissionDueDate);
       setErrorMsg('');
+    } else if (
+      isEdit &&
+      initialTracker &&
+      rawValue.trim().toLowerCase() === initialTracker.tenderId.trim().toLowerCase()
+    ) {
+      setTenderRefId(initialTracker.tenderRefId || '');
+      setTenderTitle(initialTracker.tenderTitle || '');
+      setDepartment(initialTracker.department || '');
+      setTenderDueDate(initialTracker.tenderDueDate || '');
     } else {
       setTenderRefId('');
       setTenderTitle('');
@@ -217,7 +235,12 @@ export function MafTrackerFormModal({
     }
 
     const verifiedTender = findDailyTenderByCode(tenders, tenderId);
-    if (!verifiedTender) {
+    const allowOrphanEdit =
+      isEdit &&
+      Boolean(initialTracker) &&
+      tenderId.trim().toLowerCase() === (initialTracker?.tenderId || '').trim().toLowerCase();
+
+    if (!verifiedTender && !allowOrphanEdit) {
       setErrorMsg(
         `Tender "${tenderId.trim()}" does not exist in Daily Tender Data. Please add it in Daily Tender Data first before creating a MAF Status entry.`,
       );
@@ -235,6 +258,13 @@ export function MafTrackerFormModal({
         setErrorMsg(`Item #${i + 1}: ${rowErr}`);
         return;
       }
+      const docUrl = (itemsMAF[i].mafDocumentUrl || '').trim();
+      if (docUrl && !isSafeMafDataUrl(docUrl) && !isSafeHttpUrl(docUrl)) {
+        setErrorMsg(
+          `Item #${i + 1}: Please enter a valid http:// or https:// cloud link for the MAF document.`,
+        );
+        return;
+      }
     }
 
     if (uploadingItemId) {
@@ -243,13 +273,21 @@ export function MafTrackerFormModal({
     }
 
     // If creating a new entry for a tender that already has a tracker, merge items under the existing doc ID
-    const existingForTender = !isEdit
-      ? existingTrackers.find(
-          (t) =>
-            t.tenderRefId === verifiedTender.id ||
-            t.tenderId.toLowerCase() === verifiedTender.tenderId.toLowerCase(),
-        )
-      : undefined;
+    const existingForTender =
+      !isEdit && verifiedTender
+        ? existingTrackers.find(
+            (t) =>
+              t.tenderRefId === verifiedTender.id ||
+              t.tenderId.toLowerCase() === verifiedTender.tenderId.toLowerCase(),
+          )
+        : undefined;
+
+    if (existingForTender && existingForTender.itemsMAF.length + itemsMAF.length > 50) {
+      setErrorMsg(
+        `Tender "${verifiedTender?.tenderId}" already has ${existingForTender.itemsMAF.length} MAF items. Adding ${itemsMAF.length} more exceeds the 50-item tracker limit.`,
+      );
+      return;
+    }
 
     const nowIso = new Date().toISOString();
     const cleanedItems: MafLineItem[] = itemsMAF.map((item) => {
@@ -275,26 +313,32 @@ export function MafTrackerFormModal({
       };
     });
 
-    const resolvedDept = department.trim() || verifiedTender.department;
+    const resolvedRefId = verifiedTender?.id ?? initialTracker?.tenderRefId ?? '';
+    const resolvedTenderId = verifiedTender?.tenderId ?? initialTracker?.tenderId ?? tenderId.trim();
+    const resolvedTitle = verifiedTender?.title ?? (tenderTitle.trim() || initialTracker?.tenderTitle || '');
+    const resolvedDept =
+      department.trim() || verifiedTender?.department || initialTracker?.department || '';
+    const resolvedDueDate =
+      verifiedTender?.submissionDueDate ?? (tenderDueDate || initialTracker?.tenderDueDate || '');
 
     const finalTracker: MafTrackerRecord = existingForTender
       ? {
           ...existingForTender,
-          tenderRefId: verifiedTender.id,
-          tenderId: verifiedTender.tenderId,
-          tenderTitle: verifiedTender.title,
+          tenderRefId: resolvedRefId,
+          tenderId: resolvedTenderId,
+          tenderTitle: resolvedTitle,
           department: existingForTender.department || resolvedDept,
-          tenderDueDate: verifiedTender.submissionDueDate,
-          itemsMAF: [...existingForTender.itemsMAF, ...cleanedItems].slice(0, 50),
+          tenderDueDate: resolvedDueDate,
+          itemsMAF: [...existingForTender.itemsMAF, ...cleanedItems],
           updatedAt: nowIso,
         }
       : {
           id: trackerId,
-          tenderRefId: verifiedTender.id,
-          tenderId: verifiedTender.tenderId,
-          tenderTitle: verifiedTender.title,
+          tenderRefId: resolvedRefId,
+          tenderId: resolvedTenderId,
+          tenderTitle: resolvedTitle,
           department: resolvedDept,
-          tenderDueDate: verifiedTender.submissionDueDate,
+          tenderDueDate: resolvedDueDate,
           itemsMAF: cleanedItems,
           createdAt: initialTracker?.createdAt ?? nowIso,
           updatedAt: nowIso,
@@ -487,7 +531,7 @@ export function MafTrackerFormModal({
                 </div>
               </div>
 
-              {tenders.length === 0 ? (
+              {tenders.length === 0 && !isUnlinkedEditFallback ? (
                 <div className="flex items-center gap-2 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-800 dark:text-amber-300">
                   <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
                   <span>
@@ -501,6 +545,14 @@ export function MafTrackerFormModal({
                   <span>
                     Matched with Daily Tender Data ({matchedTender.tenderId}) — Due Date,
                     Department &amp; Work Title synced automatically.
+                  </span>
+                </div>
+              ) : isUnlinkedEditFallback ? (
+                <div className="flex items-center gap-2 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3.5 py-2 text-xs text-amber-800 dark:text-amber-300">
+                  <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>
+                    Linked Daily Tender ({tenderId.trim()}) is no longer in Daily Tender Data;
+                    existing tracker details are preserved so you can safely save updates.
                   </span>
                 </div>
               ) : tenderId.trim().length > 0 ? (

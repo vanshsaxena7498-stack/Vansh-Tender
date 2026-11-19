@@ -12,6 +12,7 @@ import {
   extractSavedAttachments,
   type AttachmentSlotState,
 } from '../utils/attachments';
+import { getLocalDateInputValue } from '../utils/formatters';
 import { AttachmentSlots } from './AttachmentSlots';
 
 interface EmdBgFormModalProps {
@@ -55,7 +56,7 @@ export function EmdBgFormModal({
   const [bankName, setBankName] = useState(initialRecord?.bankName ?? '');
   const [amount, setAmount] = useState(initialRecord ? String(initialRecord.amount) : '');
   const [issueDate, setIssueDate] = useState(
-    initialRecord?.issueDate ?? new Date().toISOString().slice(0, 10),
+    initialRecord?.issueDate ?? getLocalDateInputValue(),
   );
   const [expiryDate, setExpiryDate] = useState(initialRecord?.expiryDate ?? '');
   const [claimEndDate, setClaimEndDate] = useState(initialRecord?.claimEndDate ?? '');
@@ -113,6 +114,18 @@ export function EmdBgFormModal({
       setErrorMsg(
         'Please complete Tender ID, Department, Instrument Reference No., Issuing Bank, and Amount (> ₹ 0).',
       );
+      return;
+    }
+    if (expiryDate && issueDate && expiryDate < issueDate) {
+      setErrorMsg('Expiry / Maturity Date cannot be earlier than Issue Date.');
+      return;
+    }
+    if (claimEndDate && expiryDate && claimEndDate < expiryDate) {
+      setErrorMsg('Claim Period End Date cannot be earlier than Expiry / Maturity Date.');
+      return;
+    }
+    if (status === 'Refunded / Released' && !refundDate) {
+      setErrorMsg('Please enter the Refund / Release Date before marking status as Refunded / Released.');
       return;
     }
 

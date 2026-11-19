@@ -6,6 +6,8 @@ import {
   createMafItemId,
   getMafContactDetails,
   getMafRequestedDate,
+  isSafeHttpUrl,
+  isSafeMafDataUrl,
   MAF_STATUS_OPTIONS,
   validateMafItemDraft,
   validateMafUploadFile,
@@ -116,6 +118,11 @@ export function MafItemModal({
     }
     if (uploading) {
       setErrorMsg('Please wait for the MAF document upload to complete.');
+      return;
+    }
+    const cleanDocUrl = mafDocumentUrl.trim();
+    if (cleanDocUrl && !isSafeMafDataUrl(cleanDocUrl) && !isSafeHttpUrl(cleanDocUrl)) {
+      setErrorMsg('Please enter a valid http:// or https:// cloud link for the MAF document.');
       return;
     }
 
@@ -410,8 +417,13 @@ export function MafItemModal({
                       type="url"
                       value={mafDocumentUrl}
                       onChange={(e) => {
-                        setMafDocumentUrl(e.target.value);
-                        if (!mafDocumentName) setMafDocumentName('Cloud link');
+                        const val = e.target.value;
+                        setMafDocumentUrl(val);
+                        if (!val.trim()) {
+                          setMafDocumentName('');
+                        } else if (!mafDocumentName) {
+                          setMafDocumentName('Cloud link');
+                        }
                         setMafAttachmentId('');
                       }}
                       placeholder="https://drive.google.com/..."

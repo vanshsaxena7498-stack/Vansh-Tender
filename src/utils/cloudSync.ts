@@ -16,26 +16,30 @@ import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage
 import { db, handleFirestoreError, OperationType, storage } from '../lib/firebase';
 import type {
   AttachmentItem,
+  CrmUserSession,
+  EmailAlertLog,
+  EmailAlertSettings,
   EmdBgRecord,
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
+  SecondaryUserSummary,
   Tender,
   UserPreferences,
-  WhatsAppAlertLog,
-  WhatsAppSettings,
 } from '../types/crm';
 import { MAX_ATTACHMENT_BYTES, readAttachmentForFirestore } from './attachments';
 import {
   buildCloudAttachmentFilePayload,
+  buildCloudEmailAlertLogPayload,
+  buildCloudEmailConfigPayload,
   buildCloudEmdPayload,
   buildCloudMafTrackerPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudSheetConfigPayload,
   buildCloudTenderPayload,
-  buildCloudWhatsAppAlertLogPayload,
-  buildCloudWhatsAppConfigPayload,
+  buildSecondaryUserCloudPayload,
+  buildWorkspaceRootPayload,
   sanitizeDocId,
 } from './cloudSyncHelpers';
 import {
@@ -50,11 +54,11 @@ const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'Cancelled / Retendered',
 ]);
 
-const ensuredUserUids = new Set<string>();
+const ensuredWorkspaceKeys = new Set<string>();
 const syncedAttachmentKeys = new Set<string>();
 
 export function clearCloudSessionCache(): void {
-  ensuredUserUids.clear();
+  ensuredWorkspaceKeys.clear();
   syncedAttachmentKeys.clear();
 }
 
@@ -65,6 +69,43 @@ const TERMINAL_FINANCIAL_STATUS = new Set<EmdBgRecord['status']>([
 
 function isBootstrappedAdminUser(user: User | null): boolean {
   return Boolean(user?.emailVerified && user.email === 'vanshsaxena7498@gmail.com');
+}
+
+function normalizeTenantId(workspaceTenantId?: string | null): string | null {
+  if (!workspaceTenantId || typeof workspaceTenantId !== 'string') return null;
+  const trimmed = workspaceTenantId.trim();
+  if (!trimmed || trimmed === 'admin_vanshsales') return null;
+  return sanitizeDocId(trimmed);
+}
+
+function getTenantPathPrefix(uid: string, workspaceTenantId?: string | null): string {
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  return safeTenant ? `users/${uid}/workspaces/${safeTenant}` : `users/${uid}`;
+}
+
+function getTenantDoc(
+  uid: string,
+  workspaceTenantId: string | null | undefined,
+  colName: string,
+  docId: string,
+) {
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  if (safeTenant) {
+    return doc(db, 'users', uid, 'workspaces', safeTenant, colName, docId);
+  }
+  return doc(db, 'users', uid, colName, docId);
+}
+
+function getTenantCollection(
+  uid: string,
+  workspaceTenantId: string | null | undefined,
+  colName: string,
+) {
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  if (safeTenant) {
+    return collection(db, 'users', uid, 'workspaces', safeTenant, colName);
+  }
+  return collection(db, 'users', uid, colName);
 }
 
 function docToTender(data: Record<string, unknown>): Tender {
@@ -152,7 +193,7 @@ function docToProfile(data: Record<string, unknown>): FirmProfile {
     firmName: String(data.firmName ?? 'Corporate Tender Desk'),
     gstin: String(data.gstin ?? ''),
     udyamNumber: String(data.udyamNumber ?? ''),
-    adminName: String(data.adminName ?? 'Vansh Saxena'),
+    adminName: String(data.adminName ?? 'Tender Desk User'),
     adminPhotoUrl: String(data.adminPhotoUrl ?? ''),
   };
 }
@@ -165,11 +206,11 @@ function docToPreferences(data: Record<string, unknown>): UserPreferences {
   };
 }
 
-function docToWhatsAppConfig(data: Record<string, unknown>): WhatsAppSettings {
+function docToEmailConfig(data: Record<string, unknown>): EmailAlertSettings {
   return {
     enabled: data.enabled !== false,
-    recipientName: String(data.recipientName ?? 'Vansh'),
-    recipientPhone: String(data.recipientPhone ?? '9717690890'),
+    recipientName: String(data.recipientName ?? 'User'),
+    recipientEmail: String(data.recipientEmail ?? ''),
   };
 }
 
@@ -182,25 +223,33 @@ function docToSheetConfig(data: Record<string, unknown>): GoogleSheetSettings {
   };
 }
 
-function docToWhatsAppAlertLog(data: Record<string, unknown>): WhatsAppAlertLog {
+function docToEmailAlertLog(data: Record<string, unknown>): EmailAlertLog {
   return {
     id: String(data.id ?? ''),
-    milestoneKey: String(data.milestoneKey ?? data.id ?? ''),
+    slotKey: String(data.slotKey ?? data.id ?? ''),
     tenderRefId: String(data.tenderRefId ?? ''),
     tenderId: String(data.tenderId ?? ''),
-    milestone: (data.milestone as WhatsAppAlertLog['milestone']) || 'alert_48h',
-    recipientName: String(data.recipientName ?? 'Vansh'),
-    recipientPhone: String(data.recipientPhone ?? '919717690890'),
+    slot: (data.slot as EmailAlertLog['slot']) || 'slot_11am',
+    recipientName: String(data.recipientName ?? 'User'),
+    recipientEmail: String(data.recipientEmail ?? ''),
     dueDateIso: String(data.dueDateIso ?? ''),
-    status: (data.status as WhatsAppAlertLog['status']) || 'manual_ready',
-    provider: String(data.provider ?? 'manual_ready'),
+    status: (data.status as EmailAlertLog['status']) || 'sent',
+    provider: String(data.provider ?? 'smtp'),
+    subject: String(data.subject ?? ''),
     message: String(data.message ?? ''),
     createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
   };
 }
 
-export async function ensureUserRootDocument(user: User): Promise<void> {
-  if (ensuredUserUids.has(user.uid)) return;
+export async function ensureUserRootDocument(
+  user: User,
+  workspaceTenantId?: string | null,
+  sessionMeta?: Pick<CrmUserSession, 'username' | 'email'> | null,
+): Promise<void> {
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  const cacheKey = `${user.uid}::${safeTenant || 'admin'}`;
+  if (ensuredWorkspaceKeys.has(cacheKey)) return;
+
   const userPath = `users/${user.uid}`;
   const userRef = doc(db, 'users', user.uid);
   const safeEmail = (user.email ?? '').slice(0, 200);
@@ -230,17 +279,111 @@ export async function ensureUserRootDocument(user: User): Promise<void> {
         });
       }
     }
-    ensuredUserUids.add(user.uid);
+
+    if (safeTenant) {
+      const wsPath = `users/${user.uid}/workspaces/${safeTenant}`;
+      const wsRef = doc(db, 'users', user.uid, 'workspaces', safeTenant);
+      const wsSnap = await getDoc(wsRef);
+      const existingCreatedAt = wsSnap.exists() ? wsSnap.data().createdAt : undefined;
+      const wsPayload = buildWorkspaceRootPayload(
+        {
+          ownerUid: user.uid,
+          tenantId: safeTenant,
+          username: sessionMeta?.username || safeTenant,
+          email: sessionMeta?.email || safeEmail,
+        },
+        serverTimestamp(),
+        existingCreatedAt,
+      );
+      if (!wsSnap.exists()) {
+        await setDoc(wsRef, wsPayload);
+      } else {
+        const wsData = wsSnap.data();
+        if (wsData.ownerUid !== user.uid || wsData.tenantId !== safeTenant || !wsData.createdAt) {
+          await setDoc(wsRef, wsPayload);
+        }
+      }
+      void wsPath;
+    }
+
+    ensuredWorkspaceKeys.add(cacheKey);
   } catch (error) {
-    ensuredUserUids.delete(user.uid);
+    ensuredWorkspaceKeys.delete(cacheKey);
     handleFirestoreError(error, OperationType.WRITE, userPath);
   }
 }
 
-export async function syncPreferencesToCloud(user: User, prefs: UserPreferences): Promise<void> {
-  await ensureUserRootDocument(user);
-  const path = `users/${user.uid}/settings/preferences`;
-  const ref = doc(db, 'users', user.uid, 'settings', 'preferences');
+export async function syncSecondaryUserToCloud(
+  user: User,
+  summary: SecondaryUserSummary,
+): Promise<void> {
+  const safeId = sanitizeDocId(summary.userId);
+  const path = `secondaryUsers/${safeId}`;
+  const ref = doc(db, 'secondaryUsers', safeId);
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const ownerUid = snap.exists() && typeof snap.data().ownerUid === 'string'
+      ? snap.data().ownerUid
+      : user.uid;
+    const payload = buildSecondaryUserCloudPayload(
+      {
+        ownerUid,
+        userId: safeId,
+        username: summary.username,
+        email: summary.email,
+        isActive: summary.isActive,
+        createdAtIso: summary.createdAt,
+        lastLoginAtIso: summary.lastLoginAt,
+      },
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    await setDoc(ref, payload);
+  } catch {
+    // Non-fatal if directory write isn't permitted for current auth user
+  }
+  void path;
+}
+
+export async function fetchSecondaryUsersFromCloud(
+  adminUser: User,
+): Promise<SecondaryUserSummary[]> {
+  if (!isBootstrappedAdminUser(adminUser)) return [];
+  const path = 'secondaryUsers';
+  try {
+    const snap = await getDocs(collection(db, 'secondaryUsers'));
+    return snap.docs
+      .map((d) => {
+        const data = d.data();
+        return {
+          userId: String(data.userId ?? d.id),
+          username: String(data.username ?? ''),
+          email: String(data.email ?? ''),
+          role: 'secondary' as const,
+          createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
+          lastLoginAt:
+            typeof data.clientLastLoginAt === 'string' && data.clientLastLoginAt
+              ? data.clientLastLoginAt
+              : undefined,
+          isActive: data.isActive !== false,
+        };
+      })
+      .filter((item) => item.username.length > 0 && item.email.length > 0);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
+}
+
+export async function syncPreferencesToCloud(
+  user: User,
+  prefs: UserPreferences,
+  workspaceTenantId?: string | null,
+): Promise<void> {
+  await ensureUserRootDocument(user, workspaceTenantId);
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/settings/preferences`;
+  const ref = getTenantDoc(user.uid, workspaceTenantId, 'settings', 'preferences');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -256,10 +399,15 @@ export async function syncPreferencesToCloud(user: User, prefs: UserPreferences)
   }
 }
 
-export async function syncProfileToCloud(user: User, profile: FirmProfile): Promise<void> {
-  await ensureUserRootDocument(user);
-  const path = `users/${user.uid}/profile/firm`;
-  const ref = doc(db, 'users', user.uid, 'profile', 'firm');
+export async function syncProfileToCloud(
+  user: User,
+  profile: FirmProfile,
+  workspaceTenantId?: string | null,
+): Promise<void> {
+  await ensureUserRootDocument(user, workspaceTenantId);
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/profile/firm`;
+  const ref = getTenantDoc(user.uid, workspaceTenantId, 'profile', 'firm');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -270,17 +418,19 @@ export async function syncProfileToCloud(user: User, profile: FirmProfile): Prom
   }
 }
 
-export async function syncWhatsAppConfigToCloud(
+export async function syncEmailConfigToCloud(
   user: User,
-  config: WhatsAppSettings,
+  config: EmailAlertSettings,
+  workspaceTenantId?: string | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user);
-  const path = `users/${user.uid}/whatsappConfig/default`;
-  const ref = doc(db, 'users', user.uid, 'whatsappConfig', 'default');
+  await ensureUserRootDocument(user, workspaceTenantId);
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/emailConfig/default`;
+  const ref = getTenantDoc(user.uid, workspaceTenantId, 'emailConfig', 'default');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
-    const payload = buildCloudWhatsAppConfigPayload(
+    const payload = buildCloudEmailConfigPayload(
       config,
       user.uid,
       serverTimestamp(),
@@ -295,10 +445,12 @@ export async function syncWhatsAppConfigToCloud(
 export async function syncSheetConfigToCloud(
   user: User,
   config: GoogleSheetSettings,
+  workspaceTenantId?: string | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user);
-  const path = `users/${user.uid}/sheetConfig/default`;
-  const ref = doc(db, 'users', user.uid, 'sheetConfig', 'default');
+  await ensureUserRootDocument(user, workspaceTenantId);
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/sheetConfig/default`;
+  const ref = getTenantDoc(user.uid, workspaceTenantId, 'sheetConfig', 'default');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -314,18 +466,20 @@ export async function syncSheetConfigToCloud(
   }
 }
 
-export async function syncWhatsAppAlertLogToCloud(
+export async function syncEmailAlertLogToCloud(
   user: User,
-  log: WhatsAppAlertLog,
+  log: EmailAlertLog,
+  workspaceTenantId?: string | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user);
+  await ensureUserRootDocument(user, workspaceTenantId);
   const safeId = sanitizeDocId(log.id);
-  const path = `users/${user.uid}/whatsappAlerts/${safeId}`;
-  const ref = doc(db, 'users', user.uid, 'whatsappAlerts', safeId);
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/emailAlerts/${safeId}`;
+  const ref = getTenantDoc(user.uid, workspaceTenantId, 'emailAlerts', safeId);
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
-    const payload = buildCloudWhatsAppAlertLogPayload(
+    const payload = buildCloudEmailAlertLogPayload(
       { ...log, id: safeId },
       user.uid,
       serverTimestamp(),
@@ -340,16 +494,19 @@ export async function syncWhatsAppAlertLogToCloud(
 export async function syncAttachmentFilesToCloud(
   user: User,
   attachments: AttachmentItem[] | undefined,
+  workspaceTenantId?: string | null,
 ): Promise<void> {
   const list = attachments ?? [];
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  const prefix = getTenantPathPrefix(user.uid, safeTenant);
   for (const att of list) {
     if (!att.dataUrl) continue;
     const safeId = sanitizeDocId(att.id);
-    const cacheKey = `${user.uid}:${safeId}:${att.fileSize}:${att.uploadedAt}`;
+    const cacheKey = `${user.uid}:${safeTenant || 'admin'}:${safeId}:${att.fileSize}:${att.uploadedAt}`;
     if (syncedAttachmentKeys.has(cacheKey)) continue;
 
-    const path = `users/${user.uid}/attachmentFiles/${safeId}`;
-    const ref = doc(db, 'users', user.uid, 'attachmentFiles', safeId);
+    const path = `${prefix}/attachmentFiles/${safeId}`;
+    const ref = getTenantDoc(user.uid, safeTenant, 'attachmentFiles', safeId);
     try {
       const snap = await getDoc(ref);
       const existingData = snap.exists() ? snap.data() : null;
@@ -385,6 +542,7 @@ export async function uploadMafDocumentFile(
   trackerId: string,
   itemId: string,
   file: File,
+  workspaceTenantId?: string | null,
 ): Promise<{
   mafDocumentUrl: string;
   mafDocumentName: string;
@@ -395,6 +553,7 @@ export async function uploadMafDocumentFile(
     throw new Error(validationErr);
   }
 
+  const safeTenant = normalizeTenantId(workspaceTenantId);
   const isCompressibleImage =
     file.type.startsWith('image/') && file.type !== 'image/svg+xml' && file.type !== 'image/gif';
 
@@ -406,7 +565,9 @@ export async function uploadMafDocumentFile(
       );
     }
     const safeName = file.name.replace(/[^a-zA-Z0-9._\-]/g, '_');
-    const path = `users/${user.uid}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`;
+    const path = safeTenant
+      ? `users/${user.uid}/workspaces/${safeTenant}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`
+      : `users/${user.uid}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`;
     try {
       const fileRef = storageRef(storage, path);
       await uploadBytes(fileRef, file, {
@@ -439,8 +600,8 @@ export async function uploadMafDocumentFile(
   };
 
   if (user) {
-    await ensureUserRootDocument(user);
-    await syncAttachmentFilesToCloud(user, [attachmentItem]);
+    await ensureUserRootDocument(user, safeTenant);
+    await syncAttachmentFilesToCloud(user, [attachmentItem], safeTenant);
   }
 
   return {
@@ -450,13 +611,19 @@ export async function uploadMafDocumentFile(
   };
 }
 
-export async function syncTenderToCloud(user: User, tender: Tender): Promise<void> {
-  await ensureUserRootDocument(user);
-  await syncAttachmentFilesToCloud(user, tender.attachments);
+export async function syncTenderToCloud(
+  user: User,
+  tender: Tender,
+  workspaceTenantId?: string | null,
+): Promise<void> {
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  await ensureUserRootDocument(user, safeTenant);
+  await syncAttachmentFilesToCloud(user, tender.attachments, safeTenant);
 
   const safeId = sanitizeDocId(tender.id);
-  const path = `users/${user.uid}/tenders/${safeId}`;
-  const ref = doc(db, 'users', user.uid, 'tenders', safeId);
+  const prefix = getTenantPathPrefix(user.uid, safeTenant);
+  const path = `${prefix}/tenders/${safeId}`;
+  const ref = getTenantDoc(user.uid, safeTenant, 'tenders', safeId);
   try {
     const snap = await getDoc(ref);
     if (snap.exists()) {
@@ -478,23 +645,34 @@ export async function syncTenderToCloud(user: User, tender: Tender): Promise<voi
   }
 }
 
-export async function deleteTenderFromCloud(user: User, tenderId: string): Promise<void> {
+export async function deleteTenderFromCloud(
+  user: User,
+  tenderId: string,
+  workspaceTenantId?: string | null,
+): Promise<void> {
   const safeId = sanitizeDocId(tenderId);
-  const path = `users/${user.uid}/tenders/${safeId}`;
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/tenders/${safeId}`;
   try {
-    await deleteDoc(doc(db, 'users', user.uid, 'tenders', safeId));
+    await deleteDoc(getTenantDoc(user.uid, workspaceTenantId, 'tenders', safeId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
 
-export async function syncEmdRecordToCloud(user: User, record: EmdBgRecord): Promise<void> {
-  await ensureUserRootDocument(user);
-  await syncAttachmentFilesToCloud(user, record.attachments);
+export async function syncEmdRecordToCloud(
+  user: User,
+  record: EmdBgRecord,
+  workspaceTenantId?: string | null,
+): Promise<void> {
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  await ensureUserRootDocument(user, safeTenant);
+  await syncAttachmentFilesToCloud(user, record.attachments, safeTenant);
 
   const safeId = sanitizeDocId(record.id);
-  const path = `users/${user.uid}/emdRecords/${safeId}`;
-  const ref = doc(db, 'users', user.uid, 'emdRecords', safeId);
+  const prefix = getTenantPathPrefix(user.uid, safeTenant);
+  const path = `${prefix}/emdRecords/${safeId}`;
+  const ref = getTenantDoc(user.uid, safeTenant, 'emdRecords', safeId);
   try {
     const snap = await getDoc(ref);
     if (snap.exists()) {
@@ -516,11 +694,16 @@ export async function syncEmdRecordToCloud(user: User, record: EmdBgRecord): Pro
   }
 }
 
-export async function deleteEmdRecordFromCloud(user: User, recordId: string): Promise<void> {
+export async function deleteEmdRecordFromCloud(
+  user: User,
+  recordId: string,
+  workspaceTenantId?: string | null,
+): Promise<void> {
   const safeId = sanitizeDocId(recordId);
-  const path = `users/${user.uid}/emdRecords/${safeId}`;
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/emdRecords/${safeId}`;
   try {
-    await deleteDoc(doc(db, 'users', user.uid, 'emdRecords', safeId));
+    await deleteDoc(getTenantDoc(user.uid, workspaceTenantId, 'emdRecords', safeId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -529,8 +712,10 @@ export async function deleteEmdRecordFromCloud(user: User, recordId: string): Pr
 export async function syncMafTrackerToCloud(
   user: User,
   tracker: MafTrackerRecord,
+  workspaceTenantId?: string | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user);
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  await ensureUserRootDocument(user, safeTenant);
 
   const inlineMafAttachments: AttachmentItem[] = [];
   for (const item of tracker.itemsMAF ?? []) {
@@ -549,12 +734,13 @@ export async function syncMafTrackerToCloud(
     }
   }
   if (inlineMafAttachments.length > 0) {
-    await syncAttachmentFilesToCloud(user, inlineMafAttachments);
+    await syncAttachmentFilesToCloud(user, inlineMafAttachments, safeTenant);
   }
 
   const safeId = sanitizeDocId(tracker.id);
-  const path = `users/${user.uid}/maf_tracker/${safeId}`;
-  const ref = doc(db, 'users', user.uid, 'maf_tracker', safeId);
+  const prefix = getTenantPathPrefix(user.uid, safeTenant);
+  const path = `${prefix}/maf_tracker/${safeId}`;
+  const ref = getTenantDoc(user.uid, safeTenant, 'maf_tracker', safeId);
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -570,11 +756,16 @@ export async function syncMafTrackerToCloud(
   }
 }
 
-export async function deleteMafTrackerFromCloud(user: User, trackerId: string): Promise<void> {
+export async function deleteMafTrackerFromCloud(
+  user: User,
+  trackerId: string,
+  workspaceTenantId?: string | null,
+): Promise<void> {
   const safeId = sanitizeDocId(trackerId);
-  const path = `users/${user.uid}/maf_tracker/${safeId}`;
+  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const path = `${prefix}/maf_tracker/${safeId}`;
   try {
-    await deleteDoc(doc(db, 'users', user.uid, 'maf_tracker', safeId));
+    await deleteDoc(getTenantDoc(user.uid, workspaceTenantId, 'maf_tracker', safeId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -583,11 +774,13 @@ export async function deleteMafTrackerFromCloud(user: User, trackerId: string): 
 export async function fetchAttachmentFileDataUrl(
   uid: string,
   attachmentId: string,
+  workspaceTenantId?: string | null,
 ): Promise<string | null> {
   const safeId = sanitizeDocId(attachmentId);
-  const path = `users/${uid}/attachmentFiles/${safeId}`;
+  const prefix = getTenantPathPrefix(uid, workspaceTenantId);
+  const path = `${prefix}/attachmentFiles/${safeId}`;
   try {
-    const snap = await getDoc(doc(db, 'users', uid, 'attachmentFiles', safeId));
+    const snap = await getDoc(getTenantDoc(uid, workspaceTenantId, 'attachmentFiles', safeId));
     if (!snap.exists()) return null;
     const dataUrl = snap.data().dataUrl;
     return typeof dataUrl === 'string' && dataUrl.length > 0 ? dataUrl : null;
@@ -596,39 +789,44 @@ export async function fetchAttachmentFileDataUrl(
   }
 }
 
-export async function fetchAllFromCloud(uid: string): Promise<{
+export async function fetchAllFromCloud(
+  uid: string,
+  workspaceTenantId?: string | null,
+): Promise<{
   profile: FirmProfile | null;
   preferences: UserPreferences | null;
-  whatsappConfig: WhatsAppSettings | null;
+  emailConfig: EmailAlertSettings | null;
   sheetConfig: GoogleSheetSettings | null;
-  whatsappAlerts: WhatsAppAlertLog[];
+  emailAlerts: EmailAlertLog[];
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
   attachmentFiles: Map<string, string>;
 }> {
-  const profilePath = `users/${uid}/profile/firm`;
-  const prefsPath = `users/${uid}/settings/preferences`;
-  const waConfigPath = `users/${uid}/whatsappConfig/default`;
-  const sheetConfigPath = `users/${uid}/sheetConfig/default`;
-  const waAlertsPath = `users/${uid}/whatsappAlerts`;
-  const tendersPath = `users/${uid}/tenders`;
-  const emdPath = `users/${uid}/emdRecords`;
-  const mafPath = `users/${uid}/maf_tracker`;
-  const filesPath = `users/${uid}/attachmentFiles`;
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  const prefix = getTenantPathPrefix(uid, safeTenant);
+  const profilePath = `${prefix}/profile/firm`;
+  const prefsPath = `${prefix}/settings/preferences`;
+  const emailConfigPath = `${prefix}/emailConfig/default`;
+  const sheetConfigPath = `${prefix}/sheetConfig/default`;
+  const emailAlertsPath = `${prefix}/emailAlerts`;
+  const tendersPath = `${prefix}/tenders`;
+  const emdPath = `${prefix}/emdRecords`;
+  const mafPath = `${prefix}/maf_tracker`;
+  const filesPath = `${prefix}/attachmentFiles`;
 
   let profile: FirmProfile | null = null;
   let preferences: UserPreferences | null = null;
-  let whatsappConfig: WhatsAppSettings | null = null;
+  let emailConfig: EmailAlertSettings | null = null;
   let sheetConfig: GoogleSheetSettings | null = null;
-  let whatsappAlerts: WhatsAppAlertLog[] = [];
+  let emailAlerts: EmailAlertLog[] = [];
   let tenders: Tender[] = [];
   let emdRecords: EmdBgRecord[] = [];
   let mafTrackers: MafTrackerRecord[] = [];
   const attachmentFiles = new Map<string, string>();
 
   try {
-    const profileSnap = await getDoc(doc(db, 'users', uid, 'profile', 'firm'));
+    const profileSnap = await getDoc(getTenantDoc(uid, safeTenant, 'profile', 'firm'));
     if (profileSnap.exists()) {
       profile = docToProfile(profileSnap.data());
     }
@@ -637,7 +835,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
-    const prefsSnap = await getDoc(doc(db, 'users', uid, 'settings', 'preferences'));
+    const prefsSnap = await getDoc(getTenantDoc(uid, safeTenant, 'settings', 'preferences'));
     if (prefsSnap.exists()) {
       preferences = docToPreferences(prefsSnap.data());
     }
@@ -646,7 +844,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
-    const tQuery = query(collection(db, 'users', uid, 'tenders'), where('ownerUid', '==', uid));
+    const tQuery = query(getTenantCollection(uid, safeTenant, 'tenders'), where('ownerUid', '==', uid));
     const tSnap = await getDocs(tQuery);
     tenders = tSnap.docs.map((d) => docToTender(d.data()));
   } catch (error) {
@@ -654,7 +852,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
-    const eQuery = query(collection(db, 'users', uid, 'emdRecords'), where('ownerUid', '==', uid));
+    const eQuery = query(getTenantCollection(uid, safeTenant, 'emdRecords'), where('ownerUid', '==', uid));
     const eSnap = await getDocs(eQuery);
     emdRecords = eSnap.docs.map((d) => docToEmdRecord(d.data()));
   } catch (error) {
@@ -662,7 +860,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
-    const mQuery = query(collection(db, 'users', uid, 'maf_tracker'), where('ownerUid', '==', uid));
+    const mQuery = query(getTenantCollection(uid, safeTenant, 'maf_tracker'), where('ownerUid', '==', uid));
     const mSnap = await getDocs(mQuery);
     mafTrackers = mSnap.docs.map((d) => docToMafTracker(d.data()));
   } catch (error) {
@@ -671,7 +869,7 @@ export async function fetchAllFromCloud(uid: string): Promise<{
 
   try {
     const fQuery = query(
-      collection(db, 'users', uid, 'attachmentFiles'),
+      getTenantCollection(uid, safeTenant, 'attachmentFiles'),
       where('ownerUid', '==', uid),
     );
     const fSnap = await getDocs(fQuery);
@@ -686,16 +884,16 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
-    const waConfigSnap = await getDoc(doc(db, 'users', uid, 'whatsappConfig', 'default'));
-    if (waConfigSnap.exists()) {
-      whatsappConfig = docToWhatsAppConfig(waConfigSnap.data());
+    const emailConfigSnap = await getDoc(getTenantDoc(uid, safeTenant, 'emailConfig', 'default'));
+    if (emailConfigSnap.exists()) {
+      emailConfig = docToEmailConfig(emailConfigSnap.data());
     }
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, waConfigPath);
+    handleFirestoreError(error, OperationType.GET, emailConfigPath);
   }
 
   try {
-    const sheetConfigSnap = await getDoc(doc(db, 'users', uid, 'sheetConfig', 'default'));
+    const sheetConfigSnap = await getDoc(getTenantDoc(uid, safeTenant, 'sheetConfig', 'default'));
     if (sheetConfigSnap.exists()) {
       sheetConfig = docToSheetConfig(sheetConfigSnap.data());
     }
@@ -704,24 +902,24 @@ export async function fetchAllFromCloud(uid: string): Promise<{
   }
 
   try {
-    const waAlertsQuery = query(
-      collection(db, 'users', uid, 'whatsappAlerts'),
+    const emailAlertsQuery = query(
+      getTenantCollection(uid, safeTenant, 'emailAlerts'),
       where('ownerUid', '==', uid),
     );
-    const waSnap = await getDocs(waAlertsQuery);
-    whatsappAlerts = waSnap.docs
-      .map((d) => docToWhatsAppAlertLog(d.data()))
+    const emailSnap = await getDocs(emailAlertsQuery);
+    emailAlerts = emailSnap.docs
+      .map((d) => docToEmailAlertLog(d.data()))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, waAlertsPath);
+    handleFirestoreError(error, OperationType.LIST, emailAlertsPath);
   }
 
   return {
     profile,
     preferences,
-    whatsappConfig,
+    emailConfig,
     sheetConfig,
-    whatsappAlerts,
+    emailAlerts,
     tenders,
     emdRecords,
     mafTrackers,
@@ -736,21 +934,23 @@ export async function backupAllToCloud(
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
   mafTrackers: MafTrackerRecord[] = [],
+  workspaceTenantId?: string | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user);
-  await syncProfileToCloud(user, profile);
-  await syncPreferencesToCloud(user, preferences);
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  await ensureUserRootDocument(user, safeTenant);
+  await syncProfileToCloud(user, profile, safeTenant);
+  await syncPreferencesToCloud(user, preferences, safeTenant);
 
   for (const tender of tenders) {
-    await syncTenderToCloud(user, tender);
+    await syncTenderToCloud(user, tender, safeTenant);
   }
 
   for (const record of emdRecords) {
-    await syncEmdRecordToCloud(user, record);
+    await syncEmdRecordToCloud(user, record, safeTenant);
   }
 
   for (const tracker of mafTrackers) {
-    await syncMafTrackerToCloud(user, tracker);
+    await syncMafTrackerToCloud(user, tracker, safeTenant);
   }
 }
 
@@ -761,9 +961,11 @@ export async function replaceCloudDataset(
   tenders: Tender[],
   emdRecords: EmdBgRecord[],
   mafTrackers: MafTrackerRecord[] = [],
+  workspaceTenantId?: string | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user);
-  const existing = await fetchAllFromCloud(user.uid);
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  await ensureUserRootDocument(user, safeTenant);
+  const existing = await fetchAllFromCloud(user.uid, safeTenant);
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
   const nextMafIds = new Set(mafTrackers.map((m) => sanitizeDocId(m.id)));
@@ -785,35 +987,44 @@ export async function replaceCloudDataset(
 
   for (const oldTender of existing.tenders) {
     if (!nextTenderIds.has(sanitizeDocId(oldTender.id))) {
-      await deleteTenderFromCloud(user, oldTender.id);
+      await deleteTenderFromCloud(user, oldTender.id, safeTenant);
     }
   }
 
   for (const oldEmd of existing.emdRecords) {
     if (!nextEmdIds.has(sanitizeDocId(oldEmd.id))) {
-      await deleteEmdRecordFromCloud(user, oldEmd.id);
+      await deleteEmdRecordFromCloud(user, oldEmd.id, safeTenant);
     }
   }
 
   for (const oldMaf of existing.mafTrackers) {
     if (!nextMafIds.has(sanitizeDocId(oldMaf.id))) {
-      await deleteMafTrackerFromCloud(user, oldMaf.id);
+      await deleteMafTrackerFromCloud(user, oldMaf.id, safeTenant);
     }
   }
 
+  const prefix = getTenantPathPrefix(user.uid, safeTenant);
   for (const oldAttId of existing.attachmentFiles.keys()) {
     if (!nextAttachmentIds.has(sanitizeDocId(oldAttId))) {
       const safeId = sanitizeDocId(oldAttId);
-      const path = `users/${user.uid}/attachmentFiles/${safeId}`;
+      const path = `${prefix}/attachmentFiles/${safeId}`;
       try {
-        await deleteDoc(doc(db, 'users', user.uid, 'attachmentFiles', safeId));
+        await deleteDoc(getTenantDoc(user.uid, safeTenant, 'attachmentFiles', safeId));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, path);
       }
     }
   }
 
-  await backupAllToCloud(user, profile, preferences, tenders, emdRecords, mafTrackers);
+  await backupAllToCloud(
+    user,
+    profile,
+    preferences,
+    tenders,
+    emdRecords,
+    mafTrackers,
+    safeTenant,
+  );
 }
 
 export function subscribeToUserCloudData(
@@ -821,28 +1032,31 @@ export function subscribeToUserCloudData(
   callbacks: {
     onProfile: (profile: FirmProfile) => void;
     onPreferences: (prefs: UserPreferences) => void;
-    onWhatsAppConfig?: (config: WhatsAppSettings) => void;
+    onEmailConfig?: (config: EmailAlertSettings) => void;
     onSheetConfig?: (config: GoogleSheetSettings) => void;
-    onWhatsAppAlerts?: (logs: WhatsAppAlertLog[]) => void;
+    onEmailAlerts?: (logs: EmailAlertLog[]) => void;
     onTenders: (tenders: Tender[]) => void;
     onEmdRecords: (records: EmdBgRecord[]) => void;
     onMafTrackers: (trackers: MafTrackerRecord[]) => void;
     onAttachmentFiles: (fileMap: Map<string, string>) => void;
     onError: (err: Error) => void;
   },
+  workspaceTenantId?: string | null,
 ): Unsubscribe {
-  const profilePath = `users/${uid}/profile/firm`;
-  const prefsPath = `users/${uid}/settings/preferences`;
-  const waConfigPath = `users/${uid}/whatsappConfig/default`;
-  const sheetConfigPath = `users/${uid}/sheetConfig/default`;
-  const waAlertsPath = `users/${uid}/whatsappAlerts`;
-  const tendersPath = `users/${uid}/tenders`;
-  const emdPath = `users/${uid}/emdRecords`;
-  const mafPath = `users/${uid}/maf_tracker`;
-  const filesPath = `users/${uid}/attachmentFiles`;
+  const safeTenant = normalizeTenantId(workspaceTenantId);
+  const prefix = getTenantPathPrefix(uid, safeTenant);
+  const profilePath = `${prefix}/profile/firm`;
+  const prefsPath = `${prefix}/settings/preferences`;
+  const emailConfigPath = `${prefix}/emailConfig/default`;
+  const sheetConfigPath = `${prefix}/sheetConfig/default`;
+  const emailAlertsPath = `${prefix}/emailAlerts`;
+  const tendersPath = `${prefix}/tenders`;
+  const emdPath = `${prefix}/emdRecords`;
+  const mafPath = `${prefix}/maf_tracker`;
+  const filesPath = `${prefix}/attachmentFiles`;
 
   const unsubProfile = onSnapshot(
-    doc(db, 'users', uid, 'profile', 'firm'),
+    getTenantDoc(uid, safeTenant, 'profile', 'firm'),
     (snap) => {
       if (snap.exists()) {
         callbacks.onProfile(docToProfile(snap.data()));
@@ -858,7 +1072,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubPrefs = onSnapshot(
-    doc(db, 'users', uid, 'settings', 'preferences'),
+    getTenantDoc(uid, safeTenant, 'settings', 'preferences'),
     (snap) => {
       if (snap.exists()) {
         callbacks.onPreferences(docToPreferences(snap.data()));
@@ -874,7 +1088,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubTenders = onSnapshot(
-    query(collection(db, 'users', uid, 'tenders'), where('ownerUid', '==', uid)),
+    query(getTenantCollection(uid, safeTenant, 'tenders'), where('ownerUid', '==', uid)),
     (snap) => {
       callbacks.onTenders(snap.docs.map((d) => docToTender(d.data())));
     },
@@ -888,7 +1102,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubEmd = onSnapshot(
-    query(collection(db, 'users', uid, 'emdRecords'), where('ownerUid', '==', uid)),
+    query(getTenantCollection(uid, safeTenant, 'emdRecords'), where('ownerUid', '==', uid)),
     (snap) => {
       callbacks.onEmdRecords(snap.docs.map((d) => docToEmdRecord(d.data())));
     },
@@ -902,7 +1116,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubMaf = onSnapshot(
-    query(collection(db, 'users', uid, 'maf_tracker'), where('ownerUid', '==', uid)),
+    query(getTenantCollection(uid, safeTenant, 'maf_tracker'), where('ownerUid', '==', uid)),
     (snap) => {
       callbacks.onMafTrackers(snap.docs.map((d) => docToMafTracker(d.data())));
     },
@@ -916,7 +1130,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubFiles = onSnapshot(
-    query(collection(db, 'users', uid, 'attachmentFiles'), where('ownerUid', '==', uid)),
+    query(getTenantCollection(uid, safeTenant, 'attachmentFiles'), where('ownerUid', '==', uid)),
     (snap) => {
       const map = new Map<string, string>();
       for (const d of snap.docs) {
@@ -936,35 +1150,35 @@ export function subscribeToUserCloudData(
     },
   );
 
-  const unsubWaConfig = onSnapshot(
-    doc(db, 'users', uid, 'whatsappConfig', 'default'),
+  const unsubEmailConfig = onSnapshot(
+    getTenantDoc(uid, safeTenant, 'emailConfig', 'default'),
     (snap) => {
-      if (snap.exists() && callbacks.onWhatsAppConfig) {
-        callbacks.onWhatsAppConfig(docToWhatsAppConfig(snap.data()));
+      if (snap.exists() && callbacks.onEmailConfig) {
+        callbacks.onEmailConfig(docToEmailConfig(snap.data()));
       }
     },
     (error) => {
       try {
-        handleFirestoreError(error, OperationType.GET, waConfigPath);
+        handleFirestoreError(error, OperationType.GET, emailConfigPath);
       } catch (wrapped) {
         callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
       }
     },
   );
 
-  const unsubWaAlerts = onSnapshot(
-    query(collection(db, 'users', uid, 'whatsappAlerts'), where('ownerUid', '==', uid)),
+  const unsubEmailAlerts = onSnapshot(
+    query(getTenantCollection(uid, safeTenant, 'emailAlerts'), where('ownerUid', '==', uid)),
     (snap) => {
-      if (callbacks.onWhatsAppAlerts) {
+      if (callbacks.onEmailAlerts) {
         const sorted = snap.docs
-          .map((d) => docToWhatsAppAlertLog(d.data()))
+          .map((d) => docToEmailAlertLog(d.data()))
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-        callbacks.onWhatsAppAlerts(sorted);
+        callbacks.onEmailAlerts(sorted);
       }
     },
     (error) => {
       try {
-        handleFirestoreError(error, OperationType.LIST, waAlertsPath);
+        handleFirestoreError(error, OperationType.LIST, emailAlertsPath);
       } catch (wrapped) {
         callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
       }
@@ -972,7 +1186,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubSheetConfig = onSnapshot(
-    doc(db, 'users', uid, 'sheetConfig', 'default'),
+    getTenantDoc(uid, safeTenant, 'sheetConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onSheetConfig) {
         callbacks.onSheetConfig(docToSheetConfig(snap.data()));
@@ -990,9 +1204,9 @@ export function subscribeToUserCloudData(
   return () => {
     unsubProfile();
     unsubPrefs();
-    unsubWaConfig();
+    unsubEmailConfig();
     unsubSheetConfig();
-    unsubWaAlerts();
+    unsubEmailAlerts();
     unsubTenders();
     unsubEmd();
     unsubMaf();

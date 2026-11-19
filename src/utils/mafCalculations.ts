@@ -290,3 +290,30 @@ export function getMafContactDetails(
 
   return { concernedPersonName, contactNo, mailId };
 }
+
+export function isSafeHttpUrl(rawUrl?: string | null): boolean {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+export function isSafeMafDataUrl(rawUrl?: string | null): boolean {
+  const trimmed = (rawUrl || '').trim();
+  return /^data:(application\/pdf|image\/(?:png|jpeg|jpg|webp));base64,[a-zA-Z0-9+/=]+$/i.test(
+    trimmed,
+  );
+}
+
+export function sanitizeMafDocumentUrl(rawUrl?: string | null): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+  if (isSafeMafDataUrl(trimmed) || isSafeHttpUrl(trimmed)) {
+    return trimmed;
+  }
+  return '';
+}

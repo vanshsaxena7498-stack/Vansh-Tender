@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowLeft, Check, Plus, ShieldCheck, Trash2 } from 'lucide-react';
 import type {
   EmdSecurityType,
@@ -16,10 +16,13 @@ import {
   type AttachmentSlotState,
 } from '../utils/attachments';
 import { createMafItemId, MAF_STATUS_OPTIONS } from '../utils/mafCalculations';
+import { detectMsmeEmdExemption } from '../utils/bidSearchParser';
+import { getLocalDateInputValue } from '../utils/formatters';
 import { AttachmentSlots } from './AttachmentSlots';
 
 interface TenderFormModalProps {
   initialTender?: Tender | null;
+  existingTenders?: Tender[];
   onClose: () => void;
   onSave: (tender: Tender, syncToEmd: boolean, initialMafItems?: MafLineItem[]) => void;
 }
@@ -51,8 +54,14 @@ const STAGE_OPTIONS: TenderStage[] = [
   'Tender Not Filled',
 ];
 
-export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormModalProps) {
+export function TenderFormModal({
+  initialTender,
+  existingTenders,
+  onClose,
+  onSave,
+}: TenderFormModalProps) {
   const isEdit = Boolean(initialTender);
+  const todayLocal = getLocalDateInputValue();
 
   const [tenderId, setTenderId] = useState(initialTender?.tenderId ?? '');
   const [portal, setPortal] = useState<PortalType>(initialTender?.portal ?? 'GeM');
@@ -61,10 +70,10 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
   const [category, setCategory] = useState(initialTender?.category ?? '');
   const [title, setTitle] = useState(initialTender?.title ?? '');
   const [publishDate, setPublishDate] = useState(
-    initialTender?.publishDate ?? new Date().toISOString().slice(0, 10),
+    initialTender?.publishDate ?? todayLocal,
   );
   const [submissionDueDate, setSubmissionDueDate] = useState(
-    initialTender?.submissionDueDate ?? `${new Date().toISOString().slice(0, 10)}T17:00`,
+    initialTender?.submissionDueDate ?? `${todayLocal}T17:00`,
   );
   const [preBidDate, setPreBidDate] = useState(initialTender?.preBidDate ?? '');
   const [estimatedValue, setEstimatedValue] = useState(
@@ -101,6 +110,18 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
     },
   ]);
   const [errorMsg, setErrorMsg] = useState('');
+  const emdManuallyOverriddenRef = useRef(Boolean(initialTender));
+  const [msmeAutoDetected, setMsmeAutoDetected] = useState(false);
+
+  useEffect(() => {
+    if (isEdit || emdManuallyOverriddenRef.current) return;
+    const combinedText = [title, category, department, resultInfo].filter(Boolean).join(' ');
+    if (detectMsmeEmdExemption(combinedText, { includeBareMse: true })) {
+      setEmdStatus('Exempted - MSME/Startup');
+      setEmdAmount('0');
+      setMsmeAutoDetected(true);
+    }
+  }, [title, category, department, resultInfo, isEdit]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -116,8 +137,31 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (!tenderId.trim() || !department.trim() || !title.trim() || !submissionDueDate) {
+    const cleanTenderId = tenderId.trim();
+    if (!cleanTenderId || !department.trim() || !title.trim() || !submissionDueDate) {
       setErrorMsg('Please fill Tender ID, Department, Work Title, and Submission Due Date.');
+      return;
+    }
+
+    const duplicateTender = existingTenders?.find(
+      (t) =>
+        t.id !== initialTender?.id &&
+        t.tenderId.trim().toLowerCase() === cleanTenderId.toLowerCase(),
+    );
+    if (duplicateTender) {
+      setErrorMsg(
+        `Tender ID "${cleanTenderId}" is already tracked in Daily Tender Data. Please edit the existing record or enter a unique Tender ID.`,
+      );
+      return;
+    }
+
+    const parsedDue = new Date(submissionDueDate);
+    if (Number.isNaN(parsedDue.getTime())) {
+      setErrorMsg('Please enter a valid Submission Due Date & Time.');
+      return;
+    }
+    if (publishDate && submissionDueDate.slice(0, 10) < publishDate) {
+      setErrorMsg('Submission Due Date cannot be earlier than Publish Date.');
       return;
     }
 
@@ -509,7 +553,14 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
                   <select
                     id="t-emd-status"
                     value={emdStatus}
-                    onChange={(e) => setEmdStatus(e.target.value as EmdSecurityType)}
+                    onChange={(e) => {
+                      const next = e.target.value as EmdSecurityType;
+                      emdManuallyOverriddenRef.current = true;
+                      if (next !== 'Exempted - MSME/Startup') {
+                        setMsmeAutoDetected(false);
+                      }
+                      setEmdStatus(next);
+                    }}
                     className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   >
                     {EMD_OPTIONS.map((opt) => (
@@ -518,6 +569,11 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
                       </option>
                     ))}
                   </select>
+                  {msmeAutoDetected && emdStatus === 'Exempted - MSME/Startup' && (
+                    <p className="mt-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+                      Auto-detected: MSME / Udyam / Startup EMD Exemption (₹ 0)
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -533,7 +589,10 @@ export function TenderFormModal({ initialTender, onClose, onSave }: TenderFormMo
                     min={0}
                     disabled={!supportsEmdSync}
                     value={supportsEmdSync ? emdAmount : '0'}
-                    onChange={(e) => setEmdAmount(e.target.value)}
+                    onChange={(e) => {
+                      emdManuallyOverriddenRef.current = true;
+                      setEmdAmount(e.target.value);
+                    }}
                     className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 disabled:bg-slate-100 dark:disabled:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
