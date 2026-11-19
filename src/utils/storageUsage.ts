@@ -19,7 +19,7 @@ import {
   buildCloudSheetConfigPayload,
   buildCloudTenderPayload,
   sanitizeDocId,
-} from './cloudSyncHelpers';
+} from './cloudSyncHelpers.ts';
 
 export const FIRESTORE_FREE_QUOTA_BYTES = 1024 * 1024 * 1024; // 1 GiB (1,024 MiB)
 const FIRESTORE_DOC_OVERHEAD_BYTES = 160;

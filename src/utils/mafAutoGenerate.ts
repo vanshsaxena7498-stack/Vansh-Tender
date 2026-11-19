@@ -1,5 +1,5 @@
 import type { AttachmentItem, MafLineItem, MafTrackerRecord, Tender } from '../types/crm';
-import { createMafItemId } from './mafCalculations';
+import { createMafItemId } from './mafCalculations.ts';
 
 export interface ExtractedSpecItem {
   itemName: string;

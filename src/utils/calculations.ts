@@ -11,7 +11,7 @@ import {
   getFinancialYear,
   getHoursRemaining,
   getMonthKey,
-} from './formatters';
+} from './formatters.ts';
 
 export interface DashboardFilter {
   financialYear: string; // 'ALL' | 'FY 2025-26' | 'FY 2026-27' ...

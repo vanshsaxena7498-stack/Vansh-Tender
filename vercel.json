@@ -1,8 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/index.ts": {
-      "includeFiles": "{server-core.ts,firebase-applet-config.json,src/utils/**}",
+    "api/index.mjs": {
+      "includeFiles": "firebase-applet-config.json",
       "maxDuration": 60
     }
   },

@@ -4,7 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import test, { after, before } from 'node:test';
 import express from 'express';
-import handler, { restoreVercelApiUrl } from '../../api/index.ts';
+import handler, { restoreVercelApiUrl } from '../../api/_app.ts';
 import { createApiRouter } from '../../server-core.ts';
 
 const STATE_DIR = path.resolve(process.cwd(), '.data');

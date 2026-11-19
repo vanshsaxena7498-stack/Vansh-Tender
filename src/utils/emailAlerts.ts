@@ -1,12 +1,12 @@
 import type { EmailAlertSettings, EmailReminderSlot, Tender } from '../types/crm';
-import { sanitizeDocId } from './cloudSyncHelpers';
+import { sanitizeDocId } from './cloudSyncHelpers.ts';
 import {
   formatDateTime,
   formatINR,
   formatShortDate,
   getHoursRemaining,
   getLatestRemarkText,
-} from './formatters';
+} from './formatters.ts';
 
 export const ALERT_WINDOW_HOURS = 120; // 5 days
 export const EMAIL_RETRY_COOLDOWN_MS = 15 * 60 * 1000;

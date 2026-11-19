@@ -517,6 +517,19 @@ function detectEmailProvider(): 'resend' | 'smtp' | 'none' {
   return 'none';
 }
 
+const DEFAULT_MAIL_FROM = 'no-reply@vanshtender.in';
+
+function resolveMailFromHeader(): string {
+  const rawFrom =
+    process.env.MAIL_FROM?.trim() ||
+    process.env.RESEND_FROM_EMAIL?.trim() ||
+    DEFAULT_MAIL_FROM;
+  if (!rawFrom) {
+    return `Vansh Tender Software <${DEFAULT_MAIL_FROM}>`;
+  }
+  return rawFrom.includes('<') ? rawFrom : `Vansh Tender Software <${rawFrom}>`;
+}
+
 async function sendAppEmail(params: {
   to: string;
   subject: string;
@@ -532,6 +545,7 @@ async function sendAppEmail(params: {
 
   if (provider === 'resend') {
     try {
+      const fromHeader = resolveMailFromHeader();
       const res = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
@@ -539,9 +553,7 @@ async function sendAppEmail(params: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          from:
-            process.env.RESEND_FROM_EMAIL?.trim() ||
-            'Vansh Tender Software <onboarding@resend.dev>',
+          from: fromHeader,
           to: [recipient],
           subject: params.subject,
           text: params.text,

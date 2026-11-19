@@ -13,7 +13,7 @@ import {
   type Unsubscribe,
 } from 'firebase/firestore';
 import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
-import { db, handleFirestoreError, OperationType, storage } from '../lib/firebase';
+import { db, handleFirestoreError, OperationType, storage } from '../lib/firebase.ts';
 import type {
   AttachmentItem,
   CrmUserSession,
@@ -27,7 +27,7 @@ import type {
   Tender,
   UserPreferences,
 } from '../types/crm';
-import { MAX_ATTACHMENT_BYTES, readAttachmentForFirestore } from './attachments';
+import { MAX_ATTACHMENT_BYTES, readAttachmentForFirestore } from './attachments.ts';
 import {
   buildCloudAttachmentFilePayload,
   buildCloudEmailAlertLogPayload,
@@ -41,12 +41,12 @@ import {
   buildSecondaryUserCloudPayload,
   buildWorkspaceRootPayload,
   sanitizeDocId,
-} from './cloudSyncHelpers';
+} from './cloudSyncHelpers.ts';
 import {
   getMafContactDetails,
   getMafRequestedDate,
   validateMafUploadFile,
-} from './mafCalculations';
+} from './mafCalculations.ts';
 
 const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'L1 / Won',

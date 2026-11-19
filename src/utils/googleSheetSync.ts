@@ -5,8 +5,8 @@ import type {
   SheetSyncEntityType,
   Tender,
 } from '../types/crm';
-import { ACTIVE_LOCKED_STATUSES } from './calculations';
-import { getLatestRemarkText } from './formatters';
+import { ACTIVE_LOCKED_STATUSES } from './calculations.ts';
+import { getLatestRemarkText } from './formatters.ts';
 
 export const DEFAULT_GOOGLE_SHEET_SETTINGS: GoogleSheetSettings = {
   enabled: true,

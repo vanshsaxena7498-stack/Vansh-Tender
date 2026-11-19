@@ -10,7 +10,7 @@ import type {
   Tender,
   UserPreferences,
 } from '../types/crm';
-import { isSafeHttpUrl } from './mafCalculations';
+import { isSafeHttpUrl } from './mafCalculations.ts';
 
 export const CLOUD_LIMITS = {
   ID_MAX: 128,

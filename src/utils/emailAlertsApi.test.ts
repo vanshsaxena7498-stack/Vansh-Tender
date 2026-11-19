@@ -59,16 +59,23 @@ async function withApiServer(fn: (baseUrl: string) => Promise<void>): Promise<vo
 
 test('WhatsApp notification endpoints are removed and /api/notifications/email dispatches & deduplicates cleanly', async () => {
   const prevResend = process.env.RESEND_API_KEY;
+  const prevMailFrom = process.env.MAIL_FROM;
+  const prevResendFrom = process.env.RESEND_FROM_EMAIL;
   const prevFetch = globalThis.fetch;
   process.env.RESEND_API_KEY = 're_test_email_alert_key';
+  delete process.env.MAIL_FROM;
+  delete process.env.RESEND_FROM_EMAIL;
 
   let sentCount = 0;
-  let lastPayload: { to?: string[]; subject?: string; text?: string; html?: string } = {};
+  let lastAuthHeader = '';
+  let lastPayload: { from?: string; to?: string[]; subject?: string; text?: string; html?: string } = {};
 
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     if (url === 'https://api.resend.com/emails') {
       sentCount += 1;
+      const headers = (init?.headers || {}) as Record<string, string>;
+      lastAuthHeader = headers.Authorization || headers.authorization || '';
       lastPayload = JSON.parse(String(init?.body || '{}')) as typeof lastPayload;
       return new Response(JSON.stringify({ id: `em_${sentCount}` }), {
         status: 200,
@@ -105,7 +112,7 @@ test('WhatsApp notification endpoints are removed and /api/notifications/email d
       assert.equal(statusJson.defaultRecipientEmail, 'vanshsaxena7498@gmail.com');
       assert.deepEqual(statusJson.scheduleLabels, ['11:00 AM IST', '4:00 PM IST']);
 
-      // First dispatch for slotKey sends real email
+      // First dispatch for slotKey sends real email with RESEND_API_KEY + default no-reply@vanshtender.in
       const payload = {
         slotKey: 'email_tnd-1_2026-11-18_slot_11am',
         tenderRefId: 'tnd-1',
@@ -136,7 +143,24 @@ test('WhatsApp notification endpoints are removed and /api/notifications/email d
       assert.equal(firstJson.delivered, true);
       assert.equal(firstJson.logEntry.status, 'sent');
       assert.equal(sentCount, 1);
+      assert.equal(lastAuthHeader, 'Bearer re_test_email_alert_key');
+      assert.equal(lastPayload.from, 'Vansh Tender Software <no-reply@vanshtender.in>');
       assert.equal(lastPayload.to?.[0], 'vanshsaxena7498@gmail.com');
+
+      // Explicit MAIL_FROM env var overrides default sender cleanly
+      process.env.MAIL_FROM = 'no-reply@vanshtender.in';
+      const customFromRes = await prevFetch(`${baseUrl}/api/notifications/email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...payload,
+          slotKey: 'email_tnd-1_2026-11-18_slot_4pm',
+          slot: 'slot_4pm',
+        }),
+      });
+      assert.equal(customFromRes.status, 200);
+      assert.equal(sentCount, 2);
+      assert.equal(lastPayload.from, 'Vansh Tender Software <no-reply@vanshtender.in>');
 
       // Duplicate dispatch for same slotKey is deduplicated cleanly
       const dupRes = await prevFetch(`${baseUrl}/api/notifications/email`, {
@@ -153,7 +177,7 @@ test('WhatsApp notification endpoints are removed and /api/notifications/email d
       assert.equal(dupJson.ok, true);
       assert.equal(dupJson.deduplicated, true);
       assert.equal(dupJson.delivered, true);
-      assert.equal(sentCount, 1);
+      assert.equal(sentCount, 2);
     });
   } finally {
     globalThis.fetch = prevFetch;
@@ -161,6 +185,16 @@ test('WhatsApp notification endpoints are removed and /api/notifications/email d
       delete process.env.RESEND_API_KEY;
     } else {
       process.env.RESEND_API_KEY = prevResend;
+    }
+    if (prevMailFrom === undefined) {
+      delete process.env.MAIL_FROM;
+    } else {
+      process.env.MAIL_FROM = prevMailFrom;
+    }
+    if (prevResendFrom === undefined) {
+      delete process.env.RESEND_FROM_EMAIL;
+    } else {
+      process.env.RESEND_FROM_EMAIL = prevResendFrom;
     }
   }
 });
