@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
+  BookOpen,
   Building2,
+  Check,
   CheckCircle2,
   Cloud,
   CloudDownload,
@@ -12,6 +14,7 @@ import {
   ExternalLink,
   FileSpreadsheet,
   HardDrive,
+  Lock,
   LogOut,
   Mail,
   RefreshCw,
@@ -19,12 +22,22 @@ import {
   Send,
   ShieldCheck,
   Trash2,
+  Unlock,
   Upload,
   User,
   Users,
+  X,
 } from 'lucide-react';
+import {
+  BYOC_FIRESTORE_RULES_TEMPLATE,
+  buildByocConsoleUrl,
+  parseFirebaseConfigSnippet,
+  validateByocFirebaseConfig,
+} from '../lib/byocFirebase';
 import { firebaseConfig } from '../lib/firebase';
 import type {
+  ByocConnectionState,
+  ByocFirebaseConfig,
   CrmBackupPayload,
   CrmUserSession,
   EmailAlertLog,
@@ -38,6 +51,7 @@ import type {
   Tender,
 } from '../types/crm';
 import { compressProfilePhotoDataUrl } from '../utils/attachments';
+import { computeEffectivePresenceStatus } from '../utils/authCredentials';
 import { formatSlotLabel, isValidNotificationEmail } from '../utils/emailAlerts';
 import { buildCsvContent, downloadTextFile, formatDateTime } from '../utils/formatters';
 import {
@@ -80,6 +94,13 @@ interface SettingsTabProps {
   currentUser?: CrmUserSession | null;
   secondaryUsers?: SecondaryUserSummary[];
   onRefreshSecondaryUsers?: () => void;
+  byocConfig?: ByocFirebaseConfig | null;
+  byocConnection?: ByocConnectionState;
+  onSaveByocConfig?: (config: ByocFirebaseConfig) => Promise<void> | void;
+  onTestByocConnection?: (config: ByocFirebaseConfig) => Promise<ByocConnectionState>;
+  onClearByocConfig?: () => Promise<void> | void;
+  onToggleSecondaryUserStatus?: (userId: string, enable: boolean) => Promise<void> | void;
+  togglingUserId?: string | null;
 }
 
 export function SettingsTab({
@@ -115,7 +136,15 @@ export function SettingsTab({
   currentUser,
   secondaryUsers = [],
   onRefreshSecondaryUsers,
+  byocConfig = null,
+  byocConnection = { status: 'pending' },
+  onSaveByocConfig,
+  onTestByocConnection,
+  onClearByocConfig,
+  onToggleSecondaryUserStatus,
+  togglingUserId = null,
 }: SettingsTabProps) {
+  const isSecondary = currentUser?.role === 'secondary';
   const [firmName, setFirmName] = useState(profile.firmName);
   const [gstin, setGstin] = useState(profile.gstin);
   const [udyamNumber, setUdyamNumber] = useState(profile.udyamNumber);
@@ -123,6 +152,153 @@ export function SettingsTab({
   const [adminPhotoUrl, setAdminPhotoUrl] = useState(profile.adminPhotoUrl ?? '');
   const [photoError, setPhotoError] = useState('');
   const [profileSavedMsg, setProfileSavedMsg] = useState('');
+
+  // BYOC Firebase configuration states for secondary users
+  const [byocApiKey, setByocApiKey] = useState(byocConfig?.apiKey ?? '');
+  const [byocAuthDomain, setByocAuthDomain] = useState(byocConfig?.authDomain ?? '');
+  const [byocProjectId, setByocProjectId] = useState(byocConfig?.projectId ?? '');
+  const [byocStorageBucket, setByocStorageBucket] = useState(byocConfig?.storageBucket ?? '');
+  const [byocMessagingSenderId, setByocMessagingSenderId] = useState(
+    byocConfig?.messagingSenderId ?? '',
+  );
+  const [byocAppId, setByocAppId] = useState(byocConfig?.appId ?? '');
+  const [byocDatabaseId, setByocDatabaseId] = useState(byocConfig?.firestoreDatabaseId ?? '');
+  const [byocSnippetText, setByocSnippetText] = useState('');
+  const [byocFormMsg, setByocFormMsg] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
+  const [byocBusy, setByocBusy] = useState(false);
+  const [showByocGuideModal, setShowByocGuideModal] = useState(false);
+  const [copiedByocRules, setCopiedByocRules] = useState(false);
+
+  useEffect(() => {
+    setByocApiKey(byocConfig?.apiKey ?? '');
+    setByocAuthDomain(byocConfig?.authDomain ?? '');
+    setByocProjectId(byocConfig?.projectId ?? '');
+    setByocStorageBucket(byocConfig?.storageBucket ?? '');
+    setByocMessagingSenderId(byocConfig?.messagingSenderId ?? '');
+    setByocAppId(byocConfig?.appId ?? '');
+    setByocDatabaseId(byocConfig?.firestoreDatabaseId ?? '');
+  }, [byocConfig]);
+
+  const savedByocValidation = validateByocFirebaseConfig(byocConfig);
+  const isSavedByocReady = !isSecondary || savedByocValidation.valid;
+
+  const currentCandidateByoc: ByocFirebaseConfig = {
+    apiKey: byocApiKey.trim(),
+    authDomain: byocAuthDomain.trim(),
+    projectId: byocProjectId.trim(),
+    storageBucket: byocStorageBucket.trim(),
+    messagingSenderId: byocMessagingSenderId.trim(),
+    appId: byocAppId.trim(),
+    firestoreDatabaseId: byocDatabaseId.trim(),
+  };
+
+  const usageConsoleUrl = isSecondary
+    ? savedByocValidation.valid
+      ? buildByocConsoleUrl(
+          savedByocValidation.normalized.projectId,
+          savedByocValidation.normalized.firestoreDatabaseId,
+        )
+      : null
+    : `https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/usage`;
+
+  const handleParseByocSnippet = () => {
+    const parsed = parseFirebaseConfigSnippet(byocSnippetText);
+    if (!parsed) {
+      setByocFormMsg({
+        type: 'err',
+        msg: 'Could not extract firebaseConfig keys. Paste your JSON or const firebaseConfig = { apiKey: "...", projectId: "...", appId: "..." } snippet.',
+      });
+      return;
+    }
+    if (parsed.apiKey) setByocApiKey(parsed.apiKey);
+    if (parsed.authDomain) setByocAuthDomain(parsed.authDomain);
+    if (parsed.projectId) setByocProjectId(parsed.projectId);
+    if (parsed.storageBucket) setByocStorageBucket(parsed.storageBucket);
+    if (parsed.messagingSenderId) setByocMessagingSenderId(parsed.messagingSenderId);
+    if (parsed.appId) setByocAppId(parsed.appId);
+    if (parsed.firestoreDatabaseId !== undefined) setByocDatabaseId(parsed.firestoreDatabaseId);
+    setByocFormMsg({
+      type: 'ok',
+      msg: `Parsed configuration for project "${parsed.projectId || 'detected'}". Review fields below and click Save BYOC Config.`,
+    });
+  };
+
+  const handleSaveByocSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    const check = validateByocFirebaseConfig(currentCandidateByoc);
+    if (!check.valid) {
+      setByocFormMsg({ type: 'err', msg: check.error || 'Please fill in all required Firebase config fields.' });
+      return;
+    }
+    setByocBusy(true);
+    setByocFormMsg(null);
+    try {
+      await onSaveByocConfig?.(check.normalized);
+      setByocFormMsg({
+        type: 'ok',
+        msg: `Saved BYOC Firebase project "${check.normalized.projectId}". Now sign in with your Google account below to verify and sync.`,
+      });
+    } catch (err) {
+      setByocFormMsg({
+        type: 'err',
+        msg: err instanceof Error ? err.message : 'Unable to save BYOC Firebase configuration.',
+      });
+    } finally {
+      setByocBusy(false);
+    }
+  };
+
+  const handleTestByocClick = async () => {
+    const check = validateByocFirebaseConfig(currentCandidateByoc);
+    if (!check.valid) {
+      setByocFormMsg({ type: 'err', msg: check.error || 'Complete your BYOC config fields before testing.' });
+      return;
+    }
+    setByocBusy(true);
+    setByocFormMsg(null);
+    try {
+      await onSaveByocConfig?.(check.normalized);
+      if (onTestByocConnection) {
+        const result = await onTestByocConnection(check.normalized);
+        setByocFormMsg({
+          type: result.status === 'error' ? 'err' : 'ok',
+          msg: result.message || `BYOC check completed (${result.status}).`,
+        });
+      }
+    } catch (err) {
+      setByocFormMsg({
+        type: 'err',
+        msg: err instanceof Error ? err.message : 'Connection verification failed.',
+      });
+    } finally {
+      setByocBusy(false);
+    }
+  };
+
+  const handleClearByocClick = async () => {
+    setByocBusy(true);
+    setByocFormMsg(null);
+    try {
+      await onClearByocConfig?.();
+      setByocSnippetText('');
+      setByocFormMsg({
+        type: 'ok',
+        msg: 'BYOC Firebase configuration cleared. Workspace remains strictly isolated locally until reconfigured.',
+      });
+    } finally {
+      setByocBusy(false);
+    }
+  };
+
+  const handleCopyByocRules = async () => {
+    try {
+      await navigator.clipboard.writeText(BYOC_FIRESTORE_RULES_TEMPLATE);
+      setCopiedByocRules(true);
+      setTimeout(() => setCopiedByocRules(false), 2400);
+    } catch {
+      // Clipboard blocked in restricted iframe
+    }
+  };
 
   useEffect(() => {
     setFirmName(profile.firmName);
@@ -442,21 +618,267 @@ export function SettingsTab({
           </div>
         )}
 
+        {isSecondary && (
+          <div
+            data-testid="byoc-config-panel"
+            className="rounded-xl border border-blue-200 dark:border-blue-900/70 bg-blue-50/40 dark:bg-blue-950/20 p-5 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-blue-200/70 dark:border-blue-900/60">
+              <div className="space-y-0.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                    Bring-Your-Own-Cloud (BYOC) Firebase Storage
+                  </h3>
+                  <span
+                    data-testid="byoc-status-badge"
+                    className={`inline-flex items-center px-2 py-0.5 rounded border text-[11px] font-semibold ${
+                      byocConnection.status === 'connected'
+                        ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                        : byocConnection.status === 'auth_required'
+                          ? 'bg-amber-50 dark:bg-amber-950/50 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300'
+                          : byocConnection.status === 'error'
+                            ? 'bg-red-50 dark:bg-red-950/50 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                            : 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    {byocConnection.status === 'connected'
+                      ? 'Connected'
+                      : byocConnection.status === 'auth_required'
+                        ? 'Auth Required'
+                        : byocConnection.status === 'error'
+                          ? 'Connection Error'
+                          : 'Pending Setup'}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  Your tenders, documents, and backups store directly inside your own Google Cloud / Firebase project — completely isolated from Primary Admin storage.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowByocGuideModal(true)}
+                data-testid="open-byoc-guide-btn"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-blue-300 dark:border-blue-700 bg-white dark:bg-slate-900 hover:bg-blue-50 dark:hover:bg-blue-950/50 text-xs font-semibold text-[#1E3A8A] dark:text-blue-300 cursor-pointer shrink-0"
+              >
+                <BookOpen className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>2-Minute Setup Guide &amp; Rules</span>
+              </button>
+            </div>
+
+            {byocConnection.message && (
+              <p className="text-xs text-slate-700 dark:text-slate-300">{byocConnection.message}</p>
+            )}
+
+            {byocFormMsg && (
+              <div
+                role={byocFormMsg.type === 'err' ? 'alert' : 'status'}
+                className={`rounded-lg px-3.5 py-2 text-xs font-medium border ${
+                  byocFormMsg.type === 'ok'
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300'
+                    : 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                }`}
+              >
+                {byocFormMsg.msg}
+              </div>
+            )}
+
+            {/* Quick-paste firebaseConfig JSON / JS Snippet */}
+            <div className="space-y-2">
+              <label
+                htmlFor="byoc-snippet-paste"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+              >
+                Quick Import: Paste Firebase Web SDK Config Snippet (JSON or JS)
+              </label>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <textarea
+                  id="byoc-snippet-paste"
+                  rows={2}
+                  value={byocSnippetText}
+                  onChange={(e) => setByocSnippetText(e.target.value)}
+                  placeholder='Paste { apiKey: "...", authDomain: "...", projectId: "...", appId: "..." }'
+                  className="font-mono-num flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                />
+                <button
+                  type="button"
+                  onClick={handleParseByocSnippet}
+                  className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-medium text-slate-800 dark:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Code2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Parse Snippet</span>
+                </button>
+              </div>
+            </div>
+
+            <form onSubmit={(e) => void handleSaveByocSubmit(e)} className="space-y-3.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                <div>
+                  <label
+                    htmlFor="byoc-project-id"
+                    className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Firebase Project ID *
+                  </label>
+                  <input
+                    id="byoc-project-id"
+                    type="text"
+                    required
+                    value={byocProjectId}
+                    onChange={(e) => setByocProjectId(e.target.value)}
+                    placeholder="my-tender-cloud-123"
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="byoc-api-key"
+                    className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Web API Key (apiKey) *
+                  </label>
+                  <input
+                    id="byoc-api-key"
+                    type="text"
+                    required
+                    value={byocApiKey}
+                    onChange={(e) => setByocApiKey(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="byoc-auth-domain"
+                    className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Auth Domain (authDomain) *
+                  </label>
+                  <input
+                    id="byoc-auth-domain"
+                    type="text"
+                    required
+                    value={byocAuthDomain}
+                    onChange={(e) => setByocAuthDomain(e.target.value)}
+                    placeholder="my-tender-cloud-123.firebaseapp.com"
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="byoc-app-id"
+                    className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Firebase App ID (appId) *
+                  </label>
+                  <input
+                    id="byoc-app-id"
+                    type="text"
+                    required
+                    value={byocAppId}
+                    onChange={(e) => setByocAppId(e.target.value)}
+                    placeholder="1:1234567890:web:abcdef..."
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="byoc-storage-bucket"
+                    className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Storage Bucket
+                  </label>
+                  <input
+                    id="byoc-storage-bucket"
+                    type="text"
+                    value={byocStorageBucket}
+                    onChange={(e) => setByocStorageBucket(e.target.value)}
+                    placeholder="my-tender-cloud-123.firebasestorage.app"
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="byoc-database-id"
+                    className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Firestore Database ID (blank for default)
+                  </label>
+                  <input
+                    id="byoc-database-id"
+                    type="text"
+                    value={byocDatabaseId}
+                    onChange={(e) => setByocDatabaseId(e.target.value)}
+                    placeholder="(default)"
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="submit"
+                    disabled={byocBusy}
+                    data-testid="save-byoc-config-btn"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-medium cursor-pointer"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Save BYOC Config</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleTestByocClick()}
+                    disabled={byocBusy}
+                    data-testid="test-byoc-connection-btn"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-blue-300 dark:border-blue-700 bg-white dark:bg-slate-900 hover:bg-blue-50 dark:hover:bg-blue-950/40 disabled:opacity-60 text-xs font-medium text-[#1E3A8A] dark:text-blue-300 cursor-pointer"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${byocBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
+                    <span>Test &amp; Verify Cloud Connection</span>
+                  </button>
+                </div>
+
+                {byocConfig && (
+                  <button
+                    type="button"
+                    onClick={() => void handleClearByocClick()}
+                    disabled={byocBusy}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 text-xs font-medium cursor-pointer"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Clear BYOC Config</span>
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+        )}
+
         {!cloudUser ? (
           <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 p-4">
             <div className="space-y-1 max-w-2xl">
               <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
-                Connect your Google Account for Automatic Cloud Backup
+                {isSecondary && !isSavedByocReady
+                  ? 'Configure Your Personal BYOC Firebase Project First'
+                  : 'Connect your Google Account for Automatic Cloud Backup'}
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Sign in with Google once to back up all {tenders.length} tenders, {mafTrackers.length} MAF trackers, {emdRecords.length} EMD/BG records, and firm settings to Google Cloud Firestore in real time across devices.
+                {isSecondary && !isSavedByocReady
+                  ? 'To keep your records strictly isolated from Admin storage, paste and save your own Firebase Web Config above first. Until configured, your workspace runs locally without touching Admin cloud storage.'
+                  : `Sign in with Google once to back up all ${tenders.length} tenders, ${mafTrackers.length} MAF trackers, ${emdRecords.length} EMD/BG records, and firm settings to ${isSecondary ? `your isolated Firebase project (${savedByocValidation.normalized.projectId})` : 'Google Cloud Firestore'} in real time.`}
               </p>
             </div>
             <button
               type="button"
               onClick={onConnectCloud}
-              disabled={cloudSyncing}
-              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-medium shrink-0"
+              disabled={cloudSyncing || (isSecondary && !isSavedByocReady)}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-medium shrink-0"
             >
               {cloudSyncing ? (
                 <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -487,6 +909,9 @@ export function SettingsTab({
                 </p>
                 <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
                   {cloudUser.email}
+                  {isSecondary && savedByocValidation.valid
+                    ? ` · BYOC Project: ${savedByocValidation.normalized.projectId}`
+                    : ''}
                   {lastCloudSyncAt ? ` · Last backed up ${new Date(lastCloudSyncAt).toLocaleString('en-IN')}` : ''}
                 </p>
               </div>
@@ -563,15 +988,18 @@ export function SettingsTab({
                 </p>
               </div>
 
-              <a
-                href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/usage`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-[11px] font-medium text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
-              >
-                <span>Firebase Usage</span>
-                <ExternalLink className="h-3 w-3" aria-hidden="true" />
-              </a>
+              {usageConsoleUrl && (
+                <a
+                  href={usageConsoleUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="firebase-usage-link"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-[11px] font-medium text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
+                >
+                  <span>Firebase Usage</span>
+                  <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                </a>
+              )}
             </div>
           </div>
 
@@ -897,39 +1325,117 @@ export function SettingsTab({
                   <tr>
                     <th className="py-2.5 px-3 font-semibold">User ID</th>
                     <th className="py-2.5 px-3 font-semibold">Attached Gmail</th>
-                    <th className="py-2.5 px-3 font-semibold">Role</th>
-                    <th className="py-2.5 px-3 font-semibold">Registered On</th>
-                    <th className="py-2.5 px-3 font-semibold">Last Login</th>
-                    <th className="py-2.5 px-3 font-semibold">Status</th>
+                    <th className="py-2.5 px-3 font-semibold">Live Presence</th>
+                    <th className="py-2.5 px-3 font-semibold">BYOC Cloud</th>
+                    <th className="py-2.5 px-3 font-semibold">Registered / Last Login</th>
+                    <th className="py-2.5 px-3 font-semibold">Account Access</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-                  {secondaryUsers.map((sec) => (
-                    <tr key={sec.userId} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
-                      <td className="py-2.5 px-3 font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                        {sec.username}
-                      </td>
-                      <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                        {sec.email}
-                      </td>
-                      <td className="py-2.5 px-3 whitespace-nowrap">
-                        <span className="inline-flex items-center px-2 py-0.5 rounded bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 font-medium text-[11px]">
-                          Secondary
-                        </span>
-                      </td>
-                      <td className="py-2.5 px-3 font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
-                        {sec.createdAt ? new Date(sec.createdAt).toLocaleString('en-IN') : '—'}
-                      </td>
-                      <td className="py-2.5 px-3 font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
-                        {sec.lastLoginAt ? new Date(sec.lastLoginAt).toLocaleString('en-IN') : 'Never logged in yet'}
-                      </td>
-                      <td className="py-2.5 px-3 whitespace-nowrap">
-                        <span className="inline-flex items-center px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 font-medium text-[11px]">
-                          {sec.isActive ? 'Active' : 'Inactive'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                  {secondaryUsers.map((sec) => {
+                    const isEnabled = sec.isEnabled !== false;
+                    const effectivePresence = computeEffectivePresenceStatus({
+                      isEnabled,
+                      isActive: sec.isActive,
+                      presenceStatus: sec.presenceStatus,
+                      lastHeartbeatAt: sec.lastHeartbeatAt,
+                    });
+                    const isOnline = isEnabled && effectivePresence === 'active';
+                    const isToggling = togglingUserId === sec.userId;
+
+                    return (
+                      <tr
+                        key={sec.userId}
+                        data-testid={`secondary-user-row-${sec.username}`}
+                        className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40"
+                      >
+                        <td className="py-2.5 px-3 font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                          {sec.username}
+                        </td>
+                        <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                          {sec.email}
+                        </td>
+                        <td className="py-2.5 px-3 whitespace-nowrap">
+                          <span
+                            data-testid={`secondary-presence-${sec.username}`}
+                            className={`inline-flex items-center px-2 py-0.5 rounded border font-medium text-[11px] ${
+                              isOnline
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/60 dark:border-emerald-800 dark:text-emerald-300'
+                                : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-300'
+                            }`}
+                          >
+                            {isOnline ? 'Active' : 'Not Active'}
+                          </span>
+                          {sec.lastHeartbeatAt && (
+                            <p className="font-mono-num text-[10px] text-slate-400 mt-0.5">
+                              HB: {new Date(sec.lastHeartbeatAt).toLocaleTimeString('en-IN')}
+                            </p>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 whitespace-nowrap">
+                          {sec.byocProjectId ? (
+                            <span className="font-mono-num inline-flex items-center px-2 py-0.5 rounded border bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/60 dark:border-emerald-800 dark:text-emerald-300 font-medium text-[11px]">
+                              Connected ({sec.byocProjectId})
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded border bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:border-amber-800 dark:text-amber-300 font-medium text-[11px]">
+                              Pending Setup
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                          <p>{sec.createdAt ? new Date(sec.createdAt).toLocaleDateString('en-IN') : '—'}</p>
+                          <p className="text-[10px] text-slate-400">
+                            {sec.lastLoginAt
+                              ? `Last: ${new Date(sec.lastLoginAt).toLocaleString('en-IN')}`
+                              : 'Never logged in'}
+                          </p>
+                        </td>
+                        <td className="py-2.5 px-3 whitespace-nowrap">
+                          <span
+                            data-testid={`secondary-access-${sec.username}`}
+                            className={`inline-flex items-center px-2 py-0.5 rounded border font-semibold text-[11px] ${
+                              isEnabled
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/60 dark:border-emerald-800 dark:text-emerald-300'
+                                : 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/60 dark:border-red-800 dark:text-red-300'
+                            }`}
+                          >
+                            {isEnabled ? 'Enabled' : 'Disabled'}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 whitespace-nowrap text-right">
+                          {onToggleSecondaryUserStatus && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void onToggleSecondaryUserStatus(sec.userId, !isEnabled)
+                              }
+                              disabled={isToggling}
+                              data-testid={`toggle-user-access-${sec.username}`}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md border text-[11px] font-semibold disabled:opacity-50 cursor-pointer ${
+                                isEnabled
+                                  ? 'border-red-200 dark:border-red-800 bg-red-50/80 dark:bg-red-950/40 hover:bg-red-100 text-red-700 dark:text-red-300'
+                                  : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/80 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-700 dark:text-emerald-300'
+                              }`}
+                            >
+                              {isEnabled ? (
+                                <>
+                                  <Lock className="h-3 w-3" aria-hidden="true" />
+                                  <span>{isToggling ? 'Updating...' : 'Disable'}</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Unlock className="h-3 w-3" aria-hidden="true" />
+                                  <span>{isToggling ? 'Updating...' : 'Enable'}</span>
+                                </>
+                              )}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1531,6 +2037,115 @@ export function SettingsTab({
           </div>
         )}
       </section>
+
+      {/* 2-Minute BYOC Setup Guide & Firestore Rules Modal */}
+      {showByocGuideModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="byoc-guide-title"
+          data-testid="byoc-guide-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-xs"
+        >
+          <div className="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60">
+              <div className="flex items-center gap-2.5">
+                <BookOpen className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
+                <div>
+                  <h3
+                    id="byoc-guide-title"
+                    className="font-display text-base font-bold text-slate-900 dark:text-white"
+                  >
+                    2-Minute Personal Firebase (BYOC) Setup Guide
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Keep 100% of your tender records, attachments &amp; backups inside your own Firebase project
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowByocGuideModal(false)}
+                aria-label="Close setup guide"
+                className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-200/70 dark:hover:bg-slate-800 cursor-pointer"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="p-5 overflow-y-auto space-y-4 text-xs text-slate-700 dark:text-slate-300">
+              <ol className="list-decimal list-inside space-y-2 leading-relaxed">
+                <li>
+                  Open{' '}
+                  <a
+                    href="https://console.firebase.google.com/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-semibold text-[#1E3A8A] dark:text-blue-400 underline"
+                  >
+                    console.firebase.google.com
+                  </a>{' '}
+                  and create a free Spark project (e.g. <code className="font-mono-num">my-tender-cloud</code>).
+                </li>
+                <li>
+                  Click the Web icon (<code className="font-mono-num">&lt;/&gt;</code>) to register a Web App and copy the <code className="font-mono-num">firebaseConfig</code> object.
+                </li>
+                <li>
+                  Go to <strong>Authentication &rarr; Sign-in method</strong>, enable <strong>Google</strong>, and under <strong>Settings &rarr; Authorized domains</strong> add{' '}
+                  <code className="font-mono-num px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800">
+                    {typeof window !== 'undefined' ? window.location.hostname : 'www.vanshtender.in'}
+                  </code>.
+                </li>
+                <li>
+                  Go to <strong>Firestore Database &rarr; Create database</strong> (Standard/Production mode) and publish the security rules below under the <strong>Rules</strong> tab.
+                </li>
+                <li>
+                  Paste your <code className="font-mono-num">firebaseConfig</code> snippet into the BYOC Quick Import box in Settings, click <strong>Save BYOC Config</strong>, then click <strong>Connect Google Account</strong>.
+                </li>
+              </ol>
+
+              <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+                <div className="flex items-center justify-between px-3.5 py-2 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    Recommended BYOC <code className="font-mono-num">firestore.rules</code>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyByocRules()}
+                    data-testid="copy-byoc-rules-btn"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 hover:bg-slate-50 text-[11px] font-medium cursor-pointer"
+                  >
+                    {copiedByocRules ? (
+                      <>
+                        <Check className="h-3 w-3 text-emerald-600" aria-hidden="true" />
+                        <span>Copied Rules</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="h-3 w-3" aria-hidden="true" />
+                        <span>Copy Firestore Rules</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre className="p-3.5 max-h-60 overflow-auto text-[11px] font-mono-num bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200">
+                  <code>{BYOC_FIRESTORE_RULES_TEMPLATE}</code>
+                </pre>
+              </div>
+            </div>
+
+            <div className="px-5 py-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowByocGuideModal(false)}
+                className="px-4 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium cursor-pointer"
+              >
+                Close Guide
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

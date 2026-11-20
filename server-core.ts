@@ -47,6 +47,8 @@ interface PasswordRecord {
   updatedAt: string;
 }
 
+const SERVER_PRESENCE_TTL_MS = 90_000;
+
 interface CrmServerUserRecord {
   userId: string;
   username: string;
@@ -58,6 +60,13 @@ interface CrmServerUserRecord {
   updatedAt: string;
   lastLoginAt?: string;
   isActive: boolean;
+  isEnabled?: boolean;
+  disabledAt?: string;
+  presenceStatus?: 'active' | 'not_active';
+  lastHeartbeatAt?: string;
+  lastLogoutAt?: string;
+  byocProjectId?: string;
+  byocConfig?: Record<string, unknown> | null;
 }
 
 interface PendingOtpRecord {
@@ -270,6 +279,8 @@ function verifyVerifiedResetToken(token: string): {
 }
 
 function signUserCredentialToken(record: CrmServerUserRecord): string {
+  const isEnabled =
+    record.isEnabled !== undefined ? record.isEnabled !== false : record.isActive !== false;
   return signSignedToken({
     kind: 'crm_user_cred',
     userId: record.userId,
@@ -281,6 +292,8 @@ function signUserCredentialToken(record: CrmServerUserRecord): string {
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     isActive: record.isActive,
+    isEnabled,
+    byocProjectId: record.byocProjectId,
   });
 }
 
@@ -296,6 +309,8 @@ function verifyUserCredentialToken(token: string): CrmServerUserRecord | null {
     typeof parsed.hash === 'string' &&
     typeof parsed.updatedAt === 'string'
   ) {
+    const isEnabled =
+      typeof parsed.isEnabled === 'boolean' ? parsed.isEnabled : parsed.isActive !== false;
     return {
       userId: parsed.userId,
       username: parsed.username,
@@ -305,7 +320,9 @@ function verifyUserCredentialToken(token: string): CrmServerUserRecord | null {
       hash: parsed.hash,
       createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : parsed.updatedAt,
       updatedAt: parsed.updatedAt,
-      isActive: parsed.isActive !== false,
+      isActive: isEnabled,
+      isEnabled,
+      byocProjectId: typeof parsed.byocProjectId === 'string' ? parsed.byocProjectId : undefined,
     };
   }
   if (
@@ -371,7 +388,24 @@ function readCookieValue(cookieHeader: string | undefined, name: string): string
   return '';
 }
 
+function computeServerPresenceStatus(
+  user: CrmServerUserRecord,
+  nowMs = Date.now(),
+): 'active' | 'not_active' {
+  const enabled =
+    user.isEnabled !== undefined ? user.isEnabled !== false : user.isActive !== false;
+  if (!enabled) return 'not_active';
+  if (user.presenceStatus !== 'active') return 'not_active';
+  if (!user.lastHeartbeatAt) return 'not_active';
+  const hbMs = Date.parse(user.lastHeartbeatAt);
+  if (Number.isNaN(hbMs)) return 'not_active';
+  return nowMs - hbMs <= SERVER_PRESENCE_TTL_MS ? 'active' : 'not_active';
+}
+
 function sanitizeServerUserForClient(user: CrmServerUserRecord) {
+  const isEnabled =
+    user.isEnabled !== undefined ? user.isEnabled !== false : user.isActive !== false;
+  const presenceStatus = computeServerPresenceStatus(user);
   return {
     userId: user.userId,
     username: user.username,
@@ -379,7 +413,14 @@ function sanitizeServerUserForClient(user: CrmServerUserRecord) {
     role: user.role,
     createdAt: user.createdAt,
     lastLoginAt: user.lastLoginAt,
-    isActive: user.isActive !== false,
+    isActive: isEnabled && presenceStatus === 'active',
+    isEnabled,
+    disabledAt: user.disabledAt,
+    presenceStatus,
+    lastHeartbeatAt: user.lastHeartbeatAt,
+    lastLogoutAt: user.lastLogoutAt,
+    byocProjectId: user.byocProjectId,
+    byocConfig: user.byocConfig ?? null,
   };
 }
 
@@ -896,12 +937,24 @@ export function createApiRouter(): Router {
     if (
       !matched ||
       !usernameMatches ||
-      matched.isActive === false ||
       !verifyHashedSecret(password, matched.salt, matched.hash)
     ) {
       res.status(401).json({
         ok: false,
+        code: 'INVALID_CREDENTIALS',
         error: 'Invalid User ID or password. Please check your credentials and try again.',
+      });
+      return;
+    }
+
+    const accountEnabled =
+      matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
+    if (!accountEnabled && matched.role !== 'admin') {
+      res.status(403).json({
+        ok: false,
+        code: 'ACCOUNT_DISABLED',
+        error:
+          'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
       });
       return;
     }
@@ -910,6 +963,10 @@ export function createApiRouter(): Router {
     const updatedUser: CrmServerUserRecord = {
       ...matched,
       lastLoginAt: nowIso,
+      isActive: true,
+      isEnabled: true,
+      presenceStatus: 'active',
+      lastHeartbeatAt: nowIso,
     };
 
     state = {
@@ -942,6 +999,129 @@ export function createApiRouter(): Router {
       ...(adminSessionToken ? { adminSessionToken } : {}),
     });
   });
+
+  router.post('/auth/presence/heartbeat', (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      userId?: unknown;
+      identifier?: unknown;
+      credentialToken?: unknown;
+      clientCredentialTokens?: unknown;
+      byocProjectId?: unknown;
+      byocConfig?: unknown;
+    };
+    const identifier =
+      (typeof body.userId === 'string' && body.userId.trim()) ||
+      (typeof body.identifier === 'string' && body.identifier.trim()) ||
+      '';
+    if (!identifier) {
+      res.status(400).json({ ok: false, error: 'userId is required.' });
+      return;
+    }
+
+    const pool = buildUserPool(req, body as Record<string, unknown>);
+    const matched = pool.get(identifier) || findUserInPool(pool, identifier);
+    if (!matched) {
+      res.status(404).json({ ok: false, error: 'User session not found.' });
+      return;
+    }
+
+    const isEnabled =
+      matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
+    if (!isEnabled && matched.role !== 'admin') {
+      res.status(403).json({
+        ok: false,
+        code: 'ACCOUNT_DISABLED',
+        disabled: true,
+        error:
+          'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Session terminated.',
+      });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const nextByocProject =
+      typeof body.byocProjectId === 'string' ? body.byocProjectId.trim() : matched.byocProjectId;
+    const nextByocConfig =
+      body.byocConfig && typeof body.byocConfig === 'object'
+        ? (body.byocConfig as Record<string, unknown>)
+        : matched.byocConfig;
+
+    const updatedUser: CrmServerUserRecord = {
+      ...matched,
+      isActive: true,
+      isEnabled: true,
+      presenceStatus: 'active',
+      lastHeartbeatAt: nowIso,
+      updatedAt: nowIso,
+      byocProjectId: nextByocProject,
+      byocConfig: nextByocConfig,
+    };
+
+    state = {
+      ...state,
+      users: {
+        ...state.users,
+        [updatedUser.userId]: updatedUser,
+      },
+    };
+    saveServerState(state);
+
+    res.json({
+      ok: true,
+      user: sanitizeServerUserForClient(updatedUser),
+      presenceStatus: 'active',
+      isEnabled: true,
+      lastHeartbeatAt: nowIso,
+    });
+  });
+
+  router.post(
+    '/auth/logout',
+    express.text({ type: 'text/plain', limit: '64kb' }),
+    (req: Request, res: Response) => {
+      let body: Record<string, unknown> = {};
+      if (typeof req.body === 'string' && req.body.trim()) {
+        try {
+          body = JSON.parse(req.body) as Record<string, unknown>;
+        } catch {
+          body = {};
+        }
+      } else if (req.body && typeof req.body === 'object') {
+        body = req.body as Record<string, unknown>;
+      }
+
+      const identifier =
+        (typeof body.userId === 'string' && body.userId.trim()) ||
+        (typeof body.identifier === 'string' && body.identifier.trim()) ||
+        '';
+      if (!identifier) {
+        res.json({ ok: true });
+        return;
+      }
+
+      const pool = buildUserPool(req, body);
+      const matched = pool.get(identifier) || findUserInPool(pool, identifier);
+      if (matched) {
+        const nowIso = new Date().toISOString();
+        const updatedUser: CrmServerUserRecord = {
+          ...matched,
+          presenceStatus: 'not_active',
+          isActive: false,
+          lastLogoutAt: nowIso,
+          updatedAt: nowIso,
+        };
+        state = {
+          ...state,
+          users: {
+            ...state.users,
+            [updatedUser.userId]: updatedUser,
+          },
+        };
+        saveServerState(state);
+      }
+      res.json({ ok: true, presenceStatus: 'not_active' });
+    },
+  );
 
   router.post('/auth/signup/send-otp', async (req: Request, res: Response) => {
     try {
@@ -1250,6 +1430,8 @@ export function createApiRouter(): Router {
         createdAt: nowIso,
         updatedAt: nowIso,
         isActive: true,
+        isEnabled: true,
+        presenceStatus: 'not_active',
       };
 
       const nextOtps = { ...state.pendingOtps };
@@ -1759,6 +1941,73 @@ export function createApiRouter(): Router {
     res.json({
       ok: true,
       users: secondaryUsers,
+    });
+  });
+
+  router.post('/auth/secondary-users/status', (req: Request, res: Response) => {
+    const adminToken =
+      typeof req.headers['x-crm-admin-token'] === 'string'
+        ? req.headers['x-crm-admin-token'].trim()
+        : '';
+    if (!adminToken || !verifyAdminSessionToken(adminToken)) {
+      res.status(403).json({
+        ok: false,
+        error: 'Admin session authorization is required to change secondary user status.',
+      });
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      userId?: unknown;
+      username?: unknown;
+      email?: unknown;
+      isEnabled?: unknown;
+      clientCredentialTokens?: unknown;
+    };
+    const targetIdentifier =
+      (typeof body.userId === 'string' && body.userId.trim()) ||
+      (typeof body.username === 'string' && body.username.trim()) ||
+      (typeof body.email === 'string' && body.email.trim()) ||
+      '';
+    if (!targetIdentifier || typeof body.isEnabled !== 'boolean') {
+      res.status(400).json({ ok: false, error: 'userId and boolean isEnabled are required.' });
+      return;
+    }
+
+    const pool = buildUserPool(req, body as Record<string, unknown>);
+    const target = pool.get(targetIdentifier) || findUserInPool(pool, targetIdentifier);
+    if (!target || target.role === 'admin') {
+      res.status(404).json({ ok: false, error: 'Secondary user account not found.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const isEnabled = body.isEnabled;
+    const updatedUser: CrmServerUserRecord = {
+      ...target,
+      isEnabled,
+      isActive: isEnabled ? computeServerPresenceStatus(target) === 'active' : false,
+      disabledAt: isEnabled ? undefined : nowIso,
+      presenceStatus: isEnabled ? target.presenceStatus ?? 'not_active' : 'not_active',
+      updatedAt: nowIso,
+    };
+
+    state = {
+      ...state,
+      users: {
+        ...state.users,
+        [updatedUser.userId]: updatedUser,
+      },
+    };
+    saveServerState(state);
+
+    res.json({
+      ok: true,
+      user: sanitizeServerUserForClient(updatedUser),
+      credentialToken: signUserCredentialToken(updatedUser),
+      message: isEnabled
+        ? `Re-enabled access for ${updatedUser.username}.`
+        : `Disabled access for ${updatedUser.username}. Active sessions will be locked out.`,
     });
   });
 

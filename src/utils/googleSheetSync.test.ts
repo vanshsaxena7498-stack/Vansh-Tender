@@ -4,14 +4,18 @@ import type { EmdBgRecord, Tender } from '../types/crm';
 import {
   buildSheetSyncPayload,
   computeMonthlySummaryForSheet,
+  detectMisHeaderRowIndex,
   formatFullMonthYearLabel,
   formatIndianDateForSheet,
   formatIndianDateTimeForSheet,
   getTenderInteractionMonthKey,
   GOOGLE_APPS_SCRIPT_CODE_GS,
   groupTendersByInteractionMonth,
+  isMonthBannerRow,
   isValidAppsScriptWebhookUrl,
+  mapMisRowToTenderFields,
   MIS_MONTHLY_TENDER_HEADERS,
+  sanitizeSheetText,
 } from './googleSheetSync';
 
 function makeTender(overrides: Partial<Tender>): Tender {
@@ -19,15 +23,23 @@ function makeTender(overrides: Partial<Tender>): Tender {
     id: 't1',
     tenderId: 'GEM/2026/B/1001',
     portal: 'GeM',
+    clientName: 'Ministry of Defence',
     department: 'Ministry of Defence',
+    locationDepartment: 'Defence / Panchkula',
     location: 'Panchkula, Haryana',
     category: 'IT Hardware',
     title: 'Supply of Rugged Workstations',
     publishDate: '2026-10-01',
     submissionDueDate: '2026-10-20T15:00',
     preBidDate: '2026-10-08',
+    technicalOpeningDate: '2026-10-25',
+    financialOpeningDate: '2026-10-30',
     estimatedValue: 1000000,
     quotedValue: 950000,
+    l1BidderName: 'Saxena Infra',
+    l1QuotedValue: 940000,
+    ourPositionRank: 'L1',
+    assignedOwner: 'Vansh',
     emdStatus: 'EMD Paid',
     emdAmount: 25000,
     stage: 'Identified / Reviewing',
@@ -67,6 +79,44 @@ test('formatIndianDateForSheet and formatIndianDateTimeForSheet output DD/MM/YYY
   assert.equal(formatIndianDateForSheet('2026-11-16T20:00:00.000Z'), '17/11/2026');
   assert.equal(formatIndianDateForSheet(''), '');
   assert.equal(formatIndianDateTimeForSheet(''), '');
+});
+
+test('sanitizeSheetText preserves ≤/≥/–, repairs mojibake and unit (?10 KVA) artifacts without breaking genuine questions', () => {
+  assert.equal(sanitizeSheetText('UPS Rating (≤10 KVA)'), 'UPS Rating (≤10 KVA)');
+  assert.equal(sanitizeSheetText('UPS Rating (?10 KVA)'), 'UPS Rating (≤10 KVA)');
+  assert.equal(sanitizeSheetText('Capacity â‰¤ 15 KW & â‰¥ 5 KW â€“ Phase 1'), 'Capacity ≤ 15 KW & ≥ 5 KW – Phase 1');
+  assert.equal(sanitizeSheetText('Is EMD exempted?'), 'Is EMD exempted?');
+  assert.equal(sanitizeSheetText('Budget \uFFFD100 kVA'), 'Budget ≤100 kVA');
+});
+
+test('isMonthBannerRow, detectMisHeaderRowIndex, and mapMisRowToTenderFields skip banner rows and support legacy + 21-column MIS headers', () => {
+  assert.equal(isMonthBannerRow(['November 2026', '', '', '']), true);
+  assert.equal(isMonthBannerRow(['S.No.', 'Tender Ref / ID']), false);
+
+  const legacyRows = [
+    ['November 2026'],
+    ['S.No.', 'Tender ID / Bid No.', 'Portal / Source', 'Department / Organization', 'District / State', 'Item Category', 'Work / Supply Title', 'Publish Date', 'Submission Due Date'],
+    ['1', 'GEM/2026/B/9001', 'GeM', 'Indian Army', 'Panchkula', 'UPS', '10 KVA Online UPS (?10 KVA)', '01/11/2026', '15/11/2026 15:00'],
+  ];
+  const hdrIdx = detectMisHeaderRowIndex(legacyRows);
+  assert.equal(hdrIdx, 1);
+  const mappedLegacy = mapMisRowToTenderFields(legacyRows[hdrIdx] as string[], legacyRows[2]);
+  assert.equal(mappedLegacy.tenderId, 'GEM/2026/B/9001');
+  assert.equal(mappedLegacy.clientName, 'Indian Army');
+  assert.equal(mappedLegacy.location, 'Panchkula');
+  assert.equal(mappedLegacy.title, '10 KVA Online UPS (≤10 KVA)');
+
+  const fullRows = [
+    ['December 2026'],
+    [...MIS_MONTHLY_TENDER_HEADERS],
+    ['1', 'GEM/2026/B/9002', 'SAIL', 'SAIL / Bokaro', 'Bokaro, Jharkhand', 'Solar Street Light', 'GeM', '02/12/2026', '18/12/2026 17:00', '', '1500000', '30000', 'EMD Paid', 'L1 / Won', '20/12/2026', '28/12/2026', 'Saxena Infra', '1420000', 'L1', 'Vansh', 'PO awaited'],
+  ];
+  assert.equal(detectMisHeaderRowIndex(fullRows), 1);
+  const mappedFull = mapMisRowToTenderFields(fullRows[1] as string[], fullRows[2]);
+  assert.equal(mappedFull.l1BidderName, 'Saxena Infra');
+  assert.equal(mappedFull.ourPositionRank, 'L1');
+  assert.equal(mappedFull.assignedOwner, 'Vansh');
+  assert.equal(mappedFull.remarksNextAction, 'PO awaited');
 });
 
 test('isValidAppsScriptWebhookUrl validates HTTPS Google Apps Script URLs only', () => {
@@ -213,41 +263,49 @@ test('computeMonthlySummaryForSheet groups breakdown by interaction month accura
   );
 });
 
-test('GOOGLE_APPS_SCRIPT_CODE_GS removes frozen rows, uses exact 9 MIS columns, merges A:I banners, and leaves 3 blank rows between months', () => {
-  assert.equal(MIS_MONTHLY_TENDER_HEADERS.length, 9);
+test('GOOGLE_APPS_SCRIPT_CODE_GS removes frozen rows, uses exact 21 MIS columns, merges A:U banners, and leaves 3 blank rows between months', () => {
+  assert.equal(MIS_MONTHLY_TENDER_HEADERS.length, 21);
   assert.deepEqual([...MIS_MONTHLY_TENDER_HEADERS], [
     'S.No.',
-    'Tender ID / Bid No.',
-    'Portal / Source',
-    'Department / Organization',
-    'District / State',
-    'Item Category',
-    'Work / Supply Title',
-    'Publish Date',
-    'Submission Due Date',
+    'Tender Ref / ID',
+    'Client / Organization Name',
+    'Location / Department',
+    'Location',
+    'Brief Description & Scope of Work',
+    'Portal / Platform',
+    'Publish / Tender Date',
+    'Due Date & Time',
+    'Pre-Bid Meeting Date',
+    'Estimated Tender Value (INR)',
+    'EMD Amount (INR)',
+    'EMD Mode / Form',
+    'Current Status',
+    'Technical Opening Date',
+    'Financial Opening Date',
+    'L1 Bidder Name',
+    'L1 Quoted Value (INR)',
+    'Our Position / Rank',
+    'Assigned Person / Owner',
+    'Remarks / Next Action',
   ]);
 
-  // Ensure zero row freezing anywhere in Code.gs
   assert.ok(!GOOGLE_APPS_SCRIPT_CODE_GS.includes('setFrozenRows(1)'));
   assert.ok(!GOOGLE_APPS_SCRIPT_CODE_GS.includes('frozenRowCount: 1'));
   assert.ok(GOOGLE_APPS_SCRIPT_CODE_GS.includes('setFrozenRows(0)'));
 
-  // Ensure exact 9 column headers exist in Code.gs
   for (const h of MIS_MONTHLY_TENDER_HEADERS) {
     assert.ok(GOOGLE_APPS_SCRIPT_CODE_GS.includes(`'${h}'`), `Missing MIS header ${h}`);
   }
 
-  // Ensure 3-row gap, banner merge & black fill exist
   assert.ok(GOOGLE_APPS_SCRIPT_CODE_GS.includes('BLANK_GAP_ROWS_BETWEEN_MONTHS = 3'));
   assert.ok(GOOGLE_APPS_SCRIPT_CODE_GS.includes('bannerRange.merge()'));
   assert.ok(GOOGLE_APPS_SCRIPT_CODE_GS.includes("setBackground('#000000')"));
   assert.ok(!GOOGLE_APPS_SCRIPT_CODE_GS.includes('Last Synced At (UTC)'));
 
-  // Verify Code.gs compiles cleanly as valid JavaScript syntax
   assert.doesNotThrow(() => new Function(GOOGLE_APPS_SCRIPT_CODE_GS));
 });
 
-test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I banners, exact 9 columns, fresh S.No., 3-row gap, and zero frozen rows', () => {
+test('GOOGLE_APPS_SCRIPT_CODE_GS doPost initializes all 21 headers on PING/empty tenders and writes merged A:U banners, fresh S.No., UTF-8 <=, and 3-row gaps', () => {
   interface MockCellMeta {
     value: unknown;
     bg?: string;
@@ -258,7 +316,7 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I ban
 
   class MockSheet {
     name: string;
-    frozenRows = 1; // intentionally start frozen to verify Code.gs unfreezes it to 0
+    frozenRows = 1;
     cells = new Map<string, MockCellMeta>();
     merges: Array<{ row: number; col: number; numRows: number; numCols: number }> = [];
 
@@ -437,10 +495,29 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I ban
     mockGlobals.ContentService,
   ) as { doPost: (e: unknown) => { _txt: string } };
 
+  // 1. PING with zero tenders still renders Month Banner + all 21 MIS headings
+  const pingPayload = buildSheetSyncPayload({
+    action: 'PING',
+    entityType: 'TENDER',
+    tenders: [],
+    emdRecords: [],
+  });
+  const pingResp = JSON.parse(
+    scriptExports.doPost({ postData: { contents: JSON.stringify(pingPayload) } })._txt,
+  ) as { ok: boolean; ping?: boolean };
+  assert.equal(pingResp.ok, true);
+  assert.equal(pingResp.ping, true);
+  const pingSheet = sheets.get('Daily Tender Data')!;
+  assert.deepEqual(pingSheet.merges[0], { row: 1, col: 1, numRows: 1, numCols: 21 });
+  assert.equal(pingSheet.cells.get('2,1')?.value, 'S.No.');
+  assert.equal(pingSheet.cells.get('2,21')?.value, 'Remarks / Next Action');
+
+  // 2. Multi-month tenders with UTF-8 <= symbol & 3 blank gap rows
   const novTenders = Array.from({ length: 17 }, (_, idx) =>
     makeTender({
       id: `n-${idx + 1}`,
       tenderId: `GEM/2026/B/${5001 + idx}`,
+      title: idx === 0 ? 'Online UPS System (?10 KVA)' : 'Supply of Rugged Workstations',
       publishDate: '2026-10-03',
       updatedAt: `2026-11-${String(idx + 1).padStart(2, '0')}T08:00:00.000Z`,
     }),
@@ -457,6 +534,7 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I ban
     entityType: 'TENDER',
     tenders: [decTender, ...novTenders],
     emdRecords: [],
+    assignedOwner: 'Vansh',
   });
 
   const resp = scriptExports.doPost({
@@ -468,8 +546,8 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I ban
   const sheet = sheets.get('Daily Tender Data')!;
   assert.equal(sheet.frozenRows, 0);
 
-  // Row 1: November 2026 Banner merged A1:I1 (#000000 bg, centered bold white)
-  assert.deepEqual(sheet.merges[0], { row: 1, col: 1, numRows: 1, numCols: 9 });
+  // Row 1: November 2026 Banner merged A1:U1 (#000000 bg, centered bold white)
+  assert.deepEqual(sheet.merges[0], { row: 1, col: 1, numRows: 1, numCols: 21 });
   const novBanner = sheet.cells.get('1,1');
   assert.equal(novBanner?.value, 'November 2026');
   assert.equal(novBanner?.bg, '#000000');
@@ -477,14 +555,15 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I ban
   assert.equal(novBanner?.weight, 'bold');
   assert.equal(novBanner?.hAlign, 'center');
 
-  // Row 2: Header row (9 columns)
+  // Row 2: Header row (21 columns)
   assert.equal(sheet.cells.get('2,1')?.value, 'S.No.');
-  assert.equal(sheet.cells.get('2,9')?.value, 'Submission Due Date');
+  assert.equal(sheet.cells.get('2,21')?.value, 'Remarks / Next Action');
   assert.equal(sheet.cells.get('2,2')?.bg, '#0F172A');
 
-  // Rows 3..19: 17 November tenders (S.No. 1..17)
+  // Rows 3..19: 17 November tenders (S.No. 1..17) and clean <= rendering
   assert.equal(sheet.cells.get('3,1')?.value, 1);
   assert.equal(sheet.cells.get('3,2')?.value, 'GEM/2026/B/5001');
+  assert.equal(sheet.cells.get('3,6')?.value, 'Online UPS System (≤10 KVA) [IT Hardware]');
   assert.equal(sheet.cells.get('19,1')?.value, 17);
   assert.equal(sheet.cells.get('19,2')?.value, 'GEM/2026/B/5017');
 
@@ -493,15 +572,18 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost executes cleanly to write merged A:I ban
   assert.equal(sheet.cells.has('21,1'), false);
   assert.equal(sheet.cells.has('22,1'), false);
 
-  // Row 23: December 2026 Banner merged A23:I23
-  assert.deepEqual(sheet.merges[1], { row: 23, col: 1, numRows: 1, numCols: 9 });
+  // Row 23: December 2026 Banner merged A23:U23
+  assert.deepEqual(sheet.merges[1], { row: 23, col: 1, numRows: 1, numCols: 21 });
   assert.equal(sheet.cells.get('23,1')?.value, 'December 2026');
 
   // Row 24: Header row
   assert.equal(sheet.cells.get('24,1')?.value, 'S.No.');
+  assert.equal(sheet.cells.get('24,21')?.value, 'Remarks / Next Action');
 
   // Row 25: First December tender restarts at S.No. 1
   assert.equal(sheet.cells.get('25,1')?.value, 1);
   assert.equal(sheet.cells.get('25,2')?.value, 'GEM/2026/B/6001');
+  assert.equal(sheet.cells.get('25,20')?.value, 'Vansh');
 });
+
 

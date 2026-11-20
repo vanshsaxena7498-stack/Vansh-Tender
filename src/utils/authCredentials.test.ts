@@ -5,13 +5,17 @@ import {
   ADMIN_USER_ID,
   buildEmptySecondaryWorkspace,
   clearInMemoryPasswordOverrideForTests,
+  computeEffectivePresenceStatus,
   findUserByIdentifier,
   getStoredCredentialToken,
   listSecondaryUsers,
   loadSecondaryWorkspaceSnapshot,
+  PRESENCE_HEARTBEAT_TTL_MS,
   registerSecondaryUserAccount,
   saveResetPasswordCredential,
   saveSecondaryWorkspaceSnapshot,
+  setSecondaryUserEnabled,
+  updateUserPresence,
   VALID_LOGIN_PASSWORD,
   VALID_LOGIN_USERNAME,
   validateLoginCredentials,
@@ -250,4 +254,81 @@ test('validateLoginCredentials supports legacy plaintext localStorage overrides 
     }
   }
 });
+
+test('setSecondaryUserEnabled blocks disabled user login with ACCOUNT_DISABLED and live presence respects 90s TTL', () => {
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  const { mockWindow } = createMockWindowStorage([]);
+  (globalThis as { window: unknown }).window = mockWindow;
+
+  try {
+    clearInMemoryPasswordOverrideForTests();
+    const created = registerSecondaryUserAccount({
+      userId: 'sec_niyan_test',
+      username: 'Niyan',
+      email: 'info.niyantrana@gmail.com',
+      password: 'Niyan@2027',
+    });
+
+    const baseNow = Date.parse('2026-11-20T10:00:00.000Z');
+    updateUserPresence(created.userId, 'active', {
+      nowIso: new Date(baseNow).toISOString(),
+      byocProjectId: 'niyan-byoc-01',
+    });
+
+    const freshList = listSecondaryUsers(baseNow + 15_000);
+    assert.equal(freshList[0]?.presenceStatus, 'active');
+    assert.equal(freshList[0]?.byocProjectId, 'niyan-byoc-01');
+    assert.equal(freshList[0]?.isEnabled, true);
+
+    // After 90s TTL expires without heartbeat, presence falls back to not_active
+    const staleList = listSecondaryUsers(baseNow + PRESENCE_HEARTBEAT_TTL_MS + 5_000);
+    assert.equal(staleList[0]?.presenceStatus, 'not_active');
+
+    // Explicit logout marks user not_active immediately
+    updateUserPresence(created.userId, 'not_active', {
+      nowIso: new Date(baseNow + 20_000).toISOString(),
+    });
+    assert.equal(
+      computeEffectivePresenceStatus(
+        {
+          isEnabled: true,
+          isActive: true,
+          presenceStatus: 'active',
+          lastHeartbeatAt: new Date(baseNow).toISOString(),
+        },
+        baseNow + 30_000,
+      ),
+      'active',
+    );
+    assert.equal(listSecondaryUsers(baseNow + 25_000)[0]?.presenceStatus, 'not_active');
+
+    // Admin disables secondary account
+    const disabled = setSecondaryUserEnabled(created.userId, false, '2026-11-20T10:01:00.000Z');
+    assert.equal(disabled?.isEnabled, false);
+    assert.equal(disabled?.presenceStatus, 'not_active');
+
+    const denied = validateLoginCredentials('Niyan', 'Niyan@2027');
+    assert.equal(denied.ok, false);
+    assert.equal(denied.code, 'ACCOUNT_DISABLED');
+    assert.match(denied.error || '', /disabled/i);
+
+    // Admin re-enables account -> login succeeds again
+    const reEnabled = setSecondaryUserEnabled(created.userId, true, '2026-11-20T10:02:00.000Z');
+    assert.equal(reEnabled?.isEnabled, true);
+    const allowed = validateLoginCredentials('Niyan', 'Niyan@2027');
+    assert.equal(allowed.ok, true);
+    assert.equal(allowed.user?.isEnabled, true);
+
+    // Admin account cannot be disabled
+    assert.equal(setSecondaryUserEnabled(ADMIN_USER_ID, false), null);
+  } finally {
+    clearInMemoryPasswordOverrideForTests();
+    if (prevWindow === undefined) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window: unknown }).window = prevWindow;
+    }
+  }
+});
+
 

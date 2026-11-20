@@ -75,4 +75,7 @@ export async function testFirestoreConnection(): Promise<void> {
   }
 }
 
-void testFirestoreConnection();
+if (typeof window !== 'undefined') {
+  void testFirestoreConnection();
+}
+

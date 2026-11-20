@@ -28,8 +28,23 @@ import {
   SEED_MAF_TRACKERS,
   SEED_TENDERS,
 } from './data/seedData';
+import {
+  clearByocConfig,
+  disposeByocContext,
+  getOrInitByocContext,
+  loadByocConfig,
+  saveByocConfig,
+  signInWithByocGoogle,
+  signOutByocGoogle,
+  subscribeByocAuthState,
+  testByocFirebaseConnection,
+  validateByocFirebaseConfig,
+  type ByocCloudContext,
+} from './lib/byocFirebase';
 import { auth, firebaseConfig, googleProvider } from './lib/firebase';
 import type {
+  ByocConnectionState,
+  ByocFirebaseConfig,
   CrmBackupPayload,
   CrmUserSession,
   EmailAlertLog,
@@ -54,10 +69,14 @@ import {
   ADMIN_RECOVERY_EMAIL,
   ADMIN_USER_ID,
   buildEmptySecondaryWorkspace,
+  getAllStoredCredentialTokens,
+  getStoredCredentialToken,
   listSecondaryUsers,
   loadSecondaryWorkspaceSnapshot,
   recordUserLoginActivity,
+  saveResetPasswordCredential,
   saveSecondaryWorkspaceSnapshot,
+  setSecondaryUserEnabled,
   type SecondaryWorkspaceSnapshot,
 } from './utils/authCredentials';
 import { computeNotifications } from './utils/calculations';
@@ -70,6 +89,7 @@ import {
   ensureUserRootDocument,
   fetchAllFromCloud,
   fetchSecondaryUsersFromCloud,
+  getCentralAdminCloudTarget,
   replaceCloudDataset,
   subscribeToUserCloudData,
   syncEmailAlertLogToCloud,
@@ -82,6 +102,7 @@ import {
   syncSheetConfigToCloud,
   syncTenderToCloud,
   uploadMafDocumentFile,
+  type CloudTargetContext,
 } from './utils/cloudSync';
 import {
   mergeCloudEmdWithFiles,
@@ -119,7 +140,11 @@ interface ToastNotice {
   msg: string;
 }
 
-function formatCloudErrorMessage(err: unknown): string {
+function formatCloudErrorMessage(
+  err: unknown,
+  projectIdOverride?: string,
+  databaseIdOverride?: string,
+): string {
   const raw = err instanceof Error ? err.message : String(err);
   let parsedErrorText = raw;
   let parsedOp = '';
@@ -133,8 +158,17 @@ function formatCloudErrorMessage(err: unknown): string {
     }
   }
 
+  if (
+    parsedErrorText.includes('BYOC_NOT_CONFIGURED') ||
+    parsedErrorText.includes('BYOC_PROJECT_CONFLICT')
+  ) {
+    return 'BYOC isolation active: Connect your own Firebase project in Workspace Settings to sync this secondary account to the cloud.';
+  }
+
   if (parsedErrorText.includes("Quota exceeded for quota metric 'Free daily read units per project")) {
-    return `Firestore daily read quota reached. Upgrade or check usage at https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`;
+    const pid = projectIdOverride || firebaseConfig.projectId;
+    const dbid = databaseIdOverride || firebaseConfig.firestoreDatabaseId || '(default)';
+    return `Firestore daily read quota reached. Upgrade or check usage at https://console.firebase.google.com/project/${encodeURIComponent(pid)}/firestore/databases/${encodeURIComponent(dbid)}/data?openUpgradeDialog=true`;
   }
   if (parsedErrorText.includes('Quota exceeded')) {
     return 'Google Cloud Firestore daily free-tier quota exceeded. Quota resets tomorrow.';
@@ -200,16 +234,52 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const workspaceTenantId = currentUser?.role === 'secondary' ? currentUser.userId : null;
+  const isSecondarySession = currentUser?.role === 'secondary';
 
-  // Firebase Firestore State
+  // Firebase Firestore State (Central Admin + Isolated BYOC Secondary)
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [byocConfig, setByocConfig] = useState<ByocFirebaseConfig | null>(null);
+  const [byocConnection, setByocConnection] = useState<ByocConnectionState>({
+    status: 'pending',
+    message: 'Save your personal Firebase config to enable isolated BYOC cloud sync.',
+  });
+  const [byocContextState, setByocContextState] = useState<ByocCloudContext | null>(null);
+  const [byocAuthUser, setByocAuthUser] = useState<User | null>(null);
+  const [byocAuthReady, setByocAuthReady] = useState(false);
+  const [disabledNotice, setDisabledNotice] = useState<string | null>(null);
+  const [togglingSecondaryUserId, setTogglingSecondaryUserId] = useState<string | null>(null);
+
   const [cloudSyncing, setCloudSyncing] = useState(false);
   const [lastCloudSyncAt, setLastCloudSyncAt] = useState<string | null>(null);
   const [cloudFeedback, setCloudFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(
     null,
   );
   const [toasts, setToasts] = useState<ToastNotice[]>([]);
+
+  const savedByocValid = validateByocFirebaseConfig(byocConfig).valid;
+  const activeCloudUser: User | null = isSecondarySession
+    ? byocContextState && savedByocValid
+      ? byocAuthUser
+      : null
+    : firebaseUser;
+  const activeAuthReady: boolean = isSecondarySession
+    ? byocContextState
+      ? byocAuthReady
+      : true
+    : authReady;
+  const activeCloudTarget: CloudTargetContext | null = isSecondarySession
+    ? byocContextState && savedByocValid
+      ? {
+          db: byocContextState.db,
+          storage: byocContextState.storage,
+          projectId: byocContextState.config.projectId,
+          databaseId: byocContextState.config.firestoreDatabaseId,
+          isByoc: true,
+          role: 'secondary',
+        }
+      : null
+    : getCentralAdminCloudTarget();
 
   // Modal & Drawer states
   const [tenderModalTarget, setTenderModalTarget] = useState<Tender | null | undefined>(
@@ -247,6 +317,9 @@ export default function App() {
     emailLogs,
     sheetSettings,
     firebaseUser,
+    activeCloudUser,
+    activeCloudTarget,
+    byocConfig,
     currentUser,
     workspaceTenantId,
   });
@@ -262,6 +335,9 @@ export default function App() {
       emailLogs,
       sheetSettings,
       firebaseUser,
+      activeCloudUser,
+      activeCloudTarget,
+      byocConfig,
       currentUser,
       workspaceTenantId,
     };
@@ -276,6 +352,9 @@ export default function App() {
     emailLogs,
     sheetSettings,
     firebaseUser,
+    activeCloudUser,
+    activeCloudTarget,
+    byocConfig,
     currentUser,
     workspaceTenantId,
   ]);
@@ -330,7 +409,7 @@ export default function App() {
     setLastCloudSyncAt(new Date().toISOString());
   };
 
-  // Listen for Firebase Auth state
+  // Listen for central Firebase Auth state (used exclusively by Primary Admin)
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       setFirebaseUser(user);
@@ -338,6 +417,77 @@ export default function App() {
     });
     return () => unsub();
   }, []);
+
+  // Dynamically initialize and listen to per-user BYOC Firebase Auth state (Secondary Users only)
+  useEffect(() => {
+    if (!isAuthenticated || currentUser?.role !== 'secondary') {
+      setByocContextState(null);
+      setByocAuthUser(null);
+      setByocAuthReady(true);
+      return;
+    }
+    const validation = validateByocFirebaseConfig(byocConfig);
+    if (!validation.valid) {
+      setByocContextState(null);
+      setByocAuthUser(null);
+      setByocAuthReady(true);
+      setByocConnection({
+        status: 'pending',
+        message: 'Save your personal Firebase config to enable isolated BYOC cloud sync.',
+      });
+      return;
+    }
+
+    let cancelled = false;
+    let unsubByocAuth: (() => void) | null = null;
+    setByocAuthReady(false);
+
+    void (async () => {
+      try {
+        const ctx = await getOrInitByocContext(currentUser.userId, validation.normalized);
+        if (cancelled) return;
+        setByocContextState(ctx);
+        unsubByocAuth = subscribeByocAuthState(ctx, (u) => {
+          if (cancelled) return;
+          setByocAuthUser(u);
+          setByocAuthReady(true);
+          if (u) {
+            setByocConnection({
+              status: 'connected',
+              message: `Connected & isolated: "${ctx.config.projectId}" (${ctx.config.firestoreDatabaseId || '(default)'}) as ${u.email || u.uid}.`,
+              projectId: ctx.config.projectId,
+              databaseId: ctx.config.firestoreDatabaseId || '(default)',
+              verifiedAt: ctx.config.verifiedAt || new Date().toISOString(),
+            });
+          } else {
+            setByocConnection({
+              status: 'auth_required',
+              message: `BYOC config saved for "${ctx.config.projectId}". Click "Connect Google Account" to sign in.`,
+              projectId: ctx.config.projectId,
+              databaseId: ctx.config.firestoreDatabaseId || '(default)',
+            });
+          }
+        });
+      } catch (err) {
+        if (!cancelled) {
+          setByocContextState(null);
+          setByocAuthUser(null);
+          setByocAuthReady(true);
+          setByocConnection({
+            status: 'error',
+            message: err instanceof Error ? err.message : 'Unable to initialize BYOC Firebase app.',
+            projectId: validation.normalized.projectId,
+            databaseId: validation.normalized.firestoreDatabaseId || '(default)',
+          });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (unsubByocAuth) unsubByocAuth();
+    };
+  }, [isAuthenticated, currentUser?.userId, currentUser?.role, byocConfig]);
 
   // Persist isolated secondary user workspace offline without affecting Admin or clearing localStorage
   useEffect(() => {
@@ -370,47 +520,47 @@ export default function App() {
 
   // Initial Firestore load/seed + real-time Firestore subscription when authenticated
   useEffect(() => {
-    if (!isAuthenticated || !currentUser || !authReady || !firebaseUser) return;
+    if (
+      !isAuthenticated ||
+      !currentUser ||
+      !activeAuthReady ||
+      !activeCloudUser ||
+      !activeCloudTarget
+    ) {
+      return;
+    }
 
     const activeTenantId = currentUser.role === 'secondary' ? currentUser.userId : null;
+    const targetRef = activeCloudTarget;
+    const cloudUid = activeCloudUser.uid;
     let cancelled = false;
     let unsubCloud: (() => void) | null = null;
 
     const initializeFirestoreSession = async () => {
-      // Strictly forbid Secondary users from accidentally syncing into the Primary Admin Google account
-      if (
-        currentUser.role === 'secondary' &&
-        (firebaseUser.email || '').trim().toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()
-      ) {
-        await signOut(auth).catch(() => {});
-        clearCloudSessionCache();
-        if (!cancelled) {
-          setCloudFeedback({
-            type: 'err',
-            msg: 'Admin Google account cannot be linked to a secondary user workspace. Please sign in with your own Google account.',
-          });
+      // Secondary users MUST ONLY use BYOC (never central Admin Firebase project or Admin Google account)
+      if (currentUser.role === 'secondary') {
+        if (!targetRef.isByoc || targetRef.projectId.toLowerCase() === firebaseConfig.projectId.toLowerCase()) {
+          return;
         }
-        return;
+        if ((activeCloudUser.email || '').trim().toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()) {
+          await signOutByocGoogle(currentUser.userId).catch(() => {});
+          clearCloudSessionCache();
+          if (!cancelled) {
+            setCloudFeedback({
+              type: 'err',
+              msg: 'Admin Google account cannot be linked to a secondary user workspace. Please sign in with your own Google account.',
+            });
+          }
+          return;
+        }
       }
 
       setCloudSyncing(true);
       try {
-        await ensureUserRootDocument(firebaseUser, activeTenantId, currentUser);
+        await ensureUserRootDocument(activeCloudUser, activeTenantId, currentUser, targetRef);
         if (cancelled) return;
 
-        if (currentUser.role === 'secondary') {
-          void syncSecondaryUserToCloud(firebaseUser, {
-            userId: currentUser.userId,
-            username: currentUser.username,
-            email: currentUser.email,
-            role: 'secondary',
-            createdAt: currentUser.createdAt || new Date().toISOString(),
-            lastLoginAt: currentUser.lastLoginAt,
-            isActive: true,
-          });
-        }
-
-        const cloud = await fetchAllFromCloud(firebaseUser.uid, activeTenantId);
+        const cloud = await fetchAllFromCloud(cloudUid, activeTenantId, targetRef);
         if (cancelled) return;
 
         attachmentFilesRef.current = cloud.attachmentFiles;
@@ -435,21 +585,22 @@ export default function App() {
           } = stateRef.current;
           const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
           await backupAllToCloud(
-            firebaseUser,
+            activeCloudUser,
             curProfile,
             prefs,
             curTenders,
             curEmd,
             curMaf,
             activeTenantId,
+            targetRef,
           );
-          await syncEmailConfigToCloud(firebaseUser, curEmailSettings, activeTenantId);
-          await syncSheetConfigToCloud(firebaseUser, curSheetSettings, activeTenantId);
+          await syncEmailConfigToCloud(activeCloudUser, curEmailSettings, activeTenantId, targetRef);
+          await syncSheetConfigToCloud(activeCloudUser, curSheetSettings, activeTenantId, targetRef);
           if (!cancelled) {
             markSyncedNow();
             setCloudFeedback({
               type: 'ok',
-              msg: `Connected as ${firebaseUser.email}. All data is stored in your isolated Firebase Firestore workspace.`,
+              msg: `Connected as ${activeCloudUser.email} on "${targetRef.projectId}". All data is stored in your isolated Firebase workspace.`,
             });
           }
         } else {
@@ -494,7 +645,7 @@ export default function App() {
         if (cancelled) return;
 
         unsubCloud = subscribeToUserCloudData(
-          firebaseUser.uid,
+          cloudUid,
           {
             onProfile: (remoteProfile) => {
               setFirmProfile((prev) => mergeCloudProfileWithLocal(remoteProfile, prev));
@@ -548,14 +699,21 @@ export default function App() {
               markSyncedNow();
             },
             onError: (err) => {
-              setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
+              setCloudFeedback({
+                type: 'err',
+                msg: formatCloudErrorMessage(err, targetRef.projectId, targetRef.databaseId),
+              });
             },
           },
           activeTenantId,
+          targetRef,
         );
       } catch (err) {
         if (!cancelled) {
-          setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
+          setCloudFeedback({
+            type: 'err',
+            msg: formatCloudErrorMessage(err, targetRef.projectId, targetRef.databaseId),
+          });
         }
       } finally {
         if (!cancelled) {
@@ -570,13 +728,27 @@ export default function App() {
       cancelled = true;
       if (unsubCloud) unsubCloud();
     };
-  }, [authReady, firebaseUser, isAuthenticated, currentUser?.userId, currentUser?.role]);
+  }, [
+    activeAuthReady,
+    activeCloudUser?.uid,
+    activeCloudTarget?.projectId,
+    activeCloudTarget?.databaseId,
+    activeCloudTarget?.isByoc,
+    isAuthenticated,
+    currentUser?.userId,
+    currentUser?.role,
+  ]);
 
-  const runCloudTask = async (task: (user: User) => Promise<void>, successMessage?: string) => {
-    if (!firebaseUser) return;
+  const runCloudTask = async (
+    task: (user: User, target: CloudTargetContext) => Promise<void>,
+    successMessage?: string,
+  ) => {
+    const user = stateRef.current.activeCloudUser;
+    const target = stateRef.current.activeCloudTarget;
+    if (!user || !target) return;
     setCloudSyncing(true);
     try {
-      await task(firebaseUser);
+      await task(user, target);
       markSyncedNow();
       if (successMessage) {
         setCloudFeedback({ type: 'ok', msg: successMessage });
@@ -584,7 +756,10 @@ export default function App() {
         setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
       }
     } catch (err) {
-      setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
+      setCloudFeedback({
+        type: 'err',
+        msg: formatCloudErrorMessage(err, target.projectId, target.databaseId),
+      });
     } finally {
       setCloudSyncing(false);
     }
@@ -592,6 +767,42 @@ export default function App() {
 
   const handleConnectCloud = async () => {
     setCloudFeedback(null);
+    const session = stateRef.current.currentUser;
+    if (session?.role === 'secondary') {
+      const cfg = stateRef.current.byocConfig;
+      const check = validateByocFirebaseConfig(cfg);
+      if (!check.valid) {
+        setCloudFeedback({
+          type: 'err',
+          msg: check.error || 'Please save your personal BYOC Firebase config first.',
+        });
+        return;
+      }
+      setCloudSyncing(true);
+      try {
+        const { ctx } = await signInWithByocGoogle(session.userId, check.normalized);
+        setByocContextState(ctx);
+        const verifiedCfg: ByocFirebaseConfig = {
+          ...check.normalized,
+          verifiedAt: new Date().toISOString(),
+        };
+        saveByocConfig(session.userId, verifiedCfg);
+        setByocConfig(verifiedCfg);
+      } catch (err) {
+        setCloudFeedback({
+          type: 'err',
+          msg: formatCloudErrorMessage(
+            err,
+            check.normalized.projectId,
+            check.normalized.firestoreDatabaseId,
+          ),
+        });
+      } finally {
+        setCloudSyncing(false);
+      }
+      return;
+    }
+
     setCloudSyncing(true);
     try {
       await signInWithPopup(auth, googleProvider);
@@ -604,15 +815,24 @@ export default function App() {
 
   const handleDisconnectCloud = async () => {
     setCloudSyncing(true);
+    const session = stateRef.current.currentUser;
+    const target = stateRef.current.activeCloudTarget;
     try {
-      await signOut(auth);
+      if (session?.role === 'secondary') {
+        await signOutByocGoogle(session.userId);
+      } else {
+        await signOut(auth);
+      }
       clearCloudSessionCache();
       setCloudFeedback({
         type: 'ok',
         msg: 'Signed out of Google Cloud. Sign back in anytime to read & save data in Firestore.',
       });
     } catch (err) {
-      setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
+      setCloudFeedback({
+        type: 'err',
+        msg: formatCloudErrorMessage(err, target?.projectId, target?.databaseId),
+      });
     } finally {
       setCloudSyncing(false);
     }
@@ -630,7 +850,8 @@ export default function App() {
     } = stateRef.current;
     const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
     void runCloudTask(
-      (user) => replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId),
+      (user, target) =>
+        replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId, target),
       `Synced ${curTenders.length} tenders, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
     );
   };
@@ -638,9 +859,9 @@ export default function App() {
   const handleRestoreFromCloud = () => {
     const tenantId = stateRef.current.workspaceTenantId;
     const userSession = stateRef.current.currentUser;
-    void runCloudTask(async (user) => {
-      await ensureUserRootDocument(user, tenantId, userSession);
-      const cloud = await fetchAllFromCloud(user.uid, tenantId);
+    void runCloudTask(async (user, target) => {
+      await ensureUserRootDocument(user, tenantId, userSession, target);
+      const cloud = await fetchAllFromCloud(user.uid, tenantId, target);
       attachmentFilesRef.current = cloud.attachmentFiles;
       if (cloud.profile) {
         setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
@@ -661,12 +882,12 @@ export default function App() {
     }, 'Reloaded latest data from Firebase Firestore.');
   };
 
-  const cloudUserSummary: CloudUserSummary | null = firebaseUser
+  const cloudUserSummary: CloudUserSummary | null = activeCloudUser
     ? {
-        uid: firebaseUser.uid,
-        email: firebaseUser.email,
-        displayName: firebaseUser.displayName,
-        photoURL: firebaseUser.photoURL,
+        uid: activeCloudUser.uid,
+        email: activeCloudUser.email,
+        displayName: activeCloudUser.displayName,
+        photoURL: activeCloudUser.photoURL,
       }
     : null;
 
@@ -682,15 +903,21 @@ export default function App() {
         if (!item?.userId || !item.email) continue;
         const key = item.userId.trim().toLowerCase();
         const prev = merged.get(key);
-        const pickLatestLogin =
-          item.lastLoginAt && (!prev?.lastLoginAt || item.lastLoginAt > prev.lastLoginAt)
-            ? item.lastLoginAt
-            : prev?.lastLoginAt;
+        const pickLatest = (a?: string, b?: string) => (a && (!b || a > b) ? a : b);
+        const isIncomingNewer =
+          !prev ||
+          (item.lastHeartbeatAt && (!prev.lastHeartbeatAt || item.lastHeartbeatAt >= prev.lastHeartbeatAt)) ||
+          (item.disabledAt && (!prev.disabledAt || item.disabledAt >= prev.disabledAt));
         merged.set(key, {
           ...prev,
           ...item,
           role: 'secondary',
-          lastLoginAt: pickLatestLogin,
+          lastLoginAt: pickLatest(item.lastLoginAt, prev?.lastLoginAt),
+          lastHeartbeatAt: pickLatest(item.lastHeartbeatAt, prev?.lastHeartbeatAt),
+          byocProjectId: item.byocProjectId || prev?.byocProjectId,
+          isEnabled: isIncomingNewer
+            ? (item.isEnabled !== undefined ? item.isEnabled : prev?.isEnabled ?? true)
+            : (prev?.isEnabled !== undefined ? prev.isEnabled : item.isEnabled ?? true),
         });
       }
     };
@@ -739,6 +966,238 @@ export default function App() {
     void refreshSecondaryUsers();
   }, [isAuthenticated, currentUser?.role, adminSessionToken, firebaseUser?.uid]);
 
+  // Live 25s presence refresh for Admin when inspecting Secondary Users directory
+  useEffect(() => {
+    if (!isAuthenticated || currentUser?.role !== 'admin' || activeTab !== 'settings') {
+      return;
+    }
+    void refreshSecondaryUsers();
+    const timer = window.setInterval(() => {
+      void refreshSecondaryUsers();
+    }, 25_000);
+    return () => window.clearInterval(timer);
+  }, [isAuthenticated, currentUser?.role, activeTab, adminSessionToken, firebaseUser?.uid]);
+
+  const sendPresenceHeartbeat = async (explicitByocConfig?: ByocFirebaseConfig | null) => {
+    const session = stateRef.current.currentUser;
+    if (!session) return;
+    const effectiveCfg =
+      explicitByocConfig !== undefined ? explicitByocConfig : stateRef.current.byocConfig;
+    try {
+      const res = await fetch('/api/auth/presence/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: session.userId,
+          identifier: session.username,
+          credentialToken: getStoredCredentialToken(session.username),
+          clientCredentialTokens: getAllStoredCredentialTokens(),
+          byocProjectId: effectiveCfg?.projectId || session.byocProjectId || '',
+          ...(effectiveCfg ? { byocConfig: effectiveCfg } : {}),
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        code?: string;
+        disabled?: boolean;
+        error?: string;
+      }>(res);
+      if (
+        session.role === 'secondary' &&
+        (res.status === 403 || parsed.data?.code === 'ACCOUNT_DISABLED' || parsed.data?.disabled)
+      ) {
+        handleLogout(
+          parsed.data?.error ||
+            'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+        );
+      }
+    } catch {
+      // Non-fatal network hiccup; next 25s interval will retry
+    }
+  };
+
+  // 25s active presence heartbeat + sendBeacon unload logout signal
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser) return;
+
+    void sendPresenceHeartbeat();
+    const intervalId = window.setInterval(() => {
+      void sendPresenceHeartbeat();
+    }, 25_000);
+
+    const dispatchUnloadBeacon = () => {
+      try {
+        const payload = JSON.stringify({
+          userId: currentUser.userId,
+          identifier: currentUser.username,
+        });
+        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+          navigator.sendBeacon(
+            '/api/auth/logout',
+            new Blob([payload], { type: 'application/json' }),
+          );
+        }
+      } catch {
+        // Ignore beacon failure during page unload
+      }
+    };
+
+    window.addEventListener('pagehide', dispatchUnloadBeacon);
+    window.addEventListener('beforeunload', dispatchUnloadBeacon);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('pagehide', dispatchUnloadBeacon);
+      window.removeEventListener('beforeunload', dispatchUnloadBeacon);
+    };
+  }, [isAuthenticated, currentUser?.userId]);
+
+  const handleSaveByocConfig = async (nextConfig: ByocFirebaseConfig) => {
+    const session = stateRef.current.currentUser;
+    if (!session || session.role !== 'secondary') return;
+    const validation = validateByocFirebaseConfig(nextConfig);
+    if (!validation.valid) {
+      throw new Error(validation.error || 'Invalid BYOC Firebase configuration.');
+    }
+    const normalized: ByocFirebaseConfig = {
+      ...validation.normalized,
+      updatedAt: new Date().toISOString(),
+    };
+    saveByocConfig(session.userId, normalized);
+    setByocConfig(normalized);
+    await getOrInitByocContext(session.userId, normalized);
+    void sendPresenceHeartbeat(normalized);
+    showToast('ok', `Saved BYOC project "${normalized.projectId}".`);
+  };
+
+  const handleTestByocConnection = async (
+    candidateConfig: ByocFirebaseConfig,
+  ): Promise<ByocConnectionState> => {
+    const session = stateRef.current.currentUser;
+    if (!session || session.role !== 'secondary') {
+      return { status: 'error', message: 'BYOC mode applies to secondary user accounts only.' };
+    }
+    const result = await testByocFirebaseConnection(session.userId, candidateConfig);
+    setByocConnection(result);
+    if (result.status === 'connected' && result.verifiedAt) {
+      const updatedCfg: ByocFirebaseConfig = {
+        ...candidateConfig,
+        verifiedAt: result.verifiedAt,
+      };
+      saveByocConfig(session.userId, updatedCfg);
+      setByocConfig(updatedCfg);
+      void sendPresenceHeartbeat(updatedCfg);
+    }
+    return result;
+  };
+
+  const handleClearByocConfig = async () => {
+    const session = stateRef.current.currentUser;
+    if (!session || session.role !== 'secondary') return;
+    await disposeByocContext(session.userId);
+    clearByocConfig(session.userId);
+    clearCloudSessionCache();
+    setByocConfig(null);
+    setByocContextState(null);
+    setByocAuthUser(null);
+    setByocAuthReady(true);
+    setByocConnection({
+      status: 'pending',
+      message: 'BYOC configuration cleared. Workspace remains isolated locally.',
+    });
+    void sendPresenceHeartbeat(null);
+  };
+
+  const handleToggleSecondaryUserStatus = async (targetUserId: string, enable: boolean) => {
+    if (stateRef.current.currentUser?.role !== 'admin') return;
+    const targetSummary = secondaryUsers.find((u) => u.userId === targetUserId);
+    setTogglingSecondaryUserId(targetUserId);
+    try {
+      const res = await fetch('/api/auth/secondary-users/status', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(adminSessionToken ? { 'x-crm-admin-token': adminSessionToken } : {}),
+        },
+        body: JSON.stringify({
+          userId: targetUserId,
+          username: targetSummary?.username,
+          email: targetSummary?.email,
+          isEnabled: enable,
+          clientCredentialTokens: getAllStoredCredentialTokens(),
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        user?: SecondaryUserSummary;
+        credentialToken?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+
+      if (!res.ok || !parsed.data?.ok) {
+        showToast(
+          'err',
+          parsed.data?.error || parsed.errorMessage || 'Could not update secondary user access.',
+        );
+        return;
+      }
+
+      const updatedLocal = setSecondaryUserEnabled(targetUserId, enable);
+      if (parsed.data.credentialToken && (parsed.data.user || targetSummary)) {
+        const refUser = parsed.data.user || targetSummary!;
+        saveResetPasswordCredential(refUser.username, '', parsed.data.credentialToken, {
+          userId: refUser.userId,
+          email: refUser.email,
+          role: 'secondary',
+          isEnabled: enable,
+          disabledAt: enable ? undefined : new Date().toISOString(),
+          presenceStatus: enable ? refUser.presenceStatus ?? 'not_active' : 'not_active',
+          byocProjectId: refUser.byocProjectId,
+        });
+      }
+
+      const nextRecord: SecondaryUserSummary | null =
+        parsed.data.user ||
+        updatedLocal ||
+        (targetSummary
+          ? {
+              ...targetSummary,
+              isEnabled: enable,
+              isActive: false,
+              presenceStatus: enable ? targetSummary.presenceStatus ?? 'not_active' : 'not_active',
+              disabledAt: enable ? undefined : new Date().toISOString(),
+            }
+          : null);
+
+      if (nextRecord) {
+        setSecondaryUsers((prev) =>
+          prev.map((u) => (u.userId === targetUserId ? { ...u, ...nextRecord } : u)),
+        );
+        const fbUser = stateRef.current.firebaseUser;
+        if (
+          fbUser &&
+          (fbUser.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()
+        ) {
+          void syncSecondaryUserToCloud(fbUser, nextRecord).catch(() => {
+            // Non-fatal if central Firestore sync fails
+          });
+        }
+      }
+
+      showToast(
+        'ok',
+        parsed.data.message ||
+          (enable
+            ? `Enabled access for ${targetSummary?.username || targetUserId}.`
+            : `Disabled access for ${targetSummary?.username || targetUserId}.`),
+      );
+    } catch {
+      showToast('err', 'Network error while updating secondary user access.');
+    } finally {
+      setTogglingSecondaryUserId(null);
+    }
+  };
+
   const dispatchEmailReminder = async (
     tender: Tender,
     slot: EmailReminderSlot | 'manual' | 'test',
@@ -746,7 +1205,8 @@ export default function App() {
   ): Promise<void> => {
     const {
       emailSettings: curSettings,
-      firebaseUser: curUser,
+      activeCloudUser: curUser,
+      activeCloudTarget: curTarget,
       currentUser: curSession,
       workspaceTenantId: tenantId,
     } = stateRef.current;
@@ -848,8 +1308,8 @@ export default function App() {
     }
 
     setEmailLogs((prev) => mergeEmailLogs([logEntry], prev));
-    if (curUser) {
-      void syncEmailAlertLogToCloud(curUser, logEntry, tenantId).catch(() => {
+    if (curUser && curTarget) {
+      void syncEmailAlertLogToCloud(curUser, logEntry, tenantId, curTarget).catch(() => {
         // Handled cleanly via subsequent cloud sync
       });
     }
@@ -926,7 +1386,7 @@ export default function App() {
   const cloudStorageSummary = useMemo(
     () =>
       estimateCloudStorageUsage({
-        ownerUid: firebaseUser?.uid,
+        ownerUid: activeCloudUser?.uid,
         profile: firmProfile,
         preferences: { adminPin, darkMode },
         tenders,
@@ -938,7 +1398,7 @@ export default function App() {
         attachmentFiles: attachmentFilesRef.current,
       }),
     [
-      firebaseUser?.uid,
+      activeCloudUser?.uid,
       firmProfile,
       adminPin,
       darkMode,
@@ -1120,9 +1580,11 @@ export default function App() {
       stateRef.current.mafTrackers = merged.nextTrackers;
       setMafTrackers(merged.nextTrackers);
 
-      if (merged.targetTracker && stateRef.current.firebaseUser) {
+      if (merged.targetTracker && stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
         const activeTenant = stateRef.current.workspaceTenantId;
-        void runCloudTask((user) => syncMafTrackerToCloud(user, merged.targetTracker!, activeTenant));
+        void runCloudTask((user, target) =>
+          syncMafTrackerToCloud(user, merged.targetTracker!, activeTenant, target),
+        );
       }
 
       if (merged.addedCount > 0) {
@@ -1220,13 +1682,16 @@ export default function App() {
       setSheetSyncStatus('synced');
       setSheetSyncError(null);
 
-      if (stateRef.current.firebaseUser) {
+      if (stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
         const activeTenant = stateRef.current.workspaceTenantId;
-        void syncSheetConfigToCloud(stateRef.current.firebaseUser, updatedCfg, activeTenant).catch(
-          () => {
-            // Non-fatal: already updated in-memory
-          },
-        );
+        void syncSheetConfigToCloud(
+          stateRef.current.activeCloudUser,
+          updatedCfg,
+          activeTenant,
+          stateRef.current.activeCloudTarget,
+        ).catch(() => {
+          // Non-fatal: already updated in-memory
+        });
       }
 
       if (opts.force) {
@@ -1329,16 +1794,16 @@ export default function App() {
     setTenderModalTarget(undefined);
 
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask(async (user) => {
-      await syncTenderToCloud(user, saved, activeTenant);
+    void runCloudTask(async (user, target) => {
+      await syncTenderToCloud(user, saved, activeTenant, target);
       if (linkedRecordToSync) {
-        await syncEmdRecordToCloud(user, linkedRecordToSync, activeTenant);
+        await syncEmdRecordToCloud(user, linkedRecordToSync, activeTenant, target);
       }
       if (linkedMafToSync) {
-        await syncMafTrackerToCloud(user, linkedMafToSync, activeTenant);
+        await syncMafTrackerToCloud(user, linkedMafToSync, activeTenant, target);
       }
       for (const updatedMaf of changedTrackers) {
-        await syncMafTrackerToCloud(user, updatedMaf, activeTenant);
+        await syncMafTrackerToCloud(user, updatedMaf, activeTenant, target);
       }
     });
 
@@ -1376,10 +1841,10 @@ export default function App() {
       setMafTrackers(syncedResult.nextTrackers);
     }
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask(async (user) => {
-      await syncTenderToCloud(user, updated, activeTenant);
+    void runCloudTask(async (user, target) => {
+      await syncTenderToCloud(user, updated, activeTenant, target);
       for (const updatedMaf of changedTrackers) {
-        await syncMafTrackerToCloud(user, updatedMaf, activeTenant);
+        await syncMafTrackerToCloud(user, updatedMaf, activeTenant, target);
       }
     });
 
@@ -1404,7 +1869,7 @@ export default function App() {
       setSelectedTenderId(null);
     }
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) => deleteTenderFromCloud(user, id, activeTenant));
+    void runCloudTask((user, target) => deleteTenderFromCloud(user, id, activeTenant, target));
 
     if (deletedTender) {
       void pushToGoogleSheet({
@@ -1427,7 +1892,7 @@ export default function App() {
       stateRef.current.emdRecords = nextEmdRecords;
       setEmdRecords(nextEmdRecords);
       const activeTenant = stateRef.current.workspaceTenantId;
-      void runCloudTask((user) => syncEmdRecordToCloud(user, linked, activeTenant));
+      void runCloudTask((user, target) => syncEmdRecordToCloud(user, linked, activeTenant, target));
       void pushToGoogleSheet({
         action: 'CREATE',
         entityType: 'EMD_BG',
@@ -1449,7 +1914,7 @@ export default function App() {
     setEmdRecords(nextEmdRecords);
     setEmdModalTarget(undefined);
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) => syncEmdRecordToCloud(user, saved, activeTenant));
+    void runCloudTask((user, target) => syncEmdRecordToCloud(user, saved, activeTenant, target));
 
     void pushToGoogleSheet({
       action: isExisting ? 'UPDATE' : 'CREATE',
@@ -1466,7 +1931,7 @@ export default function App() {
     stateRef.current.emdRecords = nextEmdRecords;
     setEmdRecords(nextEmdRecords);
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) => deleteEmdRecordFromCloud(user, id, activeTenant));
+    void runCloudTask((user, target) => deleteEmdRecordFromCloud(user, id, activeTenant, target));
 
     if (deletedRecord) {
       void pushToGoogleSheet({
@@ -1483,20 +1948,22 @@ export default function App() {
   const syncMafOptimistic = async (
     prevSnapshot: MafTrackerRecord[],
     nextList: MafTrackerRecord[],
-    cloudOp: (user: User) => Promise<void>,
+    cloudOp: (user: User, target: CloudTargetContext) => Promise<void>,
     toastMsg: string,
   ) => {
     setMafTrackers(nextList);
     showToast('ok', toastMsg);
-    if (!firebaseUser) return;
+    const curUser = stateRef.current.activeCloudUser;
+    const curTarget = stateRef.current.activeCloudTarget;
+    if (!curUser || !curTarget) return;
     setCloudSyncing(true);
     try {
-      await cloudOp(firebaseUser);
+      await cloudOp(curUser, curTarget);
       markSyncedNow();
       setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
     } catch (err) {
       setMafTrackers(prevSnapshot);
-      const formatted = formatCloudErrorMessage(err);
+      const formatted = formatCloudErrorMessage(err, curTarget.projectId, curTarget.databaseId);
       showToast('err', formatted);
       setCloudFeedback({ type: 'err', msg: formatted });
     } finally {
@@ -1538,7 +2005,7 @@ export default function App() {
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, canonicalTracker, activeTenant),
+      (user, target) => syncMafTrackerToCloud(user, canonicalTracker, activeTenant, target),
       exists
         ? `Updated MAF tracker for ${canonicalTracker.tenderId}.`
         : `Created MAF tracker for ${canonicalTracker.tenderId} (${canonicalTracker.itemsMAF.length} item(s)).`,
@@ -1553,7 +2020,7 @@ export default function App() {
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => deleteMafTrackerFromCloud(user, trackerId, activeTenant),
+      (user, cloudTarget) => deleteMafTrackerFromCloud(user, trackerId, activeTenant, cloudTarget),
       `Removed MAF tracker ${target?.tenderId ?? ''}.`,
     );
   };
@@ -1580,7 +2047,7 @@ export default function App() {
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
+      (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
       itemExists
         ? `Updated "${savedItem.itemName}" (${savedItem.oemName}).`
         : `Added "${savedItem.itemName}" (${savedItem.oemName}) to ${target.tenderId}.`,
@@ -1610,14 +2077,21 @@ export default function App() {
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
+      (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
       `${item?.oemName ?? 'OEM'} MAF status set to "${nextStatus}".`,
     );
   };
 
   const handleUploadMafFile = async (trackerId: string, itemId: string, file: File) => {
     const activeTenant = stateRef.current.workspaceTenantId;
-    const result = await uploadMafDocumentFile(firebaseUser, trackerId, itemId, file, activeTenant);
+    const result = await uploadMafDocumentFile(
+      stateRef.current.activeCloudUser,
+      trackerId,
+      itemId,
+      file,
+      activeTenant,
+      stateRef.current.activeCloudTarget,
+    );
     if (result.mafAttachmentId && result.mafDocumentUrl.startsWith('data:')) {
       attachmentFilesRef.current.set(result.mafAttachmentId, result.mafDocumentUrl);
     }
@@ -1651,7 +2125,7 @@ export default function App() {
       await syncMafOptimistic(
         prevSnapshot,
         nextList,
-        (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
+        (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
         `Uploaded "${uploaded.mafDocumentName}" successfully.`,
       );
     } catch (err) {
@@ -1676,7 +2150,7 @@ export default function App() {
     void syncMafOptimistic(
       prevSnapshot,
       nextList,
-      (user) => syncMafTrackerToCloud(user, updatedTracker, activeTenant),
+      (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
       `Removed "${removed?.itemName ?? 'item'}" from ${target.tenderId}.`,
     );
   };
@@ -1685,23 +2159,27 @@ export default function App() {
     stateRef.current.firmProfile = nextProfile;
     setFirmProfile(nextProfile);
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) => syncProfileToCloud(user, nextProfile, activeTenant));
+    void runCloudTask((user, target) => syncProfileToCloud(user, nextProfile, activeTenant, target));
   };
 
   const handleSaveEmailSettings = (nextSettings: EmailAlertSettings) => {
     stateRef.current.emailSettings = nextSettings;
     setEmailSettings(nextSettings);
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) => syncEmailConfigToCloud(user, nextSettings, activeTenant));
+    void runCloudTask((user, target) =>
+      syncEmailConfigToCloud(user, nextSettings, activeTenant, target),
+    );
   };
 
   const handleSaveSheetSettings = async (nextSettings: GoogleSheetSettings) => {
     stateRef.current.sheetSettings = nextSettings;
     setSheetSettings(nextSettings);
     setSheetSyncError(null);
-    if (stateRef.current.firebaseUser) {
+    if (stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
       const activeTenant = stateRef.current.workspaceTenantId;
-      void runCloudTask((user) => syncSheetConfigToCloud(user, nextSettings, activeTenant));
+      void runCloudTask((user, target) =>
+        syncSheetConfigToCloud(user, nextSettings, activeTenant, target),
+      );
     }
     if (!nextSettings.webhookUrl.trim()) {
       setSheetSyncStatus('unconfigured');
@@ -1750,11 +2228,12 @@ export default function App() {
     setDarkMode((prev) => {
       const next = !prev;
       const activeTenant = stateRef.current.workspaceTenantId;
-      void runCloudTask((user) =>
+      void runCloudTask((user, target) =>
         syncPreferencesToCloud(
           user,
           { adminPin: stateRef.current.adminPin, darkMode: next },
           activeTenant,
+          target,
         ),
       );
       return next;
@@ -1766,6 +2245,7 @@ export default function App() {
     _rememberMe: boolean,
     serverMeta?: { credentialToken?: string; adminSessionToken?: string },
   ) => {
+    setDisabledNotice(null);
     recordUserLoginActivity(session.username);
 
     // Snapshot Admin offline workspace before switching to secondary workspace if needed
@@ -1788,11 +2268,7 @@ export default function App() {
 
     const prevUserId = activeCrmUserIdRef.current;
     const isSwitchingCrmAccount = Boolean(prevUserId && prevUserId !== session.userId);
-    const activeFbUser = stateRef.current.firebaseUser;
-    const isSecondaryWithAdminGoogle =
-      session.role === 'secondary' &&
-      Boolean(activeFbUser) &&
-      (activeFbUser?.email || '').trim().toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase();
+    const activeCentralFbUser = stateRef.current.firebaseUser;
 
     clearCloudSessionCache();
     attachmentFilesRef.current.clear();
@@ -1803,11 +2279,41 @@ export default function App() {
     setActiveTab('dashboard');
     setCloudFeedback(null);
 
-    if ((isSwitchingCrmAccount || isSecondaryWithAdminGoogle) && activeFbUser) {
+    // Always ensure secondary sessions do NOT hold central Admin Firebase auth
+    if ((isSwitchingCrmAccount || session.role === 'secondary') && activeCentralFbUser) {
       await signOut(auth).catch(() => {});
     }
 
     if (session.role === 'secondary') {
+      // Dispose any prior secondary BYOC app instance before loading the new user
+      if (isSwitchingCrmAccount && prevUserId) {
+        await disposeByocContext(prevUserId).catch(() => {});
+      }
+      const resolvedByocConfig =
+        (session.byocConfig && validateByocFirebaseConfig(session.byocConfig).valid
+          ? session.byocConfig
+          : null) || loadByocConfig(session.userId);
+      if (resolvedByocConfig) {
+        saveByocConfig(session.userId, resolvedByocConfig);
+      }
+      setByocConfig(resolvedByocConfig);
+      setByocAuthUser(null);
+      setByocContextState(null);
+      setByocAuthReady(false);
+      setByocConnection(
+        resolvedByocConfig
+          ? {
+              status: 'auth_required',
+              message: `BYOC config loaded for "${resolvedByocConfig.projectId}". Click "Connect Google Account" in Settings if prompted.`,
+              projectId: resolvedByocConfig.projectId,
+              databaseId: resolvedByocConfig.firestoreDatabaseId || '(default)',
+            }
+          : {
+              status: 'pending',
+              message: 'Save your personal Firebase config to enable isolated BYOC cloud sync.',
+            },
+      );
+
       const emptyOrSaved =
         loadSecondaryWorkspaceSnapshot(session.userId) ?? buildEmptySecondaryWorkspace(session);
 
@@ -1839,11 +2345,20 @@ export default function App() {
         emailSettings: emptyOrSaved.emailSettings,
         emailLogs: emptyOrSaved.emailLogs,
         sheetSettings: emptyOrSaved.sheetSettings,
+        byocConfig: resolvedByocConfig,
+        activeCloudUser: null,
+        activeCloudTarget: null,
         currentUser: session,
         workspaceTenantId: session.userId,
       };
       setAdminSessionToken('');
     } else {
+      await disposeByocContext().catch(() => {});
+      setByocConfig(null);
+      setByocContextState(null);
+      setByocAuthUser(null);
+      setByocAuthReady(true);
+
       if (activeRoleRef.current === 'secondary' && adminOfflineSnapshotRef.current) {
         const snap = adminOfflineSnapshotRef.current;
         setFirmProfile(snap.firmProfile);
@@ -1874,6 +2389,7 @@ export default function App() {
           emailSettings: snap.emailSettings,
           emailLogs: snap.emailLogs,
           sheetSettings: snap.sheetSettings,
+          byocConfig: null,
           currentUser: session,
           workspaceTenantId: null,
         };
@@ -1885,14 +2401,33 @@ export default function App() {
     activeCrmUserIdRef.current = session.userId;
     setCurrentUser(session);
     setIsAuthenticated(true);
+    window.scrollTo({ top: 0, left: 0 });
   };
 
-  const handleLogout = () => {
+  const handleLogout = (forceDisabledMessage?: string) => {
+    const exitingSession = stateRef.current.currentUser;
+    if (exitingSession) {
+      void fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: exitingSession.userId,
+          identifier: exitingSession.username,
+        }),
+      }).catch(() => {});
+      if (exitingSession.role === 'secondary') {
+        void disposeByocContext(exitingSession.userId).catch(() => {});
+      }
+    }
+
     clearCloudSessionCache();
     attachmentFilesRef.current.clear();
     dispatchedEmailKeysRef.current.clear();
     emailRetryStateRef.current.clear();
     mafExtractionSignatureRef.current.clear();
+    setByocConfig(null);
+    setByocContextState(null);
+    setByocAuthUser(null);
     setAdminSessionToken('');
     setCloudFeedback(null);
     setIsAuthenticated(false);
@@ -1902,6 +2437,10 @@ export default function App() {
     setEmdModalTarget(undefined);
     setMafTrackerModalTarget(undefined);
     setMafItemModalTarget(null);
+    if (typeof forceDisabledMessage === 'string' && forceDisabledMessage.trim()) {
+      setDisabledNotice(forceDisabledMessage);
+    }
+    window.scrollTo({ top: 0, left: 0 });
   };
 
   const handleNavigateFromNotification = (item: NotificationItem) => {
@@ -1909,6 +2448,7 @@ export default function App() {
     if (item.targetTab === 'tenders') {
       setSelectedTenderId(item.targetId);
     }
+    window.scrollTo({ top: 0, left: 0 });
   };
 
   const handleImportBackup = (payload: CrmBackupPayload) => {
@@ -1931,7 +2471,7 @@ export default function App() {
       darkMode: stateRef.current.darkMode,
     };
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) =>
+    void runCloudTask((user, target) =>
       replaceCloudDataset(
         user,
         payload.profile,
@@ -1940,6 +2480,7 @@ export default function App() {
         payload.emdRecords,
         nextMaf,
         activeTenant,
+        target,
       ),
     );
     void pushToGoogleSheet({
@@ -1965,7 +2506,7 @@ export default function App() {
       adminPin: stateRef.current.adminPin,
       darkMode: stateRef.current.darkMode,
     };
-    void runCloudTask((user) =>
+    void runCloudTask((user, target) =>
       replaceCloudDataset(
         user,
         DEFAULT_FIRM_PROFILE,
@@ -1974,6 +2515,7 @@ export default function App() {
         SEED_EMD_RECORDS,
         SEED_MAF_TRACKERS,
         null,
+        target,
       ),
     );
     void pushToGoogleSheet({
@@ -1998,8 +2540,8 @@ export default function App() {
       darkMode: stateRef.current.darkMode,
     };
     const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user) =>
-      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], [], activeTenant),
+    void runCloudTask((user, target) =>
+      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], [], activeTenant, target),
     );
     void pushToGoogleSheet({
       action: 'FULL_SYNC',
@@ -2015,6 +2557,8 @@ export default function App() {
         onLoginSuccess={(session, rememberMe, meta) => {
           void handleLoginSuccess(session, rememberMe, meta);
         }}
+        disabledNotice={disabledNotice}
+        onDismissDisabledNotice={() => setDisabledNotice(null)}
       />
     );
   }
@@ -2023,7 +2567,10 @@ export default function App() {
     <div className="min-h-screen flex bg-[#F8FAFC] dark:bg-[#0B1120] text-slate-900 dark:text-slate-100">
       <Sidebar
         activeTab={activeTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={(tab) => {
+          setActiveTab(tab);
+          window.scrollTo({ top: 0, left: 0 });
+        }}
         firmProfile={firmProfile}
         currentUser={currentUser}
         tenderCount={tenders.length}
@@ -2052,7 +2599,11 @@ export default function App() {
           cloudUser={cloudUserSummary}
           cloudSyncing={cloudSyncing}
           cloudError={cloudFeedback?.type === 'err'}
-          onConnectCloud={handleConnectCloud}
+          onConnectCloud={
+            isSecondarySession && !savedByocValid
+              ? () => setActiveTab('settings')
+              : handleConnectCloud
+          }
           onOpenCloudSettings={() => setActiveTab('settings')}
           sheetSyncStatus={sheetSyncStatus}
           sheetSyncError={sheetSyncError}
@@ -2060,22 +2611,43 @@ export default function App() {
         />
 
         <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto space-y-4">
-          {authReady && !firebaseUser && (
+          {activeAuthReady && !activeCloudUser && (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-blue-200 dark:border-blue-900/70 bg-blue-50/80 dark:bg-blue-950/30 px-4 py-3">
               <div className="flex items-center gap-2.5 min-w-0">
                 <Cloud className="h-4 w-4 text-[#1E3A8A] dark:text-blue-400 shrink-0" aria-hidden="true" />
                 <p className="text-xs text-slate-800 dark:text-slate-200">
-                  <span className="font-semibold">Firestore Cloud Mode:</span> Browser storage is disabled. Sign in with Google to save and load all tenders, MAF statuses, EMD/BG records, and attachments in Firebase Firestore.
+                  {isSecondarySession && !savedByocValid ? (
+                    <>
+                      <span className="font-semibold">Personal BYOC Cloud Mode:</span> Your secondary workspace is strictly isolated. Configure your own Firebase project in Workspace Settings to enable cloud sync.
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-semibold">Firestore Cloud Mode:</span>{' '}
+                      {isSecondarySession
+                        ? `Sign in with your Google account to sync with your isolated BYOC project (${byocConfig?.projectId}).`
+                        : 'Browser storage is disabled. Sign in with Google to save and load all tenders, MAF statuses, EMD/BG records, and attachments in Firebase Firestore.'}
+                    </>
+                  )}
                 </p>
               </div>
               <button
                 type="button"
-                onClick={handleConnectCloud}
+                onClick={
+                  isSecondarySession && !savedByocValid
+                    ? () => setActiveTab('settings')
+                    : handleConnectCloud
+                }
                 disabled={cloudSyncing}
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium whitespace-nowrap shrink-0"
               >
                 <CloudUpload className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>{cloudSyncing ? 'Connecting...' : 'Sign in with Google'}</span>
+                <span>
+                  {cloudSyncing
+                    ? 'Connecting...'
+                    : isSecondarySession && !savedByocValid
+                      ? 'Configure Personal Cloud'
+                      : 'Sign in with Google'}
+                </span>
               </button>
             </div>
           )}
@@ -2096,7 +2668,7 @@ export default function App() {
                 <span className="break-words">{cloudFeedback.msg}</span>
               </div>
               <div className="flex items-center gap-2 shrink-0">
-                {cloudFeedback.type === 'err' && firebaseUser && (
+                {cloudFeedback.type === 'err' && activeCloudUser && (
                   <button
                     type="button"
                     onClick={handleBackupToCloudNow}
@@ -2151,6 +2723,7 @@ export default function App() {
             <TendersTab
               tenders={tenders}
               emdRecords={emdRecords}
+              defaultOwner={firmProfile.adminName || currentUser?.username}
               onAddTender={() => setTenderModalTarget(null)}
               onEditTender={(tender) => setTenderModalTarget(tender)}
               onOpenTender={(tender) => setSelectedTenderId(tender.id)}
@@ -2190,7 +2763,7 @@ export default function App() {
               emdRecords={emdRecords}
               mafTrackers={mafTrackers}
               onSaveProfile={handleSaveProfile}
-              onLogout={handleLogout}
+              onLogout={() => handleLogout()}
               onImportBackup={handleImportBackup}
               onResetDemoData={handleResetDemoData}
               onClearAllData={handleClearAllData}
@@ -2217,6 +2790,13 @@ export default function App() {
               currentUser={currentUser}
               secondaryUsers={secondaryUsers}
               onRefreshSecondaryUsers={() => void refreshSecondaryUsers()}
+              byocConfig={byocConfig}
+              byocConnection={byocConnection}
+              onSaveByocConfig={handleSaveByocConfig}
+              onTestByocConnection={handleTestByocConnection}
+              onClearByocConfig={handleClearByocConfig}
+              onToggleSecondaryUserStatus={handleToggleSecondaryUserStatus}
+              togglingUserId={togglingSecondaryUserId}
             />
           )}
         </main>

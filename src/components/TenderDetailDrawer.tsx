@@ -240,6 +240,24 @@ export function TenderDetailDrawer({
           {/* Core Specs & Financials */}
           <section className="grid grid-cols-2 sm:grid-cols-3 gap-4 pb-5 border-b border-slate-200 dark:border-slate-800 text-xs">
             <div>
+              <span className="text-slate-500 dark:text-slate-400">Client / Organization</span>
+              <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {tender.clientName || tender.department}
+              </p>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Location / Department</span>
+              <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {tender.locationDepartment || [tender.location, tender.department].filter(Boolean).join(' / ')}
+              </p>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Assigned Person / Owner</span>
+              <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {tender.assignedOwner || '—'}
+              </p>
+            </div>
+            <div>
               <span className="text-slate-500 dark:text-slate-400">Publish Date</span>
               <p className="font-mono-num font-medium text-slate-900 dark:text-slate-100 mt-0.5">
                 {formatShortDate(tender.publishDate)}
@@ -255,6 +273,18 @@ export function TenderDetailDrawer({
               <span className="text-slate-500 dark:text-slate-400">Pre-Bid Meeting</span>
               <p className="font-mono-num font-medium text-slate-900 dark:text-slate-100 mt-0.5">
                 {formatShortDate(tender.preBidDate)}
+              </p>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Technical Opening</span>
+              <p className="font-mono-num font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {formatShortDate(tender.technicalOpeningDate)}
+              </p>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Financial Opening</span>
+              <p className="font-mono-num font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {formatShortDate(tender.financialOpeningDate || tender.completionDate)}
               </p>
             </div>
             <div>
@@ -274,6 +304,19 @@ export function TenderDetailDrawer({
               <p className="font-mono-num font-medium text-slate-900 dark:text-slate-100 mt-0.5">
                 {tender.emdStatus}
                 {tender.emdAmount > 0 ? ` (${formatINR(tender.emdAmount)})` : ''}
+              </p>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">L1 Bidder / Quoted</span>
+              <p className="font-mono-num font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {tender.l1BidderName || '—'}
+                {tender.l1QuotedValue && tender.l1QuotedValue > 0 ? ` (${formatINR(tender.l1QuotedValue)})` : ''}
+              </p>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Our Position / Rank</span>
+              <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                {tender.ourPositionRank || (tender.stage === 'L1 / Won' ? 'L1' : '—')}
               </p>
             </div>
           </section>

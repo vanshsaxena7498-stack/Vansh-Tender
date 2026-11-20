@@ -4,14 +4,21 @@ import type { EmdBgRecord, Tender, TenderStage } from '../types/crm';
 import {
   buildCsvContent,
   downloadTextFile,
+  formatDateTime,
   formatINR,
   formatShortDate,
   getDaysRemaining,
+  getLatestRemarkText,
 } from '../utils/formatters';
+import {
+  MIS_MONTHLY_TENDER_HEADERS,
+  serializeTenderForSheet,
+} from '../utils/googleSheetSync';
 
 interface TendersTabProps {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
+  defaultOwner?: string;
   onAddTender: () => void;
   onEditTender: (tender: Tender) => void;
   onOpenTender: (tender: Tender) => void;
@@ -59,6 +66,7 @@ function getStageBadgeClass(stage: TenderStage): string {
 export function TendersTab({
   tenders,
   emdRecords,
+  defaultOwner,
   onAddTender,
   onEditTender,
   onOpenTender,
@@ -75,8 +83,13 @@ export function TendersTab({
           const matches =
             t.tenderId.toLowerCase().includes(q) ||
             t.title.toLowerCase().includes(q) ||
+            (t.clientName || '').toLowerCase().includes(q) ||
             t.department.toLowerCase().includes(q) ||
+            (t.locationDepartment || '').toLowerCase().includes(q) ||
             t.location.toLowerCase().includes(q) ||
+            t.category.toLowerCase().includes(q) ||
+            (t.assignedOwner || '').toLowerCase().includes(q) ||
+            (t.l1BidderName || '').toLowerCase().includes(q) ||
             t.portal.toLowerCase().includes(q);
           if (!matches) return false;
         }
@@ -107,41 +120,44 @@ export function TendersTab({
   }, [tenders, searchQuery, quickFilter]);
 
   const handleExportCsv = () => {
-    const headers = [
-      'Tender ID',
-      'Portal',
-      'Department',
-      'Location',
-      'Category',
-      'Title',
-      'Publish Date',
-      'Submission Due Date',
-      'Estimated Value (INR)',
-      'Quoted Bid Value (INR)',
-      'EMD Status',
-      'EMD Amount (INR)',
-      'Stage',
-      'Result / L1 Info',
-    ];
-    const rows = filteredTenders.map((t) => [
-      t.tenderId,
-      t.portal,
-      t.department,
-      t.location,
-      t.category,
-      t.title,
-      t.publishDate,
-      t.submissionDueDate,
-      t.estimatedValue,
-      t.quotedValue,
-      t.emdStatus,
-      t.emdAmount,
-      t.stage,
-      t.resultInfo,
-    ]);
+    const headers = [...MIS_MONTHLY_TENDER_HEADERS];
+    const rows = filteredTenders.map((t, index) => {
+      const serialized = serializeTenderForSheet(t, {
+        serialNo: index + 1,
+        assignedOwner: defaultOwner,
+      });
+      const scopeWithCategory =
+        serialized.category &&
+        !serialized.title.toLowerCase().includes(serialized.category.toLowerCase())
+          ? `${serialized.title} [${serialized.category}]`
+          : serialized.title;
+      return [
+        serialized.serialNo ?? index + 1,
+        serialized.tenderId,
+        serialized.clientName,
+        serialized.locationDepartment,
+        serialized.location,
+        scopeWithCategory,
+        serialized.portal,
+        serialized.publishDate,
+        serialized.submissionDueDate,
+        serialized.preBidDate,
+        serialized.estimatedValue,
+        serialized.emdAmount,
+        serialized.emdMode,
+        serialized.stage,
+        serialized.technicalOpeningDate,
+        serialized.financialOpeningDate,
+        serialized.l1BidderName,
+        serialized.l1QuotedValue,
+        serialized.ourPositionRank,
+        serialized.assignedOwner,
+        serialized.remarksNextAction,
+      ];
+    });
     const csv = buildCsvContent(headers, rows);
     downloadTextFile(
-      `BidLedger_Tenders_${new Date().toISOString().slice(0, 10)}.csv`,
+      `BidLedger_MIS_Tenders_${new Date().toISOString().slice(0, 10)}.csv`,
       csv,
       'text/csv;charset=utf-8;',
     );
@@ -260,27 +276,35 @@ export function TendersTab({
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
+            <table className="min-w-[2300px] w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 text-slate-600 dark:text-slate-400">
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Tender ID</th>
-                  <th className="py-2.5 px-3 font-semibold">Department & Work</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Due Date</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">
-                    Est. Value
-                  </th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">
-                    Quoted Bid
-                  </th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">
-                    EMD / Sec.
-                  </th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Stage</th>
+                  <th className="py-2.5 px-3 font-semibold text-center whitespace-nowrap">S.No.</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Tender Ref / ID</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Client / Organization Name</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Location / Department</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Location</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Brief Description &amp; Scope of Work</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Portal / Platform</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Publish / Tender Date</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Due Date &amp; Time</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Pre-Bid Meeting Date</th>
+                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">Estimated Tender Value (INR)</th>
+                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">EMD Amount (INR)</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">EMD Mode / Form</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Current Status</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Technical Opening Date</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Financial Opening Date</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">L1 Bidder Name</th>
+                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">L1 Quoted Value (INR)</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Our Position / Rank</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Assigned Person / Owner</th>
+                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Remarks / Next Action</th>
                   <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {filteredTenders.map((t) => {
+                {filteredTenders.map((t, index) => {
                   const days = getDaysRemaining(t.submissionDueDate);
                   const isOpenStage =
                     t.stage === 'Identified / Reviewing' || t.stage === 'Doc Preparation';
@@ -292,6 +316,29 @@ export function TendersTab({
                         : 'text-slate-600 dark:text-slate-400';
                   const isSynced = syncedSet.has(t.tenderId.toLowerCase());
                   const isNotFilled = t.stage === 'Tender Not Filled';
+                  const clientName = t.clientName || t.department;
+                  const locationDept =
+                    t.locationDepartment ||
+                    [t.location, t.department].filter(Boolean).join(' / ');
+                  const latestRemark = getLatestRemarkText(t.remarks);
+                  const remarksSummary = [latestRemark, (t.resultInfo || '').trim()]
+                    .filter(Boolean)
+                    .join(' | ');
+                  const l1Quoted =
+                    typeof t.l1QuotedValue === 'number' && t.l1QuotedValue > 0
+                      ? t.l1QuotedValue
+                      : t.quotedValue;
+                  const rankDisplay =
+                    t.ourPositionRank ||
+                    (t.stage === 'L1 / Won'
+                      ? 'L1'
+                      : t.stage === 'Lost (L2/L3)'
+                        ? 'L2 / L3'
+                        : '—');
+                  const techOpen =
+                    t.technicalOpeningDate ||
+                    (t.stage === 'Technical Eval' ? t.completionDate : '');
+                  const finOpen = t.financialOpeningDate || t.completionDate;
 
                   return (
                     <tr
@@ -303,7 +350,13 @@ export function TendersTab({
                           : 'hover:bg-slate-50 dark:hover:bg-slate-800/40'
                       }`}
                     >
-                      <td className="py-2.5 px-3 align-top max-w-[165px]">
+                      {/* 1. S.No. */}
+                      <td className="py-2.5 px-3 align-top text-center font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                        {index + 1}
+                      </td>
+
+                      {/* 2. Tender Ref / ID */}
+                      <td className="py-2.5 px-3 align-top max-w-[180px]">
                         <button
                           type="button"
                           onClick={() => onOpenTender(t)}
@@ -316,29 +369,60 @@ export function TendersTab({
                         >
                           {t.tenderId}
                         </button>
-                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">
-                          {t.portal}
-                          {(t.attachments?.length ?? 0) > 0
-                            ? ` · ${t.attachments?.length} ${t.attachments?.length === 1 ? 'doc' : 'docs'}`
-                            : ''}
-                        </div>
+                        {(t.attachments?.length ?? 0) > 0 && (
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">
+                            {t.attachments?.length} {t.attachments?.length === 1 ? 'doc' : 'docs'}
+                          </div>
+                        )}
                       </td>
 
-                      <td className="py-2.5 px-3 align-top max-w-[210px]">
-                        <p className="font-medium text-slate-900 dark:text-slate-100 truncate">
-                          {t.department}
+                      {/* 3. Client / Organization Name */}
+                      <td className="py-2.5 px-3 align-top max-w-[200px]">
+                        <p className="font-medium text-slate-900 dark:text-slate-100 truncate" title={clientName}>
+                          {clientName}
                         </p>
-                        <p className="text-slate-600 dark:text-slate-400 truncate mt-0.5">
+                      </td>
+
+                      {/* 4. Location / Department */}
+                      <td className="py-2.5 px-3 align-top max-w-[200px]">
+                        <p className="text-slate-700 dark:text-slate-300 truncate" title={locationDept}>
+                          {locationDept || '—'}
+                        </p>
+                      </td>
+
+                      {/* 5. Location */}
+                      <td className="py-2.5 px-3 align-top max-w-[150px]">
+                        <p className="text-slate-600 dark:text-slate-400 truncate" title={t.location}>
+                          {t.location || '—'}
+                        </p>
+                      </td>
+
+                      {/* 6. Brief Description & Scope of Work + Item Category Badge */}
+                      <td className="py-2.5 px-3 align-top max-w-[260px]">
+                        <p className="font-medium text-slate-900 dark:text-slate-100 line-clamp-2" title={t.title}>
                           {t.title}
                         </p>
-                        <p className="text-[11px] text-slate-500 dark:text-slate-500 mt-0.5 truncate">
-                          {t.location}
-                        </p>
+                        {t.category && (
+                          <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] font-medium text-slate-600 dark:text-slate-300">
+                            {t.category}
+                          </span>
+                        )}
                       </td>
 
+                      {/* 7. Portal / Platform */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap text-slate-700 dark:text-slate-300">
+                        {t.portal}
+                      </td>
+
+                      {/* 8. Publish / Tender Date */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
+                        {formatShortDate(t.publishDate)}
+                      </td>
+
+                      {/* 9. Due Date & Time */}
                       <td className="py-2.5 px-3 align-top whitespace-nowrap">
                         <div className={`font-mono-num ${dueColor}`}>
-                          {formatShortDate(t.submissionDueDate)}
+                          {formatDateTime(t.submissionDueDate)}
                         </div>
                         {isOpenStage && (
                           <div className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
@@ -347,24 +431,32 @@ export function TendersTab({
                         )}
                       </td>
 
+                      {/* 10. Pre-Bid Meeting Date */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
+                        {formatShortDate(t.preBidDate)}
+                      </td>
+
+                      {/* 11. Estimated Tender Value (INR) */}
                       <td className="py-2.5 px-3 align-top text-right font-mono-num text-slate-700 dark:text-slate-300 whitespace-nowrap">
                         {formatINR(t.estimatedValue)}
                       </td>
 
-                      <td className="py-2.5 px-3 align-top text-right font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                        {t.quotedValue > 0 ? formatINR(t.quotedValue) : '—'}
+                      {/* 12. EMD Amount (INR) */}
+                      <td className="py-2.5 px-3 align-top text-right font-mono-num font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                        {t.emdAmount > 0 ? formatINR(t.emdAmount) : 'Exempt / ₹ 0'}
                       </td>
 
-                      <td className="py-2.5 px-3 align-top text-right whitespace-nowrap">
-                        <div className="font-mono-num font-medium text-slate-900 dark:text-slate-100">
-                          {t.emdAmount > 0 ? formatINR(t.emdAmount) : 'Exempt / Nil'}
-                        </div>
-                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                          {t.emdStatus === 'Exempted - MSME/Startup' ? 'MSME Exempt' : t.emdStatus}
-                          {isSynced ? ' · Synced' : ''}
-                        </div>
+                      {/* 13. EMD Mode / Form */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap text-slate-700 dark:text-slate-300">
+                        <span>{t.emdStatus === 'Exempted - MSME/Startup' ? 'MSME Exempt' : t.emdStatus}</span>
+                        {isSynced && (
+                          <span className="ml-1 text-[11px] text-emerald-700 dark:text-emerald-400">
+                            · Synced
+                          </span>
+                        )}
                       </td>
 
+                      {/* 14. Current Status */}
                       <td className="py-2.5 px-3 align-top whitespace-nowrap">
                         <span
                           className={`inline-block px-2 py-1 rounded text-[11px] font-semibold ${getStageBadgeClass(
@@ -375,6 +467,44 @@ export function TendersTab({
                         </span>
                       </td>
 
+                      {/* 15. Technical Opening Date */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
+                        {formatShortDate(techOpen)}
+                      </td>
+
+                      {/* 16. Financial Opening Date */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
+                        {formatShortDate(finOpen)}
+                      </td>
+
+                      {/* 17. L1 Bidder Name */}
+                      <td className="py-2.5 px-3 align-top max-w-[160px] text-slate-700 dark:text-slate-300 truncate" title={t.l1BidderName || ''}>
+                        {t.l1BidderName || '—'}
+                      </td>
+
+                      {/* 18. L1 Quoted Value (INR) */}
+                      <td className="py-2.5 px-3 align-top text-right font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                        {l1Quoted > 0 ? formatINR(l1Quoted) : '—'}
+                      </td>
+
+                      {/* 19. Our Position / Rank */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-medium text-slate-700 dark:text-slate-300">
+                        {rankDisplay}
+                      </td>
+
+                      {/* 20. Assigned Person / Owner */}
+                      <td className="py-2.5 px-3 align-top whitespace-nowrap text-slate-700 dark:text-slate-300">
+                        {t.assignedOwner || defaultOwner || '—'}
+                      </td>
+
+                      {/* 21. Remarks / Next Action */}
+                      <td className="py-2.5 px-3 align-top max-w-[240px]">
+                        <p className="text-slate-600 dark:text-slate-400 line-clamp-2" title={remarksSummary}>
+                          {remarksSummary || '—'}
+                        </p>
+                      </td>
+
+                      {/* Actions */}
                       <td className="py-2.5 px-3 align-top text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1">
                           <button

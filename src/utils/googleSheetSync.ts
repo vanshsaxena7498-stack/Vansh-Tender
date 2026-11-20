@@ -17,15 +17,95 @@ export const DEFAULT_GOOGLE_SHEET_SETTINGS: GoogleSheetSettings = {
 
 export const MIS_MONTHLY_TENDER_HEADERS = [
   'S.No.',
-  'Tender ID / Bid No.',
-  'Portal / Source',
-  'Department / Organization',
-  'District / State',
-  'Item Category',
-  'Work / Supply Title',
-  'Publish Date',
-  'Submission Due Date',
+  'Tender Ref / ID',
+  'Client / Organization Name',
+  'Location / Department',
+  'Location',
+  'Brief Description & Scope of Work',
+  'Portal / Platform',
+  'Publish / Tender Date',
+  'Due Date & Time',
+  'Pre-Bid Meeting Date',
+  'Estimated Tender Value (INR)',
+  'EMD Amount (INR)',
+  'EMD Mode / Form',
+  'Current Status',
+  'Technical Opening Date',
+  'Financial Opening Date',
+  'L1 Bidder Name',
+  'L1 Quoted Value (INR)',
+  'Our Position / Rank',
+  'Assigned Person / Owner',
+  'Remarks / Next Action',
 ] as const;
+
+export type MisCanonicalField =
+  | 'serialNo'
+  | 'tenderId'
+  | 'clientName'
+  | 'locationDepartment'
+  | 'location'
+  | 'title'
+  | 'category'
+  | 'portal'
+  | 'publishDate'
+  | 'submissionDueDate'
+  | 'preBidDate'
+  | 'estimatedValue'
+  | 'emdAmount'
+  | 'emdStatus'
+  | 'stage'
+  | 'technicalOpeningDate'
+  | 'financialOpeningDate'
+  | 'l1BidderName'
+  | 'l1QuotedValue'
+  | 'ourPositionRank'
+  | 'assignedOwner'
+  | 'remarksNextAction';
+
+export const LEGACY_MIS_HEADER_ALIASES: Record<string, MisCanonicalField> = {
+  's.no.': 'serialNo',
+  's.no': 'serialNo',
+  'sno': 'serialNo',
+  'tender ref / id': 'tenderId',
+  'tender id / bid no.': 'tenderId',
+  'tender id / bid no': 'tenderId',
+  'tender id': 'tenderId',
+  'bid no.': 'tenderId',
+  'bid no': 'tenderId',
+  'client / organization name': 'clientName',
+  'department / organization': 'clientName',
+  'department': 'clientName',
+  'location / department': 'locationDepartment',
+  'location': 'location',
+  'district / state': 'location',
+  'city / state': 'location',
+  'brief description & scope of work': 'title',
+  'work / supply title': 'title',
+  'work / title': 'title',
+  'item category': 'category',
+  'category': 'category',
+  'portal / platform': 'portal',
+  'portal / source': 'portal',
+  'portal': 'portal',
+  'publish / tender date': 'publishDate',
+  'publish date': 'publishDate',
+  'due date & time': 'submissionDueDate',
+  'submission due date': 'submissionDueDate',
+  'pre-bid meeting date': 'preBidDate',
+  'estimated tender value (inr)': 'estimatedValue',
+  'emd amount (inr)': 'emdAmount',
+  'emd mode / form': 'emdStatus',
+  'current status': 'stage',
+  'stage': 'stage',
+  'technical opening date': 'technicalOpeningDate',
+  'financial opening date': 'financialOpeningDate',
+  'l1 bidder name': 'l1BidderName',
+  'l1 quoted value (inr)': 'l1QuotedValue',
+  'our position / rank': 'ourPositionRank',
+  'assigned person / owner': 'assignedOwner',
+  'remarks / next action': 'remarksNextAction',
+};
 
 export const MIS_MONTH_GAP_ROWS = 3;
 
@@ -142,6 +222,91 @@ export interface GoogleSheetSyncPayload {
   monthlyBlocks: SheetMonthlyMisBlock[];
   tenders: SheetTenderRowPayload[];
   emdRecords: SheetEmdRowPayload[];
+}
+
+const MONTH_BANNER_REGEX =
+  /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$/i;
+
+/**
+ * Normalizes sheet text cleanly as UTF-8, preserving technical symbols like ≤, ≥, –
+ * and repairing double-encoded mojibake or unit comparison artifacts (e.g., "(?10 KVA)" -> "(≤10 KVA)")
+ * without modifying genuine English questions ending in "?".
+ */
+export function sanitizeSheetText(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  let text = String(value).normalize('NFC');
+  text = text
+    .replace(/\u00e2\u2030\u00a4|â‰¤/g, '≤')
+    .replace(/\u00e2\u2030\u00a5|â‰¥/g, '≥')
+    .replace(/\u00e2\u20ac\u201c|â€“/g, '–')
+    .replace(/\u00e2\u20ac\u201d|â€”/g, '—')
+    .replace(/\u00e2\u201a\u00b9|â‚¹/g, '₹')
+    .replace(/\uFFFD(?=\s*\d)/g, '≤')
+    .replace(/\uFFFD/g, '')
+    .replace(/([(\[])\s*\?\s*(?=\d)/g, '$1≤')
+    .replace(
+      /(^|[\s(\[/,:;-])\?\s*(?=\d+(?:\.\d+)?\s*(?:kva|kw|w|mw|v|kv|a|ma|ah|mah|kg|g|mg|gm|mm|cm|m|km|gb|tb|mb|kb|mbps|gbps|hz|khz|mhz|ghz|%|nos?|units?|pcs|l|ltr|ml|hp|tr|ton|btu|db|k|lakh|cr)\b)/gi,
+      '$1≤',
+    )
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+  return text.trim();
+}
+
+export function isMonthBannerRow(row: unknown[]): boolean {
+  if (!Array.isArray(row) || row.length === 0) return false;
+  const firstCell = sanitizeSheetText(row[0]);
+  if (!MONTH_BANNER_REGEX.test(firstCell)) return false;
+  for (let i = 1; i < row.length; i += 1) {
+    if (sanitizeSheetText(row[i]) !== '') return false;
+  }
+  return true;
+}
+
+export function normalizeHeaderLookupKey(header: unknown): string {
+  return sanitizeSheetText(header).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+export function detectMisHeaderRowIndex(rows: unknown[][]): number {
+  if (!Array.isArray(rows)) return -1;
+  for (let r = 0; r < rows.length; r += 1) {
+    const row = rows[r];
+    if (!Array.isArray(row) || isMonthBannerRow(row)) continue;
+    let matchedCount = 0;
+    let hasTenderIdOrSno = false;
+    for (const cell of row) {
+      const key = normalizeHeaderLookupKey(cell);
+      const canonical = LEGACY_MIS_HEADER_ALIASES[key];
+      if (canonical) {
+        matchedCount += 1;
+        if (canonical === 'tenderId' || canonical === 'serialNo') {
+          hasTenderIdOrSno = true;
+        }
+      }
+    }
+    if (matchedCount >= 3 || (hasTenderIdOrSno && matchedCount >= 2)) {
+      return r;
+    }
+  }
+  return -1;
+}
+
+export function mapMisRowToTenderFields(
+  headers: string[],
+  row: unknown[],
+): Partial<Record<MisCanonicalField, string>> {
+  const mapped: Partial<Record<MisCanonicalField, string>> = {};
+  for (let i = 0; i < headers.length; i += 1) {
+    const canonical = LEGACY_MIS_HEADER_ALIASES[normalizeHeaderLookupKey(headers[i])];
+    if (!canonical) continue;
+    const val = sanitizeSheetText(row[i]);
+    if (val !== '' || mapped[canonical] === undefined) {
+      mapped[canonical] = val;
+    }
+  }
+  if (!mapped.locationDepartment && mapped.clientName) {
+    mapped.locationDepartment = mapped.clientName;
+  }
+  return mapped;
 }
 
 function pad2(n: number): string {
@@ -365,42 +530,67 @@ export function serializeTenderForSheet(
   const isWon = t.stage === 'L1 / Won';
   const isLost = t.stage === 'Lost (L2/L3)';
   const firmLabel = (opts?.firmName || '').trim() || 'Self';
-  const ownerLabel = (opts?.assignedOwner || '').trim() || 'Tender Owner';
-  const locationDepartment = [t.location?.trim(), t.department?.trim()].filter(Boolean).join(' / ');
+  const ownerLabel =
+    sanitizeSheetText(t.assignedOwner) ||
+    sanitizeSheetText(opts?.assignedOwner) ||
+    'Tender Owner';
+  const clientName = sanitizeSheetText(t.clientName || t.department);
+  const locationDepartment = sanitizeSheetText(
+    t.locationDepartment ||
+      [t.location?.trim(), t.department?.trim()].filter(Boolean).join(' / ') ||
+      t.department,
+  );
+  const technicalOpening = t.technicalOpeningDate
+    ? formatIndianDateForSheet(t.technicalOpeningDate)
+    : t.stage === 'Technical Eval' && t.completionDate
+      ? formatIndianDateForSheet(t.completionDate)
+      : '';
+  const financialOpening = t.financialOpeningDate
+    ? formatIndianDateForSheet(t.financialOpeningDate)
+    : t.completionDate
+      ? formatIndianDateForSheet(t.completionDate)
+      : '';
+  const l1BidderName = sanitizeSheetText(t.l1BidderName || (isWon ? firmLabel : ''));
+  const l1QuotedVal =
+    typeof t.l1QuotedValue === 'number' && Number.isFinite(t.l1QuotedValue)
+      ? t.l1QuotedValue
+      : Number.isFinite(t.quotedValue)
+        ? t.quotedValue
+        : 0;
+  const ourRank = sanitizeSheetText(
+    t.ourPositionRank || (isWon ? 'L1' : isLost ? 'L2 / L3' : ''),
+  );
   const rawInteractionTimestamp = getTenderInteractionTimestamp(t);
 
   return {
     ...(typeof opts?.serialNo === 'number' ? { serialNo: opts.serialNo } : {}),
     id: t.id,
-    tenderId: t.tenderId,
-    portal: t.portal,
-    department: t.department,
-    clientName: t.department,
+    tenderId: sanitizeSheetText(t.tenderId),
+    portal: sanitizeSheetText(t.portal),
+    department: sanitizeSheetText(t.department),
+    clientName,
     locationDepartment,
-    location: t.location || '',
-    category: t.category || '',
-    title: t.title,
+    location: sanitizeSheetText(t.location || ''),
+    category: sanitizeSheetText(t.category || ''),
+    title: sanitizeSheetText(t.title),
     publishDate: formatIndianDateForSheet(t.publishDate),
     submissionDueDate: formatIndianDateTimeForSheet(t.submissionDueDate),
     preBidDate: formatIndianDateTimeForSheet(t.preBidDate),
     completionDate: formatIndianDateForSheet(t.completionDate),
-    stage: t.stage,
+    stage: sanitizeSheetText(t.stage),
     estimatedValue: Number.isFinite(t.estimatedValue) ? t.estimatedValue : 0,
     quotedValue: Number.isFinite(t.quotedValue) ? t.quotedValue : 0,
-    emdStatus: t.emdStatus,
-    emdMode: t.emdStatus,
+    emdStatus: sanitizeSheetText(t.emdStatus),
+    emdMode: sanitizeSheetText(t.emdStatus),
     emdAmount: Number.isFinite(t.emdAmount) ? t.emdAmount : 0,
-    technicalOpeningDate:
-      t.stage === 'Technical Eval' && t.completionDate
-        ? formatIndianDateForSheet(t.completionDate)
-        : '',
-    financialOpeningDate: t.completionDate ? formatIndianDateForSheet(t.completionDate) : '',
-    l1BidderName: isWon ? firmLabel : '',
-    l1QuotedValue: Number.isFinite(t.quotedValue) ? t.quotedValue : 0,
-    ourPositionRank: isWon ? 'L1' : isLost ? 'L2 / L3' : '',
+    technicalOpeningDate: technicalOpening,
+    financialOpeningDate: financialOpening,
+    l1BidderName,
+    l1QuotedValue: l1QuotedVal,
+    ourPositionRank: ourRank,
     assignedOwner: ownerLabel,
-    remarksNextAction: combinedRemarks,
-    resultInfo: t.resultInfo || '',
+    remarksNextAction: sanitizeSheetText(combinedRemarks),
+    resultInfo: sanitizeSheetText(t.resultInfo || ''),
     lastUpdatedAt: rawInteractionTimestamp,
     updatedAt: formatIndianDateTimeForSheet(rawInteractionTimestamp),
   };
@@ -636,11 +826,13 @@ export const GOOGLE_APPS_SCRIPT_CODE_GS = `/**
  *
  * Features:
  * - Zero frozen rows (frozenRowCount = 0 / setFrozenRows(0)). No stuck top header row.
+ * - Always renders all 21 MIS headings across Columns A to U (even on initial PING / empty state).
+ * - Cleans UTF-8 text safely so technical symbols like <= (>=, <=, –) render cleanly without mojibake.
  * - Groups all CRM tenders chronologically by Month & Year of their lastUpdatedAt / updatedAt timestamp
  *   (falling back to Publish Date only when no update timestamp is present).
  * - Renders clean Monthly MIS Blocks:
- *   1) Merged Banner Row (Column A to Column I, #000000 background, centered bold white Month & Year)
- *   2) Dark Navy/Black Header Row directly below Banner
+ *   1) Merged Banner Row (Column A to Column U, #000000 background, centered bold white Month & Year)
+ *   2) Dark Navy/Black Header Row directly below Banner (21 MIS Columns)
  *   3) Data Rows with S.No. freshly starting at 1, 2, 3... inside each month
  *   4) Leaves 3 blank rows between different monthly blocks
  */
@@ -652,15 +844,47 @@ var BLANK_GAP_ROWS_BETWEEN_MONTHS = 3;
 
 var MIS_MONTHLY_HEADERS = [
   'S.No.',
-  'Tender ID / Bid No.',
-  'Portal / Source',
-  'Department / Organization',
-  'District / State',
-  'Item Category',
-  'Work / Supply Title',
-  'Publish Date',
-  'Submission Due Date'
+  'Tender Ref / ID',
+  'Client / Organization Name',
+  'Location / Department',
+  'Location',
+  'Brief Description & Scope of Work',
+  'Portal / Platform',
+  'Publish / Tender Date',
+  'Due Date & Time',
+  'Pre-Bid Meeting Date',
+  'Estimated Tender Value (INR)',
+  'EMD Amount (INR)',
+  'EMD Mode / Form',
+  'Current Status',
+  'Technical Opening Date',
+  'Financial Opening Date',
+  'L1 Bidder Name',
+  'L1 Quoted Value (INR)',
+  'Our Position / Rank',
+  'Assigned Person / Owner',
+  'Remarks / Next Action'
 ];
+
+var LEGACY_HEADER_ALIASES = {
+  's.no.': 'serialNo',
+  'tender ref / id': 'tenderId',
+  'tender id / bid no.': 'tenderId',
+  'client / organization name': 'clientName',
+  'department / organization': 'clientName',
+  'location / department': 'locationDepartment',
+  'location': 'location',
+  'district / state': 'location',
+  'brief description & scope of work': 'title',
+  'work / supply title': 'title',
+  'item category': 'category',
+  'portal / platform': 'portal',
+  'portal / source': 'portal',
+  'publish / tender date': 'publishDate',
+  'publish date': 'publishDate',
+  'due date & time': 'submissionDueDate',
+  'submission due date': 'submissionDueDate'
+};
 
 var EMD_HEADERS = [
   'Record ID',
@@ -694,6 +918,46 @@ var FULL_MONTH_NAMES = [
   'December'
 ];
 
+function sanitizeText_(val) {
+  if (val === undefined || val === null) return '';
+  var s = String(val);
+  if (typeof s.normalize === 'function') {
+    s = s.normalize('NFC');
+  }
+  s = s
+    .replace(/\\u00e2\\u2030\\u00a4|â‰¤/g, '≤')
+    .replace(/\\u00e2\\u2030\\u00a5|â‰¥/g, '≥')
+    .replace(/\\u00e2\\u20ac\\u201c|â€“/g, '–')
+    .replace(/\\u00e2\\u20ac\\u201d|â€”/g, '—')
+    .replace(/\\u00e2\\u201a\\u00b9|â‚¹/g, '₹')
+    .replace(/\\uFFFD(?=\\s*\\d)/g, '≤')
+    .replace(/\\uFFFD/g, '')
+    .replace(/([(\\[])\\s*\\?\\s*(?=\\d)/g, '$1≤')
+    .replace(/(^|[\\s(\\[\\/,;:-])\\?\\s*(?=\\d+(?:\\.\\d+)?\\s*(?:kva|kw|w|mw|v|kv|a|ma|ah|mah|kg|g|mg|gm|mm|cm|m|km|gb|tb|mb|kb|mbps|gbps|hz|khz|mhz|ghz|%|nos?|units?|pcs|l|ltr|ml|hp|tr|ton|btu|db|k|lakh|cr)\\b)/gi, '$1≤')
+    .replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]/g, '');
+  return s.trim();
+}
+
+function isMonthBannerCell_(val) {
+  var s = sanitizeText_(val);
+  return /^(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}$/i.test(s);
+}
+
+function detectHeaderRowIndex_(rows) {
+  if (!rows || !rows.length) return -1;
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r];
+    if (!row || !row.length || isMonthBannerCell_(row[0])) continue;
+    var matches = 0;
+    for (var c = 0; c < row.length; c++) {
+      var key = sanitizeText_(row[c]).toLowerCase().replace(/\\s+/g, ' ');
+      if (LEGACY_HEADER_ALIASES[key]) matches += 1;
+    }
+    if (matches >= 3) return r;
+  }
+  return -1;
+}
+
 function doPost(e) {
   var lock = LockService.getScriptLock();
   lock.waitLock(15000);
@@ -716,9 +980,8 @@ function doPost(e) {
     var rowsAffected = 0;
 
     if (action === 'PING') {
-      if ((payload.monthlyBlocks && payload.monthlyBlocks.length > 0) || (payload.tenders && payload.tenders.length > 0)) {
-        rewriteMonthlyMisSheet_(tenderSheet, payload);
-      }
+      rewriteMonthlyMisSheet_(tenderSheet, payload);
+      ensureEmdHeaders_(emdSheet);
       refreshMonthlySummary_(summarySheet, payload);
       return jsonResponse_({
         ok: true,
@@ -740,6 +1003,8 @@ function doPost(e) {
       if (payload.emdRecord) {
         upsertEmdRow_(emdSheet, payload.emdRecord);
         rowsAffected += 1;
+      } else {
+        ensureEmdHeaders_(emdSheet);
       }
     } else if (entityType === 'EMD_BG') {
       if (payload.emdRecord) {
@@ -922,8 +1187,45 @@ function buildMonthlyBlocksFromPayload_(payload) {
   });
 }
 
+function formatScopeOfWorkCell_(t) {
+  var title = sanitizeText_(t.title || '');
+  var cat = sanitizeText_(t.category || '');
+  if (cat && title && title.toLowerCase().indexOf(cat.toLowerCase()) === -1) {
+    return title + ' [' + cat + ']';
+  }
+  return title || cat;
+}
+
+function writeBannerAndHeaderRow_(sheet, currentRow, bannerLabel, totalCols) {
+  var bannerRange = sheet.getRange(currentRow, 1, 1, totalCols);
+  bannerRange.merge();
+  bannerRange
+    .setValue(bannerLabel)
+    .setBackground('#000000')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setFontSize(12)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(currentRow, 30);
+
+  var headerRow = currentRow + 1;
+  var headerRange = sheet.getRange(headerRow, 1, 1, totalCols);
+  headerRange
+    .setValues([MIS_MONTHLY_HEADERS])
+    .setBackground('#0F172A')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle');
+  headerRange.setBorder(true, true, true, true, true, true, '#334155', SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(headerRow, 1, 1, 1).setHorizontalAlignment('center');
+  sheet.setRowHeight(headerRow, 28);
+  return headerRow + 1;
+}
+
 function rewriteMonthlyMisSheet_(sheet, payload) {
-  var totalCols = MIS_MONTHLY_HEADERS.length; // 9 columns (Column A to Column I)
+  var totalCols = MIS_MONTHLY_HEADERS.length; // 21 columns (Column A to Column U)
   var existingLastRow = sheet.getLastRow();
   var existingLastCol = Math.max(sheet.getLastColumn(), totalCols);
 
@@ -936,59 +1238,60 @@ function rewriteMonthlyMisSheet_(sheet, payload) {
 
   var blocks = buildMonthlyBlocksFromPayload_(payload);
   if (!blocks || blocks.length === 0) {
+    var currentMonthKey = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM');
+    writeBannerAndHeaderRow_(sheet, 1, formatFullMonthLabel_(currentMonthKey), totalCols);
+    sheet.autoResizeColumns(1, totalCols);
     return 0;
   }
 
   var currentRow = 1;
   var totalWritten = 0;
+  var defaultOwner = sanitizeText_(payload && payload.assignedOwner ? payload.assignedOwner : 'Tender Owner');
+  var defaultFirm = sanitizeText_(payload && payload.firmName ? payload.firmName : 'Self');
 
   for (var b = 0; b < blocks.length; b++) {
     var block = blocks[b];
     var items = block.rows || [];
     if (items.length === 0) continue;
 
-    // 1. Month Banner Row: Merged Column A to Column I, solid black (#000000), centered bold white text
-    var bannerRange = sheet.getRange(currentRow, 1, 1, totalCols);
-    bannerRange.merge();
-    bannerRange
-      .setValue(block.monthLabel || formatFullMonthLabel_(block.monthKey))
-      .setBackground('#000000')
-      .setFontColor('#FFFFFF')
-      .setFontWeight('bold')
-      .setFontSize(12)
-      .setHorizontalAlignment('center')
-      .setVerticalAlignment('middle');
-    sheet.setRowHeight(currentRow, 30);
-    currentRow += 1;
+    var bannerLabel = sanitizeText_(block.monthLabel || formatFullMonthLabel_(block.monthKey));
+    currentRow = writeBannerAndHeaderRow_(sheet, currentRow, bannerLabel, totalCols);
 
-    // 2. Column Header Row directly below banner: Dark navy/black with bold white text
-    var headerRange = sheet.getRange(currentRow, 1, 1, totalCols);
-    headerRange
-      .setValues([MIS_MONTHLY_HEADERS])
-      .setBackground('#0F172A')
-      .setFontColor('#FFFFFF')
-      .setFontWeight('bold')
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle');
-    headerRange.setBorder(true, true, true, true, true, true, '#334155', SpreadsheetApp.BorderStyle.SOLID);
-    sheet.getRange(currentRow, 1, 1, 1).setHorizontalAlignment('center');
-    sheet.setRowHeight(currentRow, 26);
-    currentRow += 1;
-
-    // 3. Data Rows: Fresh S.No. (1, 2, 3...) per month
+    // 3. Data Rows: Fresh S.No. (1, 2, 3...) per month across all 21 MIS columns
     var dataRows = [];
     for (var r = 0; r < items.length; r++) {
       var t = items[r];
+      var stageStr = sanitizeText_(t.stage || '');
+      var isWon = stageStr === 'L1 / Won';
+      var isLost = stageStr === 'Lost (L2/L3)';
+      var l1Bidder = sanitizeText_(t.l1BidderName || (isWon ? defaultFirm : ''));
+      var rankVal = sanitizeText_(t.ourPositionRank || (isWon ? 'L1' : (isLost ? 'L2 / L3' : '')));
+      var l1Quoted = (t.l1QuotedValue !== undefined && t.l1QuotedValue !== null && t.l1QuotedValue !== '')
+        ? Number(t.l1QuotedValue || 0)
+        : Number(t.quotedValue || 0);
+
       dataRows.push([
         r + 1,
-        t.tenderId || '',
-        t.portal || '',
-        t.department || t.clientName || '',
-        t.location || '',
-        t.category || '',
-        t.title || '',
+        sanitizeText_(t.tenderId),
+        sanitizeText_(t.clientName || t.department),
+        sanitizeText_(t.locationDepartment || t.department),
+        sanitizeText_(t.location),
+        formatScopeOfWorkCell_(t),
+        sanitizeText_(t.portal),
         formatIstDate_(t.publishDate),
-        formatIstDateTime_(t.submissionDueDate)
+        formatIstDateTime_(t.submissionDueDate),
+        formatIstDateTime_(t.preBidDate),
+        Number(t.estimatedValue || 0),
+        Number(t.emdAmount || 0),
+        sanitizeText_(t.emdMode || t.emdStatus),
+        stageStr,
+        formatIstDate_(t.technicalOpeningDate),
+        formatIstDate_(t.financialOpeningDate || t.completionDate),
+        l1Bidder,
+        l1Quoted,
+        rankVal,
+        sanitizeText_(t.assignedOwner || defaultOwner),
+        sanitizeText_(t.remarksNextAction || t.resultInfo)
       ]);
     }
 
@@ -1036,20 +1339,20 @@ function ensureEmdHeaders_(sheet) {
 
 function emdToRow_(r) {
   return [
-    r.id || '',
-    r.tenderId || '',
-    r.department || '',
-    r.instrumentType || '',
-    r.referenceNo || '',
-    r.bankName || '',
+    sanitizeText_(r.id),
+    sanitizeText_(r.tenderId),
+    sanitizeText_(r.department),
+    sanitizeText_(r.instrumentType),
+    sanitizeText_(r.referenceNo),
+    sanitizeText_(r.bankName),
     Number(r.amount || 0),
     formatIstDate_(r.issueDate),
     formatIstDate_(r.expiryDate),
     formatIstDate_(r.claimEndDate),
-    r.status || '',
+    sanitizeText_(r.status),
     formatIstDate_(r.refundDate),
-    r.refundRef || '',
-    r.remarks || ''
+    sanitizeText_(r.refundRef),
+    sanitizeText_(r.remarks)
   ];
 }
 
@@ -1113,7 +1416,7 @@ function refreshMonthlySummary_(sheet, payload) {
   sheet.setFrozenRows(0);
 
   var kpiRows = [
-    ['MIS Monthly Report - Executive Summary', payload.firmName || 'Corporate Tender Desk'],
+    ['MIS Monthly Report - Executive Summary', sanitizeText_(payload.firmName || 'Corporate Tender Desk')],
     ['', ''],
     ['Pipeline Metric', 'Value'],
     ['Total Tracked Tenders', Number(s.totalTenders || 0)],
@@ -1158,7 +1461,7 @@ function refreshMonthlySummary_(sheet, payload) {
   if (months.length > 0) {
     var mRows = months.map(function (m) {
       return [
-        m.monthLabel || m.monthKey || '',
+        sanitizeText_(m.monthLabel || m.monthKey || ''),
         Number(m.total || 0),
         Number(m.inPreparation || 0),
         Number(m.submitted || 0),

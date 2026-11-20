@@ -65,7 +65,13 @@ export function TenderFormModal({
 
   const [tenderId, setTenderId] = useState(initialTender?.tenderId ?? '');
   const [portal, setPortal] = useState<PortalType>(initialTender?.portal ?? 'GeM');
+  const [clientName, setClientName] = useState(
+    initialTender?.clientName ?? initialTender?.department ?? '',
+  );
   const [department, setDepartment] = useState(initialTender?.department ?? '');
+  const [locationDepartment, setLocationDepartment] = useState(
+    initialTender?.locationDepartment ?? '',
+  );
   const [location, setLocation] = useState(initialTender?.location ?? '');
   const [category, setCategory] = useState(initialTender?.category ?? '');
   const [title, setTitle] = useState(initialTender?.title ?? '');
@@ -76,11 +82,27 @@ export function TenderFormModal({
     initialTender?.submissionDueDate ?? `${todayLocal}T17:00`,
   );
   const [preBidDate, setPreBidDate] = useState(initialTender?.preBidDate ?? '');
+  const [technicalOpeningDate, setTechnicalOpeningDate] = useState(
+    initialTender?.technicalOpeningDate ?? '',
+  );
+  const [financialOpeningDate, setFinancialOpeningDate] = useState(
+    initialTender?.financialOpeningDate ?? '',
+  );
   const [estimatedValue, setEstimatedValue] = useState(
     initialTender ? String(initialTender.estimatedValue) : '',
   );
   const [quotedValue, setQuotedValue] = useState(
     initialTender ? String(initialTender.quotedValue) : '',
+  );
+  const [l1BidderName, setL1BidderName] = useState(initialTender?.l1BidderName ?? '');
+  const [l1QuotedValue, setL1QuotedValue] = useState(
+    initialTender?.l1QuotedValue ? String(initialTender.l1QuotedValue) : '',
+  );
+  const [ourPositionRank, setOurPositionRank] = useState(
+    initialTender?.ourPositionRank ?? '',
+  );
+  const [assignedOwner, setAssignedOwner] = useState(
+    initialTender?.assignedOwner ?? '',
   );
   const [emdStatus, setEmdStatus] = useState<EmdSecurityType>(
     initialTender?.emdStatus ?? 'Exempted - MSME/Startup',
@@ -167,6 +189,7 @@ export function TenderFormModal({
 
     const parsedEst = Math.max(0, Number(estimatedValue) || 0);
     const parsedQuoted = Math.max(0, Number(quotedValue) || 0);
+    const parsedL1Quoted = Math.max(0, Number(l1QuotedValue) || 0);
     const parsedEmd = supportsEmdSync ? Math.max(0, Number(emdAmount) || 0) : 0;
 
     if (supportsEmdSync && parsedEmd <= 0) {
@@ -175,19 +198,30 @@ export function TenderFormModal({
     }
 
     const nowIso = new Date().toISOString();
+    const cleanDept = department.trim();
+    const cleanLoc = location.trim() || 'India';
     const savedTender: Tender = {
       id: initialTender?.id ?? `tnd-${Date.now()}`,
       tenderId: tenderId.trim(),
       portal,
-      department: department.trim(),
-      location: location.trim() || 'India',
+      clientName: clientName.trim() || cleanDept,
+      department: cleanDept,
+      locationDepartment:
+        locationDepartment.trim() || [cleanLoc, cleanDept].filter(Boolean).join(' / '),
+      location: cleanLoc,
       category: category.trim() || 'General Supply & Services',
       title: title.trim(),
       publishDate,
       submissionDueDate,
       preBidDate: preBidDate || undefined,
+      technicalOpeningDate: technicalOpeningDate || undefined,
+      financialOpeningDate: financialOpeningDate || undefined,
       estimatedValue: parsedEst,
       quotedValue: parsedQuoted,
+      l1BidderName: l1BidderName.trim() || undefined,
+      l1QuotedValue: parsedL1Quoted > 0 ? parsedL1Quoted : undefined,
+      ourPositionRank: ourPositionRank.trim() || undefined,
+      assignedOwner: assignedOwner.trim() || undefined,
       emdStatus,
       emdAmount: parsedEmd,
       stage,
@@ -198,6 +232,7 @@ export function TenderFormModal({
       attachments: extractSavedAttachments(attachmentSlots),
       createdAt: initialTender?.createdAt ?? nowIso,
       updatedAt: nowIso,
+      lastUpdatedAt: nowIso,
     };
 
     const initialMafItems: MafLineItem[] | undefined =
@@ -363,7 +398,24 @@ export function TenderFormModal({
                   </select>
                 </div>
 
-                <div className="lg:col-span-2">
+                <div>
+                  <label
+                    htmlFor="t-client-name"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Client / Organization Name
+                  </label>
+                  <input
+                    id="t-client-name"
+                    type="text"
+                    value={clientName}
+                    onChange={(e) => setClientName(e.target.value)}
+                    placeholder="Defaults to Department Name"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
                   <label
                     htmlFor="t-department"
                     className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
@@ -383,10 +435,27 @@ export function TenderFormModal({
 
                 <div>
                   <label
+                    htmlFor="t-location-dept"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Location / Department (MIS Col 4)
+                  </label>
+                  <input
+                    id="t-location-dept"
+                    type="text"
+                    value={locationDepartment}
+                    onChange={(e) => setLocationDepartment(e.target.value)}
+                    placeholder="e.g. HQ Western Command / MES"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
                     htmlFor="t-location"
                     className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
                   >
-                    City / State
+                    Location (City / State)
                   </label>
                   <input
                     id="t-location"
@@ -398,20 +467,19 @@ export function TenderFormModal({
                   />
                 </div>
 
-                <div className="sm:col-span-2">
+                <div>
                   <label
-                    htmlFor="t-title"
+                    htmlFor="t-assigned-owner"
                     className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
                   >
-                    Work / Supply Brief Title *
+                    Assigned Person / Owner
                   </label>
                   <input
-                    id="t-title"
+                    id="t-assigned-owner"
                     type="text"
-                    required
-                    value={title}
-                    onChange={(e) => setTitle(e.target.value)}
-                    placeholder="e.g. Supply & Installation of Managed Network Switches & Firewall"
+                    value={assignedOwner}
+                    onChange={(e) => setAssignedOwner(e.target.value)}
+                    placeholder="e.g. Vansh Saxena"
                     className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
@@ -429,6 +497,24 @@ export function TenderFormModal({
                     value={category}
                     onChange={(e) => setCategory(e.target.value)}
                     placeholder="e.g. IT Hardware & Networking"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div className="sm:col-span-2 lg:col-span-3">
+                  <label
+                    htmlFor="t-title"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Brief Description & Scope of Work (Work / Supply Title) *
+                  </label>
+                  <input
+                    id="t-title"
+                    type="text"
+                    required
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="e.g. Supply & Installation of Managed Network Switches & Firewall"
                     className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
@@ -597,12 +683,96 @@ export function TenderFormModal({
                   />
                 </div>
 
-                <div className="sm:col-span-2 lg:col-span-4">
+                <div>
+                  <label
+                    htmlFor="t-tech-open-date"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Technical Opening Date
+                  </label>
+                  <input
+                    id="t-tech-open-date"
+                    type="date"
+                    value={technicalOpeningDate}
+                    onChange={(e) => setTechnicalOpeningDate(e.target.value)}
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="t-fin-open-date"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Financial Opening Date
+                  </label>
+                  <input
+                    id="t-fin-open-date"
+                    type="date"
+                    value={financialOpeningDate}
+                    onChange={(e) => setFinancialOpeningDate(e.target.value)}
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="t-l1-bidder"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    L1 Bidder Name
+                  </label>
+                  <input
+                    id="t-l1-bidder"
+                    type="text"
+                    value={l1BidderName}
+                    onChange={(e) => setL1BidderName(e.target.value)}
+                    placeholder="e.g. Winning Firm Name"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="t-l1-val"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    L1 Quoted Value (₹)
+                  </label>
+                  <input
+                    id="t-l1-val"
+                    type="number"
+                    min={0}
+                    value={l1QuotedValue}
+                    onChange={(e) => setL1QuotedValue(e.target.value)}
+                    placeholder="e.g. 13900000"
+                    className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="t-our-rank"
+                    className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                  >
+                    Our Position / Rank
+                  </label>
+                  <input
+                    id="t-our-rank"
+                    type="text"
+                    value={ourPositionRank}
+                    onChange={(e) => setOurPositionRank(e.target.value)}
+                    placeholder="e.g. L1, L2, Qualified"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+
+                <div className="sm:col-span-2 lg:col-span-3">
                   <label
                     htmlFor="t-result-info"
                     className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
                   >
-                    Result / L1 Price Info (Competitive Analysis)
+                    Result / L1 Price Info & Next Action Summary
                   </label>
                   <input
                     id="t-result-info"

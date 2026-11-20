@@ -10,12 +10,26 @@ import {
   serverTimestamp,
   setDoc,
   where,
+  type Firestore,
   type Unsubscribe,
 } from 'firebase/firestore';
-import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
-import { db, handleFirestoreError, OperationType, storage } from '../lib/firebase.ts';
+import {
+  getDownloadURL,
+  ref as storageRef,
+  uploadBytes,
+  type FirebaseStorage,
+} from 'firebase/storage';
+import { assertIsolatedTargetDescriptor } from '../lib/byocConfigHelpers.ts';
+import {
+  db as centralDb,
+  firebaseConfig as centralFirebaseConfig,
+  handleFirestoreError,
+  OperationType,
+  storage as centralStorage,
+} from '../lib/firebase.ts';
 import type {
   AttachmentItem,
+  CrmUserRole,
   CrmUserSession,
   EmailAlertLog,
   EmailAlertSettings,
@@ -48,6 +62,39 @@ import {
   validateMafUploadFile,
 } from './mafCalculations.ts';
 
+export interface CloudTargetContext {
+  db: Firestore;
+  storage: FirebaseStorage;
+  projectId: string;
+  databaseId?: string;
+  isByoc: boolean;
+  role: CrmUserRole;
+}
+
+export function getCentralAdminCloudTarget(): CloudTargetContext {
+  return {
+    db: centralDb,
+    storage: centralStorage,
+    projectId: centralFirebaseConfig.projectId,
+    databaseId: centralFirebaseConfig.firestoreDatabaseId,
+    isByoc: false,
+    role: 'admin',
+  };
+}
+
+export function assertCloudTargetIsolated(opts: {
+  role?: CrmUserRole;
+  workspaceTenantId?: string | null;
+  target?: CloudTargetContext | null;
+}): CloudTargetContext {
+  return assertIsolatedTargetDescriptor({
+    role: opts.role,
+    workspaceTenantId: opts.workspaceTenantId,
+    target: opts.target ?? null,
+    adminFallback: getCentralAdminCloudTarget(),
+  });
+}
+
 const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'L1 / Won',
   'Lost (L2/L3)',
@@ -78,50 +125,72 @@ function normalizeTenantId(workspaceTenantId?: string | null): string | null {
   return sanitizeDocId(trimmed);
 }
 
-function getTenantPathPrefix(uid: string, workspaceTenantId?: string | null): string {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  return safeTenant ? `users/${uid}/workspaces/${safeTenant}` : `users/${uid}`;
-}
-
-function getTenantDoc(
+function resolveScope(
   uid: string,
   workspaceTenantId: string | null | undefined,
+  target?: CloudTargetContext | null,
+): { ctx: CloudTargetContext; scopedTenant: string | null; prefix: string } {
+  const ctx = assertCloudTargetIsolated({
+    workspaceTenantId,
+    target,
+  });
+  // Inside a dedicated BYOC Firebase project, store directly under /users/{uid}/...
+  const scopedTenant = ctx.isByoc ? null : normalizeTenantId(workspaceTenantId);
+  const prefix = scopedTenant ? `users/${uid}/workspaces/${scopedTenant}` : `users/${uid}`;
+  return { ctx, scopedTenant, prefix };
+}
+
+function getScopedDoc(
+  ctx: CloudTargetContext,
+  uid: string,
+  scopedTenant: string | null,
   colName: string,
   docId: string,
 ) {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  if (safeTenant) {
-    return doc(db, 'users', uid, 'workspaces', safeTenant, colName, docId);
+  if (scopedTenant) {
+    return doc(ctx.db, 'users', uid, 'workspaces', scopedTenant, colName, docId);
   }
-  return doc(db, 'users', uid, colName, docId);
+  return doc(ctx.db, 'users', uid, colName, docId);
 }
 
-function getTenantCollection(
+function getScopedCollection(
+  ctx: CloudTargetContext,
   uid: string,
-  workspaceTenantId: string | null | undefined,
+  scopedTenant: string | null,
   colName: string,
 ) {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  if (safeTenant) {
-    return collection(db, 'users', uid, 'workspaces', safeTenant, colName);
+  if (scopedTenant) {
+    return collection(ctx.db, 'users', uid, 'workspaces', scopedTenant, colName);
   }
-  return collection(db, 'users', uid, colName);
+  return collection(ctx.db, 'users', uid, colName);
 }
 
 function docToTender(data: Record<string, unknown>): Tender {
+  const dept = String(data.department ?? '');
   return {
     id: String(data.id ?? ''),
     tenderId: String(data.tenderId ?? ''),
     portal: data.portal as Tender['portal'],
-    department: String(data.department ?? ''),
+    clientName: typeof data.clientName === 'string' && data.clientName ? data.clientName : dept,
+    department: dept,
+    locationDepartment:
+      typeof data.locationDepartment === 'string' && data.locationDepartment
+        ? data.locationDepartment
+        : dept,
     location: String(data.location ?? ''),
     category: String(data.category ?? ''),
     title: String(data.title ?? ''),
     publishDate: String(data.publishDate ?? ''),
     submissionDueDate: String(data.submissionDueDate ?? ''),
     preBidDate: String(data.preBidDate ?? ''),
+    technicalOpeningDate: String(data.technicalOpeningDate ?? ''),
+    financialOpeningDate: String(data.financialOpeningDate ?? ''),
     estimatedValue: Number(data.estimatedValue ?? 0),
     quotedValue: Number(data.quotedValue ?? 0),
+    l1BidderName: String(data.l1BidderName ?? ''),
+    l1QuotedValue: Number(data.l1QuotedValue ?? 0),
+    ourPositionRank: String(data.ourPositionRank ?? ''),
+    assignedOwner: String(data.assignedOwner ?? ''),
     emdStatus: data.emdStatus as Tender['emdStatus'],
     emdAmount: Number(data.emdAmount ?? 0),
     stage: data.stage as Tender['stage'],
@@ -245,13 +314,14 @@ export async function ensureUserRootDocument(
   user: User,
   workspaceTenantId?: string | null,
   sessionMeta?: Pick<CrmUserSession, 'username' | 'email'> | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  const cacheKey = `${user.uid}::${safeTenant || 'admin'}`;
+  const { ctx, scopedTenant } = resolveScope(user.uid, workspaceTenantId, target);
+  const cacheKey = `${ctx.projectId}::${user.uid}::${scopedTenant || 'root'}`;
   if (ensuredWorkspaceKeys.has(cacheKey)) return;
 
   const userPath = `users/${user.uid}`;
-  const userRef = doc(db, 'users', user.uid);
+  const userRef = doc(ctx.db, 'users', user.uid);
   const safeEmail = (user.email ?? '').slice(0, 200);
   try {
     const snap = await getDoc(userRef);
@@ -280,16 +350,15 @@ export async function ensureUserRootDocument(
       }
     }
 
-    if (safeTenant) {
-      const wsPath = `users/${user.uid}/workspaces/${safeTenant}`;
-      const wsRef = doc(db, 'users', user.uid, 'workspaces', safeTenant);
+    if (scopedTenant) {
+      const wsRef = doc(ctx.db, 'users', user.uid, 'workspaces', scopedTenant);
       const wsSnap = await getDoc(wsRef);
       const existingCreatedAt = wsSnap.exists() ? wsSnap.data().createdAt : undefined;
       const wsPayload = buildWorkspaceRootPayload(
         {
           ownerUid: user.uid,
-          tenantId: safeTenant,
-          username: sessionMeta?.username || safeTenant,
+          tenantId: scopedTenant,
+          username: sessionMeta?.username || scopedTenant,
           email: sessionMeta?.email || safeEmail,
         },
         serverTimestamp(),
@@ -299,11 +368,10 @@ export async function ensureUserRootDocument(
         await setDoc(wsRef, wsPayload);
       } else {
         const wsData = wsSnap.data();
-        if (wsData.ownerUid !== user.uid || wsData.tenantId !== safeTenant || !wsData.createdAt) {
+        if (wsData.ownerUid !== user.uid || wsData.tenantId !== scopedTenant || !wsData.createdAt) {
           await setDoc(wsRef, wsPayload);
         }
       }
-      void wsPath;
     }
 
     ensuredWorkspaceKeys.add(cacheKey);
@@ -318,14 +386,14 @@ export async function syncSecondaryUserToCloud(
   summary: SecondaryUserSummary,
 ): Promise<void> {
   const safeId = sanitizeDocId(summary.userId);
-  const path = `secondaryUsers/${safeId}`;
-  const ref = doc(db, 'secondaryUsers', safeId);
+  const ref = doc(centralDb, 'secondaryUsers', safeId);
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
-    const ownerUid = snap.exists() && typeof snap.data().ownerUid === 'string'
-      ? snap.data().ownerUid
-      : user.uid;
+    const ownerUid =
+      snap.exists() && typeof snap.data().ownerUid === 'string'
+        ? snap.data().ownerUid
+        : user.uid;
     const payload = buildSecondaryUserCloudPayload(
       {
         ownerUid,
@@ -333,6 +401,11 @@ export async function syncSecondaryUserToCloud(
         username: summary.username,
         email: summary.email,
         isActive: summary.isActive,
+        isEnabled: summary.isEnabled,
+        presenceStatus: summary.presenceStatus,
+        lastHeartbeatAt: summary.lastHeartbeatAt,
+        lastLogoutAt: summary.lastLogoutAt,
+        byocProjectId: summary.byocProjectId,
         createdAtIso: summary.createdAt,
         lastLoginAtIso: summary.lastLoginAt,
       },
@@ -341,9 +414,8 @@ export async function syncSecondaryUserToCloud(
     );
     await setDoc(ref, payload);
   } catch {
-    // Non-fatal if directory write isn't permitted for current auth user
+    // Non-fatal if central directory write isn't permitted for current auth user
   }
-  void path;
 }
 
 export async function fetchSecondaryUsersFromCloud(
@@ -352,10 +424,11 @@ export async function fetchSecondaryUsersFromCloud(
   if (!isBootstrappedAdminUser(adminUser)) return [];
   const path = 'secondaryUsers';
   try {
-    const snap = await getDocs(collection(db, 'secondaryUsers'));
+    const snap = await getDocs(collection(centralDb, 'secondaryUsers'));
     return snap.docs
       .map((d) => {
         const data = d.data();
+        const isEnabled = data.isEnabled !== false && data.isActive !== false;
         return {
           userId: String(data.userId ?? d.id),
           username: String(data.username ?? ''),
@@ -367,6 +440,23 @@ export async function fetchSecondaryUsersFromCloud(
               ? data.clientLastLoginAt
               : undefined,
           isActive: data.isActive !== false,
+          isEnabled,
+          presenceStatus:
+            data.presenceStatus === 'active' || data.presenceStatus === 'not_active'
+              ? (data.presenceStatus as 'active' | 'not_active')
+              : 'not_active',
+          lastHeartbeatAt:
+            typeof data.lastHeartbeatAt === 'string' && data.lastHeartbeatAt
+              ? data.lastHeartbeatAt
+              : undefined,
+          lastLogoutAt:
+            typeof data.lastLogoutAt === 'string' && data.lastLogoutAt
+              ? data.lastLogoutAt
+              : undefined,
+          byocProjectId:
+            typeof data.byocProjectId === 'string' && data.byocProjectId
+              ? data.byocProjectId
+              : undefined,
         };
       })
       .filter((item) => item.username.length > 0 && item.email.length > 0);
@@ -379,11 +469,12 @@ export async function syncPreferencesToCloud(
   user: User,
   prefs: UserPreferences,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user, workspaceTenantId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/settings/preferences`;
-  const ref = getTenantDoc(user.uid, workspaceTenantId, 'settings', 'preferences');
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -403,11 +494,12 @@ export async function syncProfileToCloud(
   user: User,
   profile: FirmProfile,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user, workspaceTenantId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/profile/firm`;
-  const ref = getTenantDoc(user.uid, workspaceTenantId, 'profile', 'firm');
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -422,11 +514,12 @@ export async function syncEmailConfigToCloud(
   user: User,
   config: EmailAlertSettings,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user, workspaceTenantId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/emailConfig/default`;
-  const ref = getTenantDoc(user.uid, workspaceTenantId, 'emailConfig', 'default');
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -446,11 +539,12 @@ export async function syncSheetConfigToCloud(
   user: User,
   config: GoogleSheetSettings,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user, workspaceTenantId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/sheetConfig/default`;
-  const ref = getTenantDoc(user.uid, workspaceTenantId, 'sheetConfig', 'default');
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default');
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -470,12 +564,13 @@ export async function syncEmailAlertLogToCloud(
   user: User,
   log: EmailAlertLog,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  await ensureUserRootDocument(user, workspaceTenantId);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const safeId = sanitizeDocId(log.id);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
   const path = `${prefix}/emailAlerts/${safeId}`;
-  const ref = getTenantDoc(user.uid, workspaceTenantId, 'emailAlerts', safeId);
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailAlerts', safeId);
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -495,18 +590,18 @@ export async function syncAttachmentFilesToCloud(
   user: User,
   attachments: AttachmentItem[] | undefined,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
   const list = attachments ?? [];
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  const prefix = getTenantPathPrefix(user.uid, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   for (const att of list) {
     if (!att.dataUrl) continue;
     const safeId = sanitizeDocId(att.id);
-    const cacheKey = `${user.uid}:${safeTenant || 'admin'}:${safeId}:${att.fileSize}:${att.uploadedAt}`;
+    const cacheKey = `${ctx.projectId}:${user.uid}:${scopedTenant || 'root'}:${safeId}:${att.fileSize}:${att.uploadedAt}`;
     if (syncedAttachmentKeys.has(cacheKey)) continue;
 
     const path = `${prefix}/attachmentFiles/${safeId}`;
-    const ref = getTenantDoc(user.uid, safeTenant, 'attachmentFiles', safeId);
+    const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId);
     try {
       const snap = await getDoc(ref);
       const existingData = snap.exists() ? snap.data() : null;
@@ -543,6 +638,7 @@ export async function uploadMafDocumentFile(
   itemId: string,
   file: File,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<{
   mafDocumentUrl: string;
   mafDocumentName: string;
@@ -553,23 +649,23 @@ export async function uploadMafDocumentFile(
     throw new Error(validationErr);
   }
 
-  const safeTenant = normalizeTenantId(workspaceTenantId);
   const isCompressibleImage =
     file.type.startsWith('image/') && file.type !== 'image/svg+xml' && file.type !== 'image/gif';
 
-  // Use Firebase Storage for large non-image PDFs (> 650 KB) when signed in
+  // Use scoped Firebase Storage ONLY when authenticated AND isolated target is valid
   if (!isCompressibleImage && file.size > MAX_ATTACHMENT_BYTES) {
     if (!user) {
       throw new Error(
-        'PDF exceeds 650 KB. Sign in with Google for Firebase Storage upload, compress the PDF under 650 KB, or paste a Cloud Drive link.',
+        'PDF exceeds 650 KB. Connect your cloud account for Storage upload, compress the PDF under 650 KB, or paste a Cloud Drive link.',
       );
     }
+    const { ctx, scopedTenant } = resolveScope(user.uid, workspaceTenantId, target);
     const safeName = file.name.replace(/[^a-zA-Z0-9._\-]/g, '_');
-    const path = safeTenant
-      ? `users/${user.uid}/workspaces/${safeTenant}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`
+    const path = scopedTenant
+      ? `users/${user.uid}/workspaces/${scopedTenant}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`
       : `users/${user.uid}/maf_tracker/${sanitizeDocId(trackerId)}/${sanitizeDocId(itemId)}/${Date.now()}_${safeName}`;
     try {
-      const fileRef = storageRef(storage, path);
+      const fileRef = storageRef(ctx.storage, path);
       await uploadBytes(fileRef, file, {
         contentType: file.type || 'application/pdf',
       });
@@ -586,7 +682,7 @@ export async function uploadMafDocumentFile(
     }
   }
 
-  // Images (auto-compressed) or PDFs <= 650 KB -> store cleanly in attachmentFiles subcollection
+  // Images (auto-compressed) or PDFs <= 650 KB -> store cleanly in attachmentFiles subcollection (or inline local if unconfigured)
   const prepared = await readAttachmentForFirestore(file);
   const attId = sanitizeDocId(`maf_${itemId}_${Date.now()}`);
   const attachmentItem: AttachmentItem = {
@@ -600,8 +696,12 @@ export async function uploadMafDocumentFile(
   };
 
   if (user) {
-    await ensureUserRootDocument(user, safeTenant);
-    await syncAttachmentFilesToCloud(user, [attachmentItem], safeTenant);
+    const canCloud =
+      target?.isByoc || (!normalizeTenantId(workspaceTenantId) && target?.role !== 'secondary');
+    if (canCloud) {
+      await ensureUserRootDocument(user, workspaceTenantId, null, target);
+      await syncAttachmentFilesToCloud(user, [attachmentItem], workspaceTenantId, target);
+    }
   }
 
   return {
@@ -615,20 +715,20 @@ export async function syncTenderToCloud(
   user: User,
   tender: Tender,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  await ensureUserRootDocument(user, safeTenant);
-  await syncAttachmentFilesToCloud(user, tender.attachments, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  await syncAttachmentFilesToCloud(user, tender.attachments, workspaceTenantId, ctx);
 
   const safeId = sanitizeDocId(tender.id);
-  const prefix = getTenantPathPrefix(user.uid, safeTenant);
   const path = `${prefix}/tenders/${safeId}`;
-  const ref = getTenantDoc(user.uid, safeTenant, 'tenders', safeId);
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId);
   try {
     const snap = await getDoc(ref);
     if (snap.exists()) {
       const existingStage = snap.data().stage as Tender['stage'];
-      if (TERMINAL_TENDER_STAGES.has(existingStage) && !isBootstrappedAdminUser(user)) {
+      if (TERMINAL_TENDER_STAGES.has(existingStage) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
         return;
       }
     }
@@ -649,12 +749,18 @@ export async function deleteTenderFromCloud(
   user: User,
   tenderId: string,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   const safeId = sanitizeDocId(tenderId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
   const path = `${prefix}/tenders/${safeId}`;
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId);
   try {
-    await deleteDoc(getTenantDoc(user.uid, workspaceTenantId, 'tenders', safeId));
+    const snap = await getDoc(ref);
+    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+      throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
+    }
+    await deleteDoc(ref);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -664,20 +770,20 @@ export async function syncEmdRecordToCloud(
   user: User,
   record: EmdBgRecord,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  await ensureUserRootDocument(user, safeTenant);
-  await syncAttachmentFilesToCloud(user, record.attachments, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  await syncAttachmentFilesToCloud(user, record.attachments, workspaceTenantId, ctx);
 
   const safeId = sanitizeDocId(record.id);
-  const prefix = getTenantPathPrefix(user.uid, safeTenant);
   const path = `${prefix}/emdRecords/${safeId}`;
-  const ref = getTenantDoc(user.uid, safeTenant, 'emdRecords', safeId);
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId);
   try {
     const snap = await getDoc(ref);
     if (snap.exists()) {
       const existingStatus = snap.data().status as EmdBgRecord['status'];
-      if (TERMINAL_FINANCIAL_STATUS.has(existingStatus) && !isBootstrappedAdminUser(user)) {
+      if (TERMINAL_FINANCIAL_STATUS.has(existingStatus) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
         return;
       }
     }
@@ -698,12 +804,18 @@ export async function deleteEmdRecordFromCloud(
   user: User,
   recordId: string,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   const safeId = sanitizeDocId(recordId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
   const path = `${prefix}/emdRecords/${safeId}`;
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId);
   try {
-    await deleteDoc(getTenantDoc(user.uid, workspaceTenantId, 'emdRecords', safeId));
+    const snap = await getDoc(ref);
+    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+      throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
+    }
+    await deleteDoc(ref);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -713,9 +825,10 @@ export async function syncMafTrackerToCloud(
   user: User,
   tracker: MafTrackerRecord,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  await ensureUserRootDocument(user, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
 
   const inlineMafAttachments: AttachmentItem[] = [];
   for (const item of tracker.itemsMAF ?? []) {
@@ -734,13 +847,12 @@ export async function syncMafTrackerToCloud(
     }
   }
   if (inlineMafAttachments.length > 0) {
-    await syncAttachmentFilesToCloud(user, inlineMafAttachments, safeTenant);
+    await syncAttachmentFilesToCloud(user, inlineMafAttachments, workspaceTenantId, ctx);
   }
 
   const safeId = sanitizeDocId(tracker.id);
-  const prefix = getTenantPathPrefix(user.uid, safeTenant);
   const path = `${prefix}/maf_tracker/${safeId}`;
-  const ref = getTenantDoc(user.uid, safeTenant, 'maf_tracker', safeId);
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
   try {
     const snap = await getDoc(ref);
     const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
@@ -760,12 +872,18 @@ export async function deleteMafTrackerFromCloud(
   user: User,
   trackerId: string,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   const safeId = sanitizeDocId(trackerId);
-  const prefix = getTenantPathPrefix(user.uid, workspaceTenantId);
   const path = `${prefix}/maf_tracker/${safeId}`;
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
   try {
-    await deleteDoc(getTenantDoc(user.uid, workspaceTenantId, 'maf_tracker', safeId));
+    const snap = await getDoc(ref);
+    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+      throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
+    }
+    await deleteDoc(ref);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -775,12 +893,13 @@ export async function fetchAttachmentFileDataUrl(
   uid: string,
   attachmentId: string,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<string | null> {
+  const { ctx, scopedTenant, prefix } = resolveScope(uid, workspaceTenantId, target);
   const safeId = sanitizeDocId(attachmentId);
-  const prefix = getTenantPathPrefix(uid, workspaceTenantId);
   const path = `${prefix}/attachmentFiles/${safeId}`;
   try {
-    const snap = await getDoc(getTenantDoc(uid, workspaceTenantId, 'attachmentFiles', safeId));
+    const snap = await getDoc(getScopedDoc(ctx, uid, scopedTenant, 'attachmentFiles', safeId));
     if (!snap.exists()) return null;
     const dataUrl = snap.data().dataUrl;
     return typeof dataUrl === 'string' && dataUrl.length > 0 ? dataUrl : null;
@@ -792,6 +911,7 @@ export async function fetchAttachmentFileDataUrl(
 export async function fetchAllFromCloud(
   uid: string,
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<{
   profile: FirmProfile | null;
   preferences: UserPreferences | null;
@@ -803,8 +923,7 @@ export async function fetchAllFromCloud(
   mafTrackers: MafTrackerRecord[];
   attachmentFiles: Map<string, string>;
 }> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  const prefix = getTenantPathPrefix(uid, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(uid, workspaceTenantId, target);
   const profilePath = `${prefix}/profile/firm`;
   const prefsPath = `${prefix}/settings/preferences`;
   const emailConfigPath = `${prefix}/emailConfig/default`;
@@ -826,7 +945,7 @@ export async function fetchAllFromCloud(
   const attachmentFiles = new Map<string, string>();
 
   try {
-    const profileSnap = await getDoc(getTenantDoc(uid, safeTenant, 'profile', 'firm'));
+    const profileSnap = await getDoc(getScopedDoc(ctx, uid, scopedTenant, 'profile', 'firm'));
     if (profileSnap.exists()) {
       profile = docToProfile(profileSnap.data());
     }
@@ -835,7 +954,7 @@ export async function fetchAllFromCloud(
   }
 
   try {
-    const prefsSnap = await getDoc(getTenantDoc(uid, safeTenant, 'settings', 'preferences'));
+    const prefsSnap = await getDoc(getScopedDoc(ctx, uid, scopedTenant, 'settings', 'preferences'));
     if (prefsSnap.exists()) {
       preferences = docToPreferences(prefsSnap.data());
     }
@@ -844,7 +963,10 @@ export async function fetchAllFromCloud(
   }
 
   try {
-    const tQuery = query(getTenantCollection(uid, safeTenant, 'tenders'), where('ownerUid', '==', uid));
+    const tQuery = query(
+      getScopedCollection(ctx, uid, scopedTenant, 'tenders'),
+      where('ownerUid', '==', uid),
+    );
     const tSnap = await getDocs(tQuery);
     tenders = tSnap.docs.map((d) => docToTender(d.data()));
   } catch (error) {
@@ -852,7 +974,10 @@ export async function fetchAllFromCloud(
   }
 
   try {
-    const eQuery = query(getTenantCollection(uid, safeTenant, 'emdRecords'), where('ownerUid', '==', uid));
+    const eQuery = query(
+      getScopedCollection(ctx, uid, scopedTenant, 'emdRecords'),
+      where('ownerUid', '==', uid),
+    );
     const eSnap = await getDocs(eQuery);
     emdRecords = eSnap.docs.map((d) => docToEmdRecord(d.data()));
   } catch (error) {
@@ -860,7 +985,10 @@ export async function fetchAllFromCloud(
   }
 
   try {
-    const mQuery = query(getTenantCollection(uid, safeTenant, 'maf_tracker'), where('ownerUid', '==', uid));
+    const mQuery = query(
+      getScopedCollection(ctx, uid, scopedTenant, 'maf_tracker'),
+      where('ownerUid', '==', uid),
+    );
     const mSnap = await getDocs(mQuery);
     mafTrackers = mSnap.docs.map((d) => docToMafTracker(d.data()));
   } catch (error) {
@@ -869,7 +997,7 @@ export async function fetchAllFromCloud(
 
   try {
     const fQuery = query(
-      getTenantCollection(uid, safeTenant, 'attachmentFiles'),
+      getScopedCollection(ctx, uid, scopedTenant, 'attachmentFiles'),
       where('ownerUid', '==', uid),
     );
     const fSnap = await getDocs(fQuery);
@@ -884,7 +1012,9 @@ export async function fetchAllFromCloud(
   }
 
   try {
-    const emailConfigSnap = await getDoc(getTenantDoc(uid, safeTenant, 'emailConfig', 'default'));
+    const emailConfigSnap = await getDoc(
+      getScopedDoc(ctx, uid, scopedTenant, 'emailConfig', 'default'),
+    );
     if (emailConfigSnap.exists()) {
       emailConfig = docToEmailConfig(emailConfigSnap.data());
     }
@@ -893,7 +1023,9 @@ export async function fetchAllFromCloud(
   }
 
   try {
-    const sheetConfigSnap = await getDoc(getTenantDoc(uid, safeTenant, 'sheetConfig', 'default'));
+    const sheetConfigSnap = await getDoc(
+      getScopedDoc(ctx, uid, scopedTenant, 'sheetConfig', 'default'),
+    );
     if (sheetConfigSnap.exists()) {
       sheetConfig = docToSheetConfig(sheetConfigSnap.data());
     }
@@ -903,7 +1035,7 @@ export async function fetchAllFromCloud(
 
   try {
     const emailAlertsQuery = query(
-      getTenantCollection(uid, safeTenant, 'emailAlerts'),
+      getScopedCollection(ctx, uid, scopedTenant, 'emailAlerts'),
       where('ownerUid', '==', uid),
     );
     const emailSnap = await getDocs(emailAlertsQuery);
@@ -935,22 +1067,23 @@ export async function backupAllToCloud(
   emdRecords: EmdBgRecord[],
   mafTrackers: MafTrackerRecord[] = [],
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  await ensureUserRootDocument(user, safeTenant);
-  await syncProfileToCloud(user, profile, safeTenant);
-  await syncPreferencesToCloud(user, preferences, safeTenant);
+  const { ctx } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  await syncProfileToCloud(user, profile, workspaceTenantId, ctx);
+  await syncPreferencesToCloud(user, preferences, workspaceTenantId, ctx);
 
   for (const tender of tenders) {
-    await syncTenderToCloud(user, tender, safeTenant);
+    await syncTenderToCloud(user, tender, workspaceTenantId, ctx);
   }
 
   for (const record of emdRecords) {
-    await syncEmdRecordToCloud(user, record, safeTenant);
+    await syncEmdRecordToCloud(user, record, workspaceTenantId, ctx);
   }
 
   for (const tracker of mafTrackers) {
-    await syncMafTrackerToCloud(user, tracker, safeTenant);
+    await syncMafTrackerToCloud(user, tracker, workspaceTenantId, ctx);
   }
 }
 
@@ -962,10 +1095,11 @@ export async function replaceCloudDataset(
   emdRecords: EmdBgRecord[],
   mafTrackers: MafTrackerRecord[] = [],
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Promise<void> {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  await ensureUserRootDocument(user, safeTenant);
-  const existing = await fetchAllFromCloud(user.uid, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  const existing = await fetchAllFromCloud(user.uid, workspaceTenantId, ctx);
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
   const nextMafIds = new Set(mafTrackers.map((m) => sanitizeDocId(m.id)));
@@ -987,29 +1121,28 @@ export async function replaceCloudDataset(
 
   for (const oldTender of existing.tenders) {
     if (!nextTenderIds.has(sanitizeDocId(oldTender.id))) {
-      await deleteTenderFromCloud(user, oldTender.id, safeTenant);
+      await deleteTenderFromCloud(user, oldTender.id, workspaceTenantId, ctx);
     }
   }
 
   for (const oldEmd of existing.emdRecords) {
     if (!nextEmdIds.has(sanitizeDocId(oldEmd.id))) {
-      await deleteEmdRecordFromCloud(user, oldEmd.id, safeTenant);
+      await deleteEmdRecordFromCloud(user, oldEmd.id, workspaceTenantId, ctx);
     }
   }
 
   for (const oldMaf of existing.mafTrackers) {
     if (!nextMafIds.has(sanitizeDocId(oldMaf.id))) {
-      await deleteMafTrackerFromCloud(user, oldMaf.id, safeTenant);
+      await deleteMafTrackerFromCloud(user, oldMaf.id, workspaceTenantId, ctx);
     }
   }
 
-  const prefix = getTenantPathPrefix(user.uid, safeTenant);
   for (const oldAttId of existing.attachmentFiles.keys()) {
     if (!nextAttachmentIds.has(sanitizeDocId(oldAttId))) {
       const safeId = sanitizeDocId(oldAttId);
       const path = `${prefix}/attachmentFiles/${safeId}`;
       try {
-        await deleteDoc(getTenantDoc(user.uid, safeTenant, 'attachmentFiles', safeId));
+        await deleteDoc(getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, path);
       }
@@ -1023,7 +1156,8 @@ export async function replaceCloudDataset(
     tenders,
     emdRecords,
     mafTrackers,
-    safeTenant,
+    workspaceTenantId,
+    ctx,
   );
 }
 
@@ -1042,9 +1176,9 @@ export function subscribeToUserCloudData(
     onError: (err: Error) => void;
   },
   workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
 ): Unsubscribe {
-  const safeTenant = normalizeTenantId(workspaceTenantId);
-  const prefix = getTenantPathPrefix(uid, safeTenant);
+  const { ctx, scopedTenant, prefix } = resolveScope(uid, workspaceTenantId, target);
   const profilePath = `${prefix}/profile/firm`;
   const prefsPath = `${prefix}/settings/preferences`;
   const emailConfigPath = `${prefix}/emailConfig/default`;
@@ -1056,7 +1190,7 @@ export function subscribeToUserCloudData(
   const filesPath = `${prefix}/attachmentFiles`;
 
   const unsubProfile = onSnapshot(
-    getTenantDoc(uid, safeTenant, 'profile', 'firm'),
+    getScopedDoc(ctx, uid, scopedTenant, 'profile', 'firm'),
     (snap) => {
       if (snap.exists()) {
         callbacks.onProfile(docToProfile(snap.data()));
@@ -1072,7 +1206,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubPrefs = onSnapshot(
-    getTenantDoc(uid, safeTenant, 'settings', 'preferences'),
+    getScopedDoc(ctx, uid, scopedTenant, 'settings', 'preferences'),
     (snap) => {
       if (snap.exists()) {
         callbacks.onPreferences(docToPreferences(snap.data()));
@@ -1088,7 +1222,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubTenders = onSnapshot(
-    query(getTenantCollection(uid, safeTenant, 'tenders'), where('ownerUid', '==', uid)),
+    query(getScopedCollection(ctx, uid, scopedTenant, 'tenders'), where('ownerUid', '==', uid)),
     (snap) => {
       callbacks.onTenders(snap.docs.map((d) => docToTender(d.data())));
     },
@@ -1102,7 +1236,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubEmd = onSnapshot(
-    query(getTenantCollection(uid, safeTenant, 'emdRecords'), where('ownerUid', '==', uid)),
+    query(getScopedCollection(ctx, uid, scopedTenant, 'emdRecords'), where('ownerUid', '==', uid)),
     (snap) => {
       callbacks.onEmdRecords(snap.docs.map((d) => docToEmdRecord(d.data())));
     },
@@ -1116,7 +1250,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubMaf = onSnapshot(
-    query(getTenantCollection(uid, safeTenant, 'maf_tracker'), where('ownerUid', '==', uid)),
+    query(getScopedCollection(ctx, uid, scopedTenant, 'maf_tracker'), where('ownerUid', '==', uid)),
     (snap) => {
       callbacks.onMafTrackers(snap.docs.map((d) => docToMafTracker(d.data())));
     },
@@ -1130,7 +1264,10 @@ export function subscribeToUserCloudData(
   );
 
   const unsubFiles = onSnapshot(
-    query(getTenantCollection(uid, safeTenant, 'attachmentFiles'), where('ownerUid', '==', uid)),
+    query(
+      getScopedCollection(ctx, uid, scopedTenant, 'attachmentFiles'),
+      where('ownerUid', '==', uid),
+    ),
     (snap) => {
       const map = new Map<string, string>();
       for (const d of snap.docs) {
@@ -1151,7 +1288,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubEmailConfig = onSnapshot(
-    getTenantDoc(uid, safeTenant, 'emailConfig', 'default'),
+    getScopedDoc(ctx, uid, scopedTenant, 'emailConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onEmailConfig) {
         callbacks.onEmailConfig(docToEmailConfig(snap.data()));
@@ -1167,7 +1304,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubEmailAlerts = onSnapshot(
-    query(getTenantCollection(uid, safeTenant, 'emailAlerts'), where('ownerUid', '==', uid)),
+    query(getScopedCollection(ctx, uid, scopedTenant, 'emailAlerts'), where('ownerUid', '==', uid)),
     (snap) => {
       if (callbacks.onEmailAlerts) {
         const sorted = snap.docs
@@ -1186,7 +1323,7 @@ export function subscribeToUserCloudData(
   );
 
   const unsubSheetConfig = onSnapshot(
-    getTenantDoc(uid, safeTenant, 'sheetConfig', 'default'),
+    getScopedDoc(ctx, uid, scopedTenant, 'sheetConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onSheetConfig) {
         callbacks.onSheetConfig(docToSheetConfig(snap.data()));

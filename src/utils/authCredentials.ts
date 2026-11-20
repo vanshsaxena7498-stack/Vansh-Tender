@@ -43,6 +43,30 @@ export interface StoredCrmUserAccount {
   updatedAt: string;
   lastLoginAt?: string;
   isActive: boolean;
+  isEnabled?: boolean;
+  disabledAt?: string;
+  presenceStatus?: 'active' | 'not_active';
+  lastHeartbeatAt?: string;
+  lastLogoutAt?: string;
+  byocProjectId?: string;
+}
+
+export const PRESENCE_HEARTBEAT_TTL_MS = 90_000;
+
+export function computeEffectivePresenceStatus(
+  user: Pick<
+    StoredCrmUserAccount,
+    'isEnabled' | 'isActive' | 'presenceStatus' | 'lastHeartbeatAt'
+  >,
+  nowMs = Date.now(),
+): 'active' | 'not_active' {
+  const enabled = user.isEnabled !== undefined ? user.isEnabled !== false : user.isActive !== false;
+  if (!enabled) return 'not_active';
+  if (user.presenceStatus !== 'active') return 'not_active';
+  if (!user.lastHeartbeatAt) return 'not_active';
+  const hbMs = Date.parse(user.lastHeartbeatAt);
+  if (Number.isNaN(hbMs)) return 'not_active';
+  return nowMs - hbMs <= PRESENCE_HEARTBEAT_TTL_MS ? 'active' : 'not_active';
 }
 
 export interface SecondaryWorkspaceSnapshot {
@@ -232,6 +256,22 @@ function readUserStore(): Record<string, StoredCrmUserAccount> {
                 lastLoginAt:
                   typeof entry.lastLoginAt === 'string' ? entry.lastLoginAt : undefined,
                 isActive: entry.isActive !== false,
+                isEnabled:
+                  typeof entry.isEnabled === 'boolean'
+                    ? entry.isEnabled
+                    : entry.isActive !== false,
+                disabledAt:
+                  typeof entry.disabledAt === 'string' ? entry.disabledAt : undefined,
+                presenceStatus:
+                  entry.presenceStatus === 'active' || entry.presenceStatus === 'not_active'
+                    ? entry.presenceStatus
+                    : 'not_active',
+                lastHeartbeatAt:
+                  typeof entry.lastHeartbeatAt === 'string' ? entry.lastHeartbeatAt : undefined,
+                lastLogoutAt:
+                  typeof entry.lastLogoutAt === 'string' ? entry.lastLogoutAt : undefined,
+                byocProjectId:
+                  typeof entry.byocProjectId === 'string' ? entry.byocProjectId : undefined,
               };
             }
           }
@@ -375,6 +415,11 @@ export function registerSecondaryUserAccount(params: {
     updatedAt: now,
     lastLoginAt: prev?.lastLoginAt,
     isActive: true,
+    isEnabled: prev?.isEnabled !== false,
+    presenceStatus: prev?.presenceStatus ?? 'not_active',
+    lastHeartbeatAt: prev?.lastHeartbeatAt,
+    lastLogoutAt: prev?.lastLogoutAt,
+    byocProjectId: prev?.byocProjectId,
   };
   store[userId] = record;
   persistUserStore(store);
@@ -395,6 +440,12 @@ export function saveResetPasswordCredential(
     role?: CrmUserRole;
     createdAt?: string;
     lastLoginAt?: string;
+    isEnabled?: boolean;
+    disabledAt?: string;
+    presenceStatus?: 'active' | 'not_active';
+    lastHeartbeatAt?: string;
+    lastLogoutAt?: string;
+    byocProjectId?: string;
   },
 ): StoredCrmUserAccount {
   const store = readUserStore();
@@ -464,6 +515,13 @@ export function saveResetPasswordCredential(
         ? createPasswordHashRecord(existing.password)
         : undefined;
 
+  const nextEnabled =
+    extra?.isEnabled !== undefined
+      ? extra.isEnabled
+      : existing?.isEnabled !== undefined
+        ? existing.isEnabled
+        : true;
+
   const updated: StoredCrmUserAccount = {
     userId: targetUserId,
     username: cleanUsername,
@@ -474,7 +532,13 @@ export function saveResetPasswordCredential(
     createdAt: existing?.createdAt || extra?.createdAt || now,
     updatedAt: now,
     lastLoginAt: extra?.lastLoginAt || existing?.lastLoginAt,
-    isActive: true,
+    isActive: nextEnabled,
+    isEnabled: nextEnabled,
+    disabledAt: extra?.disabledAt ?? existing?.disabledAt,
+    presenceStatus: extra?.presenceStatus ?? existing?.presenceStatus ?? 'not_active',
+    lastHeartbeatAt: extra?.lastHeartbeatAt ?? existing?.lastHeartbeatAt,
+    lastLogoutAt: extra?.lastLogoutAt ?? existing?.lastLogoutAt,
+    byocProjectId: extra?.byocProjectId ?? existing?.byocProjectId,
   };
   store[targetUserId] = updated;
   persistUserStore(store);
@@ -490,6 +554,12 @@ export function syncAuthenticatedUserFromServer(params: {
   credentialToken?: string;
   createdAt?: string;
   lastLoginAt?: string;
+  isEnabled?: boolean;
+  disabledAt?: string;
+  presenceStatus?: 'active' | 'not_active';
+  lastHeartbeatAt?: string;
+  lastLogoutAt?: string;
+  byocProjectId?: string;
 }): StoredCrmUserAccount {
   return saveResetPasswordCredential(
     params.username,
@@ -501,8 +571,82 @@ export function syncAuthenticatedUserFromServer(params: {
       role: params.role,
       createdAt: params.createdAt,
       lastLoginAt: params.lastLoginAt || new Date().toISOString(),
+      isEnabled: params.isEnabled,
+      disabledAt: params.disabledAt,
+      presenceStatus: params.presenceStatus ?? 'active',
+      lastHeartbeatAt: params.lastHeartbeatAt,
+      lastLogoutAt: params.lastLogoutAt,
+      byocProjectId: params.byocProjectId,
     },
   );
+}
+
+export function setSecondaryUserEnabled(
+  identifierOrUserId: string,
+  isEnabled: boolean,
+  nowIso = new Date().toISOString(),
+): SecondaryUserSummary | null {
+  const store = readUserStore();
+  const match = store[identifierOrUserId] || findUserByIdentifier(identifierOrUserId);
+  if (!match || match.role === 'admin') return null;
+  const current = store[match.userId];
+  if (!current) return null;
+  current.isEnabled = isEnabled;
+  current.isActive = isEnabled;
+  current.disabledAt = isEnabled ? undefined : nowIso;
+  if (!isEnabled) {
+    current.presenceStatus = 'not_active';
+  }
+  current.updatedAt = nowIso;
+  store[match.userId] = current;
+  persistUserStore(store);
+  const livePresence = computeEffectivePresenceStatus(current);
+  return {
+    userId: current.userId,
+    username: current.username,
+    email: current.email,
+    role: 'secondary',
+    createdAt: current.createdAt,
+    lastLoginAt: current.lastLoginAt,
+    isActive: current.isEnabled !== false && livePresence === 'active',
+    isEnabled: current.isEnabled !== false,
+    disabledAt: current.disabledAt,
+    presenceStatus: livePresence,
+    lastHeartbeatAt: current.lastHeartbeatAt,
+    lastLogoutAt: current.lastLogoutAt,
+    byocProjectId: current.byocProjectId,
+  };
+}
+
+export function updateUserPresence(
+  identifierOrUserId: string,
+  status: 'active' | 'not_active',
+  extra?: { nowIso?: string; byocProjectId?: string },
+): void {
+  const store = readUserStore();
+  const match = store[identifierOrUserId] || findUserByIdentifier(identifierOrUserId);
+  if (!match) return;
+  const current = store[match.userId];
+  if (!current) return;
+  const nowIso = extra?.nowIso || new Date().toISOString();
+  if (current.isEnabled === false) {
+    current.presenceStatus = 'not_active';
+    current.isActive = false;
+  } else {
+    current.presenceStatus = status;
+    current.isActive = status === 'active';
+    if (status === 'active') {
+      current.lastHeartbeatAt = nowIso;
+    } else {
+      current.lastLogoutAt = nowIso;
+    }
+  }
+  if (extra?.byocProjectId !== undefined) {
+    current.byocProjectId = extra.byocProjectId;
+  }
+  current.updatedAt = nowIso;
+  store[match.userId] = current;
+  persistUserStore(store);
 }
 
 export function recordUserLoginActivity(identifier: string, lastLoginAt = new Date().toISOString()): void {
@@ -512,6 +656,8 @@ export function recordUserLoginActivity(identifier: string, lastLoginAt = new Da
   const current = store[match.userId];
   if (!current) return;
   current.lastLoginAt = lastLoginAt;
+  current.presenceStatus = current.isEnabled === false ? 'not_active' : 'active';
+  current.lastHeartbeatAt = lastLoginAt;
   store[match.userId] = current;
   persistUserStore(store);
 }
@@ -536,20 +682,30 @@ export function getAllStoredCredentialTokens(): string[] {
   return Array.from(tokens);
 }
 
-export function listSecondaryUsers(): SecondaryUserSummary[] {
+export function listSecondaryUsers(nowMs = Date.now()): SecondaryUserSummary[] {
   const store = readUserStore();
   return Object.values(store)
     .filter((u) => u.role === 'secondary')
     .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
-    .map((u) => ({
-      userId: u.userId,
-      username: u.username,
-      email: u.email,
-      role: 'secondary',
-      createdAt: u.createdAt,
-      lastLoginAt: u.lastLoginAt,
-      isActive: u.isActive !== false,
-    }));
+    .map((u) => {
+      const enabled = u.isEnabled !== undefined ? u.isEnabled !== false : u.isActive !== false;
+      const presence = computeEffectivePresenceStatus(u, nowMs);
+      return {
+        userId: u.userId,
+        username: u.username,
+        email: u.email,
+        role: 'secondary',
+        createdAt: u.createdAt,
+        lastLoginAt: u.lastLoginAt,
+        isActive: enabled && presence === 'active',
+        isEnabled: enabled,
+        disabledAt: u.disabledAt,
+        presenceStatus: presence,
+        lastHeartbeatAt: u.lastHeartbeatAt,
+        lastLogoutAt: u.lastLogoutAt,
+        byocProjectId: u.byocProjectId,
+      };
+    });
 }
 
 export function clearInMemoryPasswordOverrideForTests(): void {
@@ -559,6 +715,7 @@ export function clearInMemoryPasswordOverrideForTests(): void {
 
 export interface LoginValidationResult {
   ok: boolean;
+  code?: 'ACCOUNT_DISABLED' | 'INVALID_CREDENTIALS';
   user?: CrmUserSession;
   error?: string;
 }
@@ -569,16 +726,17 @@ export function validateLoginCredentials(
 ): LoginValidationResult {
   const trimmedUser = usernameOrEmailInput.trim();
   if (!trimmedUser) {
-    return { ok: false, error: 'Please enter your User ID or Email ID.' };
+    return { ok: false, code: 'INVALID_CREDENTIALS', error: 'Please enter your User ID or Email ID.' };
   }
   if (!passwordInput) {
-    return { ok: false, error: 'Please enter your Password.' };
+    return { ok: false, code: 'INVALID_CREDENTIALS', error: 'Please enter your Password.' };
   }
 
   const account = findUserByIdentifier(trimmedUser);
   if (!account) {
     return {
       ok: false,
+      code: 'INVALID_CREDENTIALS',
       error: 'Invalid User ID or password. Please check your credentials and try again.',
     };
   }
@@ -588,6 +746,7 @@ export function validateLoginCredentials(
   if (!isEmailInput && trimmedUser !== account.username && trimmedUser !== account.userId) {
     return {
       ok: false,
+      code: 'INVALID_CREDENTIALS',
       error: 'Invalid User ID or password. Please check your credentials and try again.',
     };
   }
@@ -604,7 +763,19 @@ export function validateLoginCredentials(
   if (!passwordValid) {
     return {
       ok: false,
+      code: 'INVALID_CREDENTIALS',
       error: 'Invalid User ID or password. Please check your credentials and try again.',
+    };
+  }
+
+  const isEnabled =
+    account.isEnabled !== undefined ? account.isEnabled !== false : account.isActive !== false;
+  if (!isEnabled && account.role !== 'admin') {
+    return {
+      ok: false,
+      code: 'ACCOUNT_DISABLED',
+      error:
+        'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to re-enable access.',
     };
   }
 
@@ -617,6 +788,9 @@ export function validateLoginCredentials(
       role: account.role,
       createdAt: account.createdAt,
       lastLoginAt: account.lastLoginAt,
+      isEnabled: true,
+      presenceStatus: 'active',
+      byocProjectId: account.byocProjectId,
     },
   };
 }

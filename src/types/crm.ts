@@ -48,15 +48,23 @@ export interface Tender {
   id: string;
   tenderId: string;
   portal: PortalType;
+  clientName?: string;
   department: string;
+  locationDepartment?: string;
   location: string;
   category: string;
   title: string;
   publishDate: string;
   submissionDueDate: string; // YYYY-MM-DDTHH:mm
   preBidDate?: string;
+  technicalOpeningDate?: string;
+  financialOpeningDate?: string;
   estimatedValue: number;
   quotedValue: number;
+  l1BidderName?: string;
+  l1QuotedValue?: number;
+  ourPositionRank?: string;
+  assignedOwner?: string;
   emdStatus: EmdSecurityType;
   emdAmount: number;
   stage: TenderStage;
@@ -122,16 +130,24 @@ export interface ExtractedBidDraft {
   tenderId: string;
   portal: PortalType;
   stage: TenderStage;
+  clientName?: string;
   department: string;
+  locationDepartment?: string;
   location: string;
   title: string;
   category: string;
   publishDate: string;
   submissionDueDate: string;
   preBidDate: string;
+  technicalOpeningDate?: string;
+  financialOpeningDate?: string;
   completionDate: string;
   estimatedValue: number;
   quotedValue: number;
+  l1BidderName?: string;
+  l1QuotedValue?: number;
+  ourPositionRank?: string;
+  assignedOwner?: string;
   emdStatus: EmdSecurityType;
   emdAmount: number;
   resultInfo: string;
@@ -237,6 +253,30 @@ export interface CrmBackupPayload {
 
 export type CrmUserRole = 'admin' | 'secondary';
 
+export type PresenceStatus = 'active' | 'not_active';
+
+export interface ByocFirebaseConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+  appId: string;
+  firestoreDatabaseId?: string;
+  updatedAt?: string;
+  verifiedAt?: string;
+}
+
+export type ByocConnectionStatus = 'pending' | 'auth_required' | 'connected' | 'error';
+
+export interface ByocConnectionState {
+  status: ByocConnectionStatus;
+  message?: string;
+  projectId?: string;
+  databaseId?: string;
+  verifiedAt?: string;
+}
+
 export interface CrmUserSession {
   userId: string;
   username: string;
@@ -244,6 +284,14 @@ export interface CrmUserSession {
   role: CrmUserRole;
   createdAt?: string;
   lastLoginAt?: string;
+  isEnabled?: boolean;
+  disabledAt?: string;
+  presenceStatus?: PresenceStatus;
+  lastHeartbeatAt?: string;
+  lastLogoutAt?: string;
+  byocProjectId?: string;
+  byocDatabaseId?: string;
+  byocConfig?: ByocFirebaseConfig | null;
 }
 
 export interface SecondaryUserSummary {
@@ -254,4 +302,11 @@ export interface SecondaryUserSummary {
   createdAt: string;
   lastLoginAt?: string;
   isActive: boolean;
+  isEnabled?: boolean;
+  disabledAt?: string;
+  presenceStatus?: PresenceStatus;
+  lastHeartbeatAt?: string;
+  lastLogoutAt?: string;
+  byocProjectId?: string;
 }
+

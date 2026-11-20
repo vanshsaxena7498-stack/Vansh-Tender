@@ -218,9 +218,17 @@
           "enum": ["GeM", "CPPP / eProcure", "State Portal", "PSU / Direct", "Private"],
           "maxLength": 40
         },
+        "clientName": {
+          "type": "string",
+          "maxLength": 200
+        },
         "department": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 200
+        },
+        "locationDepartment": {
+          "type": "string",
           "maxLength": 200
         },
         "location": {
@@ -249,11 +257,34 @@
           "type": "string",
           "maxLength": 32
         },
+        "technicalOpeningDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "financialOpeningDate": {
+          "type": "string",
+          "maxLength": 32
+        },
         "estimatedValue": {
           "type": "number"
         },
         "quotedValue": {
           "type": "number"
+        },
+        "l1BidderName": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "l1QuotedValue": {
+          "type": "number"
+        },
+        "ourPositionRank": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "assignedOwner": {
+          "type": "string",
+          "maxLength": 100
         },
         "emdStatus": {
           "type": "string",
@@ -317,15 +348,23 @@
         "id",
         "tenderId",
         "portal",
+        "clientName",
         "department",
+        "locationDepartment",
         "location",
         "category",
         "title",
         "publishDate",
         "submissionDueDate",
         "preBidDate",
+        "technicalOpeningDate",
+        "financialOpeningDate",
         "estimatedValue",
         "quotedValue",
+        "l1BidderName",
+        "l1QuotedValue",
+        "ourPositionRank",
+        "assignedOwner",
         "emdStatus",
         "emdAmount",
         "stage",
@@ -758,6 +797,26 @@
         "isActive": {
           "type": "boolean"
         },
+        "isEnabled": {
+          "type": "boolean"
+        },
+        "presenceStatus": {
+          "type": "string",
+          "enum": ["active", "not_active"],
+          "maxLength": 20
+        },
+        "lastHeartbeatAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "lastLogoutAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "byocProjectId": {
+          "type": "string",
+          "maxLength": 128
+        },
         "clientCreatedAt": {
           "type": "string",
           "maxLength": 40
@@ -782,6 +841,11 @@
         "email",
         "role",
         "isActive",
+        "isEnabled",
+        "presenceStatus",
+        "lastHeartbeatAt",
+        "lastLogoutAt",
+        "byocProjectId",
         "clientCreatedAt",
         "clientLastLoginAt",
         "createdAt",

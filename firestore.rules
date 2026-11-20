@@ -239,15 +239,23 @@ service cloud.firestore {
           'id',
           'tenderId',
           'portal',
+          'clientName',
           'department',
+          'locationDepartment',
           'location',
           'category',
           'title',
           'publishDate',
           'submissionDueDate',
           'preBidDate',
+          'technicalOpeningDate',
+          'financialOpeningDate',
           'estimatedValue',
           'quotedValue',
+          'l1BidderName',
+          'l1QuotedValue',
+          'ourPositionRank',
+          'assignedOwner',
           'emdStatus',
           'emdAmount',
           'stage',
@@ -266,15 +274,23 @@ service cloud.firestore {
           'id',
           'tenderId',
           'portal',
+          'clientName',
           'department',
+          'locationDepartment',
           'location',
           'category',
           'title',
           'publishDate',
           'submissionDueDate',
           'preBidDate',
+          'technicalOpeningDate',
+          'financialOpeningDate',
           'estimatedValue',
           'quotedValue',
+          'l1BidderName',
+          'l1QuotedValue',
+          'ourPositionRank',
+          'assignedOwner',
           'emdStatus',
           'emdAmount',
           'stage',
@@ -299,9 +315,13 @@ service cloud.firestore {
         data.portal is string &&
         data.portal.size() <= 40 &&
         isValidPortal(data.portal) &&
+        data.clientName is string &&
+        data.clientName.size() <= 200 &&
         data.department is string &&
         data.department.size() >= 1 &&
         data.department.size() <= 200 &&
+        data.locationDepartment is string &&
+        data.locationDepartment.size() <= 200 &&
         data.location is string &&
         data.location.size() <= 120 &&
         data.category is string &&
@@ -316,10 +336,22 @@ service cloud.firestore {
         data.submissionDueDate.size() <= 32 &&
         data.preBidDate is string &&
         data.preBidDate.size() <= 32 &&
+        data.technicalOpeningDate is string &&
+        data.technicalOpeningDate.size() <= 32 &&
+        data.financialOpeningDate is string &&
+        data.financialOpeningDate.size() <= 32 &&
         data.estimatedValue is number &&
         data.estimatedValue >= 0 &&
         data.quotedValue is number &&
         data.quotedValue >= 0 &&
+        data.l1BidderName is string &&
+        data.l1BidderName.size() <= 200 &&
+        data.l1QuotedValue is number &&
+        data.l1QuotedValue >= 0 &&
+        data.ourPositionRank is string &&
+        data.ourPositionRank.size() <= 40 &&
+        data.assignedOwner is string &&
+        data.assignedOwner.size() <= 100 &&
         data.emdStatus is string &&
         data.emdStatus.size() <= 40 &&
         isValidEmdStatus(data.emdStatus) &&
@@ -642,6 +674,11 @@ service cloud.firestore {
           'email',
           'role',
           'isActive',
+          'isEnabled',
+          'presenceStatus',
+          'lastHeartbeatAt',
+          'lastLogoutAt',
+          'byocProjectId',
           'clientCreatedAt',
           'clientLastLoginAt',
           'createdAt',
@@ -654,6 +691,11 @@ service cloud.firestore {
           'email',
           'role',
           'isActive',
+          'isEnabled',
+          'presenceStatus',
+          'lastHeartbeatAt',
+          'lastLogoutAt',
+          'byocProjectId',
           'clientCreatedAt',
           'clientLastLoginAt',
           'createdAt',
@@ -670,6 +712,16 @@ service cloud.firestore {
         data.email.size() <= 160 &&
         data.role == 'secondary' &&
         data.isActive is bool &&
+        data.isEnabled is bool &&
+        data.presenceStatus is string &&
+        data.presenceStatus.size() <= 20 &&
+        data.presenceStatus in ['active', 'not_active'] &&
+        data.lastHeartbeatAt is string &&
+        data.lastHeartbeatAt.size() <= 40 &&
+        data.lastLogoutAt is string &&
+        data.lastLogoutAt.size() <= 40 &&
+        data.byocProjectId is string &&
+        data.byocProjectId.size() <= 128 &&
         data.clientCreatedAt is string &&
         data.clientCreatedAt.size() <= 40 &&
         data.clientLastLoginAt is string &&
@@ -712,6 +764,12 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     // Collection Rules
     // -------------------------------------------------------------------------
+    match /test/connection {
+      allow get: if isVerifiedUser();
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
     match /admins/{uid} {
       allow get: if isVerifiedUser() && isValidId(uid) && (request.auth.uid == uid || isAdmin());
       allow list: if false;
@@ -936,15 +994,23 @@ service cloud.firestore {
                   'id',
                   'tenderId',
                   'portal',
+                  'clientName',
                   'department',
+                  'locationDepartment',
                   'location',
                   'category',
                   'title',
                   'publishDate',
                   'submissionDueDate',
                   'preBidDate',
+                  'technicalOpeningDate',
+                  'financialOpeningDate',
                   'estimatedValue',
                   'quotedValue',
+                  'l1BidderName',
+                  'l1QuotedValue',
+                  'ourPositionRank',
+                  'assignedOwner',
                   'emdStatus',
                   'emdAmount',
                   'stage',
@@ -1459,15 +1525,23 @@ service cloud.firestore {
                 incoming().diff(existing()).affectedKeys().hasOnly([
                   'tenderId',
                   'portal',
+                  'clientName',
                   'department',
+                  'locationDepartment',
                   'location',
                   'category',
                   'title',
                   'publishDate',
                   'submissionDueDate',
                   'preBidDate',
+                  'technicalOpeningDate',
+                  'financialOpeningDate',
                   'estimatedValue',
                   'quotedValue',
+                  'l1BidderName',
+                  'l1QuotedValue',
+                  'ourPositionRank',
+                  'assignedOwner',
                   'emdStatus',
                   'emdAmount',
                   'stage',
@@ -1783,6 +1857,10 @@ service cloud.firestore {
               'username',
               'email',
               'isActive',
+              'presenceStatus',
+              'lastHeartbeatAt',
+              'lastLogoutAt',
+              'byocProjectId',
               'clientLastLoginAt',
               'updatedAt'
             ])

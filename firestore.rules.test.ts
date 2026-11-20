@@ -86,15 +86,23 @@ function isValidTender(
     'id',
     'tenderId',
     'portal',
+    'clientName',
     'department',
+    'locationDepartment',
     'location',
     'category',
     'title',
     'publishDate',
     'submissionDueDate',
     'preBidDate',
+    'technicalOpeningDate',
+    'financialOpeningDate',
     'estimatedValue',
     'quotedValue',
+    'l1BidderName',
+    'l1QuotedValue',
+    'ourPositionRank',
+    'assignedOwner',
     'emdStatus',
     'emdAmount',
     'stage',
@@ -186,15 +194,23 @@ function makeBaseTender(uid: string, id = 't1'): Record<string, unknown> {
     id,
     tenderId: 'GEM/2026/B/1001',
     portal: 'GeM',
+    clientName: 'CPWD Delhi',
     department: 'CPWD Delhi',
+    locationDepartment: 'CPWD Delhi',
     location: 'New Delhi',
     category: 'IT Hardware',
     title: 'Supply of Enterprise Workstations',
     publishDate: '2026-04-01',
     submissionDueDate: '2026-05-01T15:00',
     preBidDate: '',
+    technicalOpeningDate: '',
+    financialOpeningDate: '',
     estimatedValue: 1000000,
     quotedValue: 950000,
+    l1BidderName: '',
+    l1QuotedValue: 0,
+    ourPositionRank: '',
+    assignedOwner: 'Vansh Saxena',
     emdStatus: 'EMD Paid',
     emdAmount: 25000,
     stage: 'Submitted',
@@ -526,6 +542,96 @@ test('GoogleSheetConfig Firestore rules enforce ownership, HTTPS webhook URLs, a
     false,
   );
 });
+
+function isValidSecondaryUserRecord(
+  data: Record<string, unknown>,
+  secondaryUserId: string,
+): boolean {
+  const keys = [
+    'ownerUid',
+    'userId',
+    'username',
+    'email',
+    'role',
+    'isActive',
+    'isEnabled',
+    'presenceStatus',
+    'lastHeartbeatAt',
+    'lastLogoutAt',
+    'byocProjectId',
+    'clientCreatedAt',
+    'clientLastLoginAt',
+    'createdAt',
+    'updatedAt',
+  ];
+  if (!hasExactKeys(data, keys, keys)) return false;
+  return (
+    isValidId(data.ownerUid) &&
+    isValidId(data.userId) &&
+    data.userId === secondaryUserId &&
+    typeof data.username === 'string' &&
+    data.username.length >= 1 &&
+    data.username.length <= 64 &&
+    typeof data.email === 'string' &&
+    data.email.length >= 5 &&
+    data.email.length <= 160 &&
+    data.role === 'secondary' &&
+    typeof data.isActive === 'boolean' &&
+    typeof data.isEnabled === 'boolean' &&
+    (data.presenceStatus === 'active' || data.presenceStatus === 'not_active') &&
+    typeof data.lastHeartbeatAt === 'string' &&
+    data.lastHeartbeatAt.length <= 40 &&
+    typeof data.lastLogoutAt === 'string' &&
+    data.lastLogoutAt.length <= 40 &&
+    typeof data.byocProjectId === 'string' &&
+    data.byocProjectId.length <= 128 &&
+    data.createdAt === SERVER_TIME &&
+    data.updatedAt === SERVER_TIME
+  );
+}
+
+test('SecondaryUserRecord enforces presence enum, isEnabled lock, and blocks non-admin enabling themselves', () => {
+  const validSec: Record<string, unknown> = {
+    ownerUid: 'u2',
+    userId: 'sec_niyan_12ab',
+    username: 'Niyan',
+    email: 'info.niyantrana@gmail.com',
+    role: 'secondary',
+    isActive: true,
+    isEnabled: true,
+    presenceStatus: 'active',
+    lastHeartbeatAt: '2026-11-20T05:30:00.000Z',
+    lastLogoutAt: '',
+    byocProjectId: 'niyan-byoc-project-1',
+    clientCreatedAt: '2026-11-18T10:00:00.000Z',
+    clientLastLoginAt: '2026-11-20T05:25:00.000Z',
+    createdAt: SERVER_TIME,
+    updatedAt: SERVER_TIME,
+  };
+  assert.equal(isValidSecondaryUserRecord(validSec, 'sec_niyan_12ab'), true);
+  assert.equal(
+    isValidSecondaryUserRecord({ ...validSec, presenceStatus: 'online' }, 'sec_niyan_12ab'),
+    false,
+  );
+  // Secondary user cannot mutate isEnabled field on update
+  const ownerUpdatableKeys = new Set([
+    'username',
+    'email',
+    'isActive',
+    'presenceStatus',
+    'lastHeartbeatAt',
+    'lastLogoutAt',
+    'byocProjectId',
+    'clientLastLoginAt',
+    'updatedAt',
+  ]);
+  const changed = affectedKeys(
+    { ...validSec, isEnabled: true },
+    { ...validSec, isEnabled: false },
+  );
+  assert.equal(changed.every((k) => ownerUpdatableKeys.has(k)), false);
+});
+
 
 
 

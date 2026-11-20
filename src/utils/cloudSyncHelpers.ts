@@ -23,6 +23,9 @@ export const CLOUD_LIMITS = {
   CLIENT_ISO_MAX: 40,
   RESULT_INFO_MAX: 1000,
   REMARKS_TEXT_MAX: 1000,
+  OWNER_NAME_MAX: 100,
+  RANK_MAX: 40,
+  PROJECT_ID_MAX: 128,
   FIRM_NAME_MAX: 150,
   GSTIN_MAX: 32,
   UDYAM_MAX: 40,
@@ -154,12 +157,15 @@ export function buildCloudTenderPayload<TTime>(
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
   const safeId = sanitizeDocId(tender.id);
+  const dept = clampStr(tender.department.trim() || 'Department', CLOUD_LIMITS.DEPARTMENT_MAX);
   return {
     ownerUid: sanitizeDocId(ownerUid),
     id: safeId,
     tenderId: clampStr(tender.tenderId.trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX),
     portal: tender.portal,
-    department: clampStr(tender.department.trim() || 'Department', CLOUD_LIMITS.DEPARTMENT_MAX),
+    clientName: clampStr((tender.clientName ?? '').trim() || dept, CLOUD_LIMITS.DEPARTMENT_MAX),
+    department: dept,
+    locationDepartment: clampStr((tender.locationDepartment ?? '').trim() || dept, CLOUD_LIMITS.DEPARTMENT_MAX),
     location: clampStr(tender.location, CLOUD_LIMITS.LOCATION_MAX),
     category: clampStr(tender.category, CLOUD_LIMITS.CATEGORY_MAX),
     title: clampStr(tender.title.trim() || 'Untitled Tender', CLOUD_LIMITS.TITLE_MAX),
@@ -169,8 +175,14 @@ export function buildCloudTenderPayload<TTime>(
       CLOUD_LIMITS.DATE_MAX,
     ),
     preBidDate: clampStr(tender.preBidDate, CLOUD_LIMITS.DATE_MAX),
+    technicalOpeningDate: clampStr(tender.technicalOpeningDate, CLOUD_LIMITS.DATE_MAX),
+    financialOpeningDate: clampStr(tender.financialOpeningDate, CLOUD_LIMITS.DATE_MAX),
     estimatedValue: clampNonNegativeNumber(tender.estimatedValue),
     quotedValue: clampNonNegativeNumber(tender.quotedValue),
+    l1BidderName: clampStr(tender.l1BidderName, CLOUD_LIMITS.DEPARTMENT_MAX),
+    l1QuotedValue: clampNonNegativeNumber(tender.l1QuotedValue),
+    ourPositionRank: clampStr(tender.ourPositionRank, CLOUD_LIMITS.RANK_MAX),
+    assignedOwner: clampStr(tender.assignedOwner, CLOUD_LIMITS.OWNER_NAME_MAX),
     emdStatus: tender.emdStatus,
     emdAmount: clampNonNegativeNumber(tender.emdAmount),
     stage: tender.stage,
@@ -468,6 +480,11 @@ export function buildSecondaryUserCloudPayload<TTime>(
     username: string;
     email: string;
     isActive?: boolean;
+    isEnabled?: boolean;
+    presenceStatus?: 'active' | 'not_active';
+    lastHeartbeatAt?: string;
+    lastLogoutAt?: string;
+    byocProjectId?: string;
     createdAtIso?: string;
     lastLoginAtIso?: string;
   },
@@ -475,17 +492,26 @@ export function buildSecondaryUserCloudPayload<TTime>(
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
   const safeEmail = params.email.trim().toLowerCase();
+  const isEnabled = params.isEnabled !== false && params.isActive !== false;
+  const presenceStatus =
+    isEnabled && params.presenceStatus === 'active' ? 'active' : 'not_active';
   return {
     ownerUid: sanitizeDocId(params.ownerUid),
     userId: sanitizeDocId(params.userId),
     username: clampStr(params.username.trim() || 'User', 64),
     email: clampStr(safeEmail.length >= 5 ? safeEmail : 'user@example.com', 160),
     role: 'secondary',
-    isActive: params.isActive !== false,
+    isActive: isEnabled && presenceStatus === 'active',
+    isEnabled,
+    presenceStatus,
+    lastHeartbeatAt: clampStr(params.lastHeartbeatAt || '', 40),
+    lastLogoutAt: clampStr(params.lastLogoutAt || '', 40),
+    byocProjectId: clampStr(params.byocProjectId || '', CLOUD_LIMITS.PROJECT_ID_MAX),
     clientCreatedAt: clampStr(params.createdAtIso || new Date().toISOString(), 40),
     clientLastLoginAt: clampStr(params.lastLoginAtIso || '', 40),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
   };
 }
+
 

@@ -109,18 +109,18 @@ export function Header({
   }, [notifOpen]);
 
   return (
-    <header className="sticky top-0 z-30 flex items-center justify-between gap-4 px-4 sm:px-6 h-16 bg-white dark:bg-[#0B1120] border-b border-slate-200 dark:border-slate-800">
-      <div className="flex items-center gap-3 min-w-0">
+    <header className="sticky top-0 z-30 flex items-center justify-between gap-2 sm:gap-4 px-3 sm:px-6 h-16 bg-white dark:bg-[#0B1120] border-b border-slate-200 dark:border-slate-800">
+      <div className="flex items-center gap-2 sm:gap-3 flex-1 min-w-0">
         <button
           type="button"
           onClick={onOpenMobileMenu}
           aria-label="Open navigation menu"
-          className="lg:hidden rounded-lg p-2 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+          className="lg:hidden rounded-lg p-2 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
         >
           <Menu className="h-5 w-5" />
         </button>
-        <div className="min-w-0">
-          <h1 className="font-display text-base sm:text-lg font-semibold text-slate-900 dark:text-white truncate">
+        <div className="min-w-0 flex-1">
+          <h1 className="font-display text-sm sm:text-lg font-semibold text-slate-900 dark:text-white truncate">
             {activeTab === 'settings' && currentUser?.role === 'secondary'
               ? 'Workspace Settings & Backups'
               : TAB_TITLES[activeTab]}
@@ -131,7 +131,7 @@ export function Header({
         </div>
       </div>
 
-      <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+      <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
         <button
           type="button"
           onClick={cloudUser ? onOpenCloudSettings : onConnectCloud}
@@ -143,7 +143,7 @@ export function Header({
                 ? 'Google Cloud backup connected'
                 : 'Connect Google Cloud backup'
           }
-          className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
+          className={`flex items-center gap-1.5 p-2 sm:px-3 sm:py-2 rounded-lg border text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
             cloudError
               ? 'border-red-200 dark:border-red-800 bg-red-50/80 dark:bg-red-950/40 text-red-700 dark:text-red-300 hover:bg-red-100/70 dark:hover:bg-red-950/60'
               : cloudUser
@@ -198,7 +198,7 @@ export function Header({
                     : 'Configure Google Sheet Sync'
           }
           data-testid="sheet-sync-badge"
-          className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+          className={`flex items-center gap-1.5 p-2 sm:px-3 sm:py-2 rounded-lg border text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
             sheetSyncStatus === 'error'
               ? 'border-red-200 dark:border-red-800 bg-red-50/80 dark:bg-red-950/40 text-red-700 dark:text-red-300 hover:bg-red-100/70 dark:hover:bg-red-950/60'
               : sheetSyncStatus === 'synced' || sheetSyncStatus === 'idle'
@@ -254,7 +254,7 @@ export function Header({
             onClick={() => setNotifOpen((prev) => !prev)}
             aria-label={`Notifications (${notifications.length} alerts)`}
             aria-expanded={notifOpen}
-            className="relative flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-medium whitespace-nowrap shrink-0 transition-colors"
+            className="relative flex items-center gap-1.5 p-2 sm:px-3 sm:py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-medium whitespace-nowrap shrink-0 transition-colors"
           >
             <Bell className="h-4 w-4" aria-hidden="true" />
             <span className="hidden sm:inline">Alerts</span>
@@ -380,7 +380,7 @@ export function Header({
           type="button"
           onClick={onToggleDarkMode}
           aria-label={darkMode ? 'Switch to Day Mode' : 'Switch to Dark Mode'}
-          className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-medium whitespace-nowrap shrink-0"
+          className="flex items-center gap-1.5 p-2 sm:px-3 sm:py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 text-xs font-medium whitespace-nowrap shrink-0"
         >
           {darkMode ? (
             <>
@@ -398,10 +398,11 @@ export function Header({
         <button
           type="button"
           onClick={onLogout}
-          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+          aria-label="Log Out"
+          className="flex items-center gap-1.5 p-2 sm:px-3 sm:py-2 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
         >
           <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
-          <span>Log Out</span>
+          <span className="hidden sm:inline">Log Out</span>
         </button>
       </div>
     </header>

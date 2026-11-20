@@ -1,6 +1,7 @@
 import { signInWithPopup } from 'firebase/auth';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRightCircle,
   CheckCircle2,
@@ -23,6 +24,7 @@ import {
   Trophy,
   User,
   UserPlus,
+  X,
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
 import type { CrmUserSession } from '../types/crm';
@@ -45,6 +47,8 @@ interface LoginPageProps {
     rememberMe: boolean,
     serverMeta?: { credentialToken?: string; adminSessionToken?: string },
   ) => void;
+  disabledNotice?: string | null;
+  onDismissDisabledNotice?: () => void;
 }
 
 function VanshBrandEmblem({ className = 'h-10 w-10' }: { className?: string }) {
@@ -91,7 +95,11 @@ const FEATURE_HIGHLIGHTS = [
   { label: 'Task Management', icon: ClipboardCheck },
 ];
 
-export function LoginPage({ onLoginSuccess }: LoginPageProps) {
+export function LoginPage({
+  onLoginSuccess,
+  disabledNotice = null,
+  onDismissDisabledNotice,
+}: LoginPageProps) {
   const [authView, setAuthView] = useState<'login' | 'reset' | 'signup'>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -100,6 +108,20 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [disabledModalMessage, setDisabledModalMessage] = useState<string | null>(
+    disabledNotice ?? null,
+  );
+
+  useEffect(() => {
+    if (disabledNotice) {
+      setDisabledModalMessage(disabledNotice);
+    }
+  }, [disabledNotice]);
+
+  const handleDismissDisabledModal = () => {
+    setDisabledModalMessage(null);
+    onDismissDisabledNotice?.();
+  };
 
   // Forgot Password / Reset Password flow (per-user identifier -> attached Gmail OTP -> New Password)
   const [resetMode, setResetMode] = useState<'request' | 'verify_otp' | 'set_password'>('request');
@@ -185,6 +207,7 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
       });
       const parsed = await safeReadJsonResponse<{
         ok?: boolean;
+        code?: string;
         username?: string;
         user?: CrmUserSession;
         credentialToken?: string;
@@ -197,6 +220,11 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         const localCheck = validateLoginCredentials(trimmedUser, password);
         if (localCheck.ok && localCheck.user) {
           onLoginSuccess(localCheck.user, rememberMe);
+        } else if (localCheck.code === 'ACCOUNT_DISABLED') {
+          setDisabledModalMessage(
+            localCheck.error ||
+              'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+          );
         } else {
           setErrorMsg(
             localCheck.error ||
@@ -205,6 +233,15 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         }
         return;
       }
+
+      if (res.status === 403 || data.code === 'ACCOUNT_DISABLED') {
+        setDisabledModalMessage(
+          data.error ||
+            'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+        );
+        return;
+      }
+
       if (!res.ok || !data.ok) {
         setErrorMsg(
           data.error || 'Invalid User ID or password. Please check your credentials and try again.',
@@ -218,10 +255,17 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
         email: ADMIN_RECOVERY_EMAIL,
         role: 'admin',
       };
+      if (resolvedUser.role === 'secondary' && resolvedUser.isEnabled === false) {
+        setDisabledModalMessage(
+          'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+        );
+        return;
+      }
       syncAuthenticatedUserFromServer({
         ...resolvedUser,
         password,
         credentialToken: data.credentialToken,
+        byocProjectId: resolvedUser.byocProjectId,
       });
       onLoginSuccess(resolvedUser, rememberMe, {
         credentialToken: data.credentialToken,
@@ -231,6 +275,11 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
       const localCheck = validateLoginCredentials(trimmedUser, password);
       if (localCheck.ok && localCheck.user) {
         onLoginSuccess(localCheck.user, rememberMe);
+      } else if (localCheck.code === 'ACCOUNT_DISABLED') {
+        setDisabledModalMessage(
+          localCheck.error ||
+            'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+        );
       } else {
         setErrorMsg(
           localCheck.error || 'Unable to reach authentication server. Please retry.',
@@ -1802,6 +1851,62 @@ export function LoginPage({ onLoginSuccess }: LoginPageProps) {
           </div>
         </div>
       </footer>
+
+      {disabledModalMessage && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="account-disabled-title"
+          data-testid="account-disabled-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-xs"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-red-200 bg-white shadow-2xl overflow-hidden">
+            <div className="flex items-start justify-between gap-3 bg-red-50 px-5 py-4 border-b border-red-100">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-100 text-red-600">
+                  <AlertTriangle className="h-5 w-5" aria-hidden="true" />
+                </div>
+                <div>
+                  <h3
+                    id="account-disabled-title"
+                    className="font-display text-base font-bold text-slate-900"
+                  >
+                    Account Access Disabled
+                  </h3>
+                  <p className="text-xs text-red-700 font-medium">
+                    Blocked by Primary Administrator
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleDismissDisabledModal}
+                aria-label="Close account disabled notice"
+                className="p-1.5 rounded-lg text-slate-500 hover:bg-red-100/70 hover:text-slate-800 cursor-pointer"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <p className="text-sm text-slate-700 leading-relaxed">{disabledModalMessage}</p>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600">
+                Only the Primary Administrator (<span className="font-semibold text-slate-800">VanshSales</span>) can re-enable this secondary CRM user ID from Admin Settings.
+              </div>
+              <div className="flex justify-end pt-1">
+                <button
+                  type="button"
+                  onClick={handleDismissDisabledModal}
+                  data-testid="dismiss-disabled-modal-btn"
+                  className="px-4 py-2 rounded-lg bg-[#0F5BD8] hover:bg-[#0A46AD] text-white text-xs font-semibold cursor-pointer"
+                >
+                  Understood / Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

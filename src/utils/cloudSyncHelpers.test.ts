@@ -343,6 +343,11 @@ test('buildWorkspaceRootPayload and buildSecondaryUserCloudPayload enforce bound
       username: '  RohanDesk  ',
       email: '  Rohan.Desk@GMAIL.COM ',
       isActive: true,
+      isEnabled: true,
+      presenceStatus: 'active',
+      lastHeartbeatAt: '2026-11-20T05:30:00.000Z',
+      lastLogoutAt: '',
+      byocProjectId: 'rohan-byoc-cloud',
       createdAtIso: '2026-11-18T10:00:00.000Z',
     },
     TOKEN,
@@ -353,9 +358,62 @@ test('buildWorkspaceRootPayload and buildSecondaryUserCloudPayload enforce bound
   assert.equal(secUserPayload.email, 'rohan.desk@gmail.com');
   assert.equal(secUserPayload.role, 'secondary');
   assert.equal(secUserPayload.isActive, true);
+  assert.equal(secUserPayload.isEnabled, true);
+  assert.equal(secUserPayload.presenceStatus, 'active');
+  assert.equal(secUserPayload.lastHeartbeatAt, '2026-11-20T05:30:00.000Z');
+  assert.equal(secUserPayload.lastLogoutAt, '');
+  assert.equal(secUserPayload.byocProjectId, 'rohan-byoc-cloud');
   assert.equal(secUserPayload.clientCreatedAt, '2026-11-18T10:00:00.000Z');
   assert.equal(secUserPayload.clientLastLoginAt, '');
+  assert.equal(Object.keys(secUserPayload).length, 15);
 });
+
+test('buildCloudTenderPayload includes all 33 blueprint keys with expanded MIS fields', () => {
+  const tender: Tender = {
+    id: 'mis-tnd-1',
+    tenderId: 'GEM/2026/B/7788',
+    portal: 'GeM',
+    clientName: 'Indian Army Signals',
+    department: 'Ministry of Defence',
+    locationDepartment: 'Signals / Panchkula',
+    location: 'Panchkula, Haryana',
+    category: 'UPS',
+    title: 'Supply of 10 KVA UPS',
+    publishDate: '2026-11-01',
+    submissionDueDate: '2026-11-15T15:00',
+    preBidDate: '2026-11-05T11:00',
+    technicalOpeningDate: '2026-11-18',
+    financialOpeningDate: '2026-11-25',
+    estimatedValue: 1200000,
+    quotedValue: 1120000,
+    l1BidderName: 'Saxena Corp',
+    l1QuotedValue: 1120000,
+    ourPositionRank: 'L1',
+    assignedOwner: 'Vansh',
+    emdStatus: 'EMD Paid',
+    emdAmount: 30000,
+    stage: 'L1 / Won',
+    resultInfo: 'Awarded',
+    completionDate: '2026-11-25',
+    checklist: [],
+    remarks: [],
+    attachments: [],
+    createdAt: '2026-11-01T08:00:00Z',
+    updatedAt: '2026-11-25T10:00:00Z',
+  };
+
+  const payload = buildCloudTenderPayload(tender, 'uid-admin-1', TOKEN);
+  assert.equal(Object.keys(payload).length, 33);
+  assert.equal(payload.clientName, 'Indian Army Signals');
+  assert.equal(payload.locationDepartment, 'Signals / Panchkula');
+  assert.equal(payload.technicalOpeningDate, '2026-11-18');
+  assert.equal(payload.financialOpeningDate, '2026-11-25');
+  assert.equal(payload.l1BidderName, 'Saxena Corp');
+  assert.equal(payload.l1QuotedValue, 1120000);
+  assert.equal(payload.ourPositionRank, 'L1');
+  assert.equal(payload.assignedOwner, 'Vansh');
+});
+
 
 
 
