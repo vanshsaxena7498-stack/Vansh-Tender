@@ -2003,7 +2003,7 @@ export function SettingsTab({
             <p className="text-xs font-medium text-slate-800 dark:text-slate-200">
               {confirmAction === 'reset'
                 ? 'Restore all 8 pre-loaded Indian Government/GeM demo tenders and 7 EMD/BG records? Existing edits will be overwritten.'
-                : 'Clear all tenders and EMD/BG records to start with an empty CRM sheet?'}
+                : 'Clear local tenders, MAF trackers, and EMD/BG records from this CRM workspace? Your Google Cloud / BYOC and Google Sheet backups remain untouched and can be restored anytime via "Restore from Cloud".'}
             </p>
             <div className="flex items-center gap-2">
               <button
@@ -2021,7 +2021,10 @@ export function SettingsTab({
                     setBackupMsg({ type: 'ok', msg: 'Sample Indian tender & EMD/BG demo data restored.' });
                   } else {
                     onClearAllData();
-                    setBackupMsg({ type: 'ok', msg: 'All tenders and EMD/BG records cleared.' });
+                    setBackupMsg({
+                      type: 'ok',
+                      msg: 'Local CRM workspace cleared. Google Cloud / BYOC & Google Sheet backups remain preserved (use "Restore from Cloud" to reload).',
+                    });
                   }
                   setConfirmAction(null);
                 }}

@@ -348,16 +348,131 @@ export function findUserByIdentifier(identifier: string): StoredCrmUserAccount |
   const normalized = identifier.trim().toLowerCase();
   if (!normalized) return null;
   const store = readUserStore();
+  let bestMatch: StoredCrmUserAccount | null = null;
   for (const user of Object.values(store)) {
     if (
       user.userId.toLowerCase() === normalized ||
       user.username.toLowerCase() === normalized ||
       user.email.toLowerCase() === normalized
     ) {
-      return { ...user };
+      if (
+        !bestMatch ||
+        (user.updatedAt || '') > (bestMatch.updatedAt || '') ||
+        ((user.updatedAt || '') === (bestMatch.updatedAt || '') &&
+          user.userId === identifier.trim())
+      ) {
+        bestMatch = user;
+      }
     }
   }
-  return null;
+  return bestMatch ? { ...bestMatch } : null;
+}
+
+export function deduplicateSecondaryUsers(items: SecondaryUserSummary[]): SecondaryUserSummary[] {
+  const byEmail = new Map<string, SecondaryUserSummary>();
+  const pickLatestIso = (a?: string, b?: string): string | undefined => {
+    if (a && b) return a >= b ? a : b;
+    return a || b;
+  };
+  const pickEarliestIso = (a?: string, b?: string): string => {
+    if (a && b) return a <= b ? a : b;
+    return a || b || new Date().toISOString();
+  };
+  const getRecencyIso = (u: SecondaryUserSummary): string =>
+    [u.disabledAt, u.lastHeartbeatAt, u.lastLoginAt, u.lastLogoutAt, u.createdAt]
+      .filter((v): v is string => typeof v === 'string' && v.length > 0)
+      .sort()
+      .pop() || '';
+
+  for (const item of items) {
+    if (!item?.userId || !item.email) continue;
+    const normEmail = item.email.trim().toLowerCase();
+    const key = normEmail || item.userId.trim().toLowerCase();
+    const prev = byEmail.get(key);
+    const aliasSet = new Set<string>([
+      item.userId,
+      ...(item.aliasUserIds ?? []),
+      ...(prev ? [prev.userId, ...(prev.aliasUserIds ?? [])] : []),
+    ]);
+
+    if (!prev) {
+      byEmail.set(key, {
+        ...item,
+        email: normEmail,
+        role: 'secondary',
+        isEnabled: item.isEnabled !== undefined ? item.isEnabled !== false : true,
+        aliasUserIds: Array.from(aliasSet),
+      });
+      continue;
+    }
+
+    const incomingRecency = getRecencyIso(item);
+    const prevRecency = getRecencyIso(prev);
+    const preferIncoming =
+      incomingRecency > prevRecency ||
+      (incomingRecency === prevRecency &&
+        Boolean(item.byocProjectId) &&
+        !prev.byocProjectId);
+
+    const primary = preferIncoming ? item : prev;
+    const secondary = preferIncoming ? prev : item;
+
+    const latestHeartbeat = pickLatestIso(item.lastHeartbeatAt, prev.lastHeartbeatAt);
+    const latestLogin = pickLatestIso(item.lastLoginAt, prev.lastLoginAt);
+    const latestLogout = pickLatestIso(item.lastLogoutAt, prev.lastLogoutAt);
+    const latestDisabled = pickLatestIso(item.disabledAt, prev.disabledAt);
+    const nextIsEnabled =
+      primary.isEnabled !== undefined
+        ? primary.isEnabled !== false
+        : secondary.isEnabled !== undefined
+          ? secondary.isEnabled !== false
+          : true;
+
+    byEmail.set(key, {
+      ...secondary,
+      ...primary,
+      userId: primary.userId,
+      username: primary.username || secondary.username,
+      email: normEmail,
+      role: 'secondary',
+      createdAt: pickEarliestIso(prev.createdAt, item.createdAt),
+      lastLoginAt: latestLogin,
+      lastHeartbeatAt: latestHeartbeat,
+      lastLogoutAt: latestLogout,
+      disabledAt: nextIsEnabled ? undefined : latestDisabled,
+      isEnabled: nextIsEnabled,
+      isActive:
+        nextIsEnabled &&
+        computeEffectivePresenceStatus({
+          isEnabled: nextIsEnabled,
+          isActive: primary.isActive || secondary.isActive,
+          presenceStatus:
+            primary.presenceStatus === 'active' || secondary.presenceStatus === 'active'
+              ? 'active'
+              : 'not_active',
+          lastHeartbeatAt: latestHeartbeat,
+        }) === 'active',
+      presenceStatus:
+        nextIsEnabled &&
+        computeEffectivePresenceStatus({
+          isEnabled: nextIsEnabled,
+          isActive: primary.isActive || secondary.isActive,
+          presenceStatus:
+            primary.presenceStatus === 'active' || secondary.presenceStatus === 'active'
+              ? 'active'
+              : 'not_active',
+          lastHeartbeatAt: latestHeartbeat,
+        }) === 'active'
+          ? 'active'
+          : 'not_active',
+      byocProjectId: primary.byocProjectId || secondary.byocProjectId,
+      aliasUserIds: Array.from(aliasSet),
+    });
+  }
+
+  return Array.from(byEmail.values()).sort((a, b) =>
+    (b.createdAt || '').localeCompare(a.createdAt || ''),
+  );
 }
 
 export function registerSecondaryUserAccount(params: {
@@ -585,36 +700,95 @@ export function setSecondaryUserEnabled(
   identifierOrUserId: string,
   isEnabled: boolean,
   nowIso = new Date().toISOString(),
+  metadata?: {
+    username?: string;
+    email?: string;
+    aliasUserIds?: string[];
+    byocProjectId?: string;
+    createdAt?: string;
+  },
 ): SecondaryUserSummary | null {
   const store = readUserStore();
-  const match = store[identifierOrUserId] || findUserByIdentifier(identifierOrUserId);
-  if (!match || match.role === 'admin') return null;
-  const current = store[match.userId];
-  if (!current) return null;
-  current.isEnabled = isEnabled;
-  current.isActive = isEnabled;
-  current.disabledAt = isEnabled ? undefined : nowIso;
-  if (!isEnabled) {
-    current.presenceStatus = 'not_active';
+  const normalizedInput = identifierOrUserId.trim().toLowerCase();
+  const normalizedEmail = metadata?.email?.trim().toLowerCase() || '';
+  const candidateIds = new Set<string>(
+    [identifierOrUserId.trim(), ...(metadata?.aliasUserIds ?? [])].filter(Boolean),
+  );
+
+  let primaryMatch =
+    store[identifierOrUserId] ||
+    findUserByIdentifier(identifierOrUserId) ||
+    (normalizedEmail ? findUserByIdentifier(normalizedEmail) : null);
+
+  if (!primaryMatch && metadata?.username && normalizedEmail) {
+    if (
+      metadata.username.trim().toLowerCase() === VALID_LOGIN_USERNAME.toLowerCase() ||
+      normalizedEmail === ADMIN_RECOVERY_EMAIL.toLowerCase()
+    ) {
+      return null;
+    }
+    const created: StoredCrmUserAccount = {
+      userId: identifierOrUserId.trim() || `sec_${sanitizeUserIdSlug(metadata.username)}`,
+      username: metadata.username.trim(),
+      email: normalizedEmail,
+      role: 'secondary',
+      createdAt: metadata.createdAt || nowIso,
+      updatedAt: nowIso,
+      isActive: isEnabled,
+      isEnabled,
+      disabledAt: isEnabled ? undefined : nowIso,
+      presenceStatus: 'not_active',
+      byocProjectId: metadata.byocProjectId,
+    };
+    store[created.userId] = created;
+    primaryMatch = created;
   }
-  current.updatedAt = nowIso;
-  store[match.userId] = current;
+
+  if (!primaryMatch || primaryMatch.role === 'admin') return null;
+
+  const targetEmail = (normalizedEmail || primaryMatch.email || '').trim().toLowerCase();
+  const collectedAliases = new Set<string>([primaryMatch.userId, ...candidateIds]);
+
+  for (const [id, entry] of Object.entries(store)) {
+    if (entry.role === 'admin') continue;
+    const matchesAlias =
+      candidateIds.has(id) ||
+      candidateIds.has(entry.userId) ||
+      entry.userId.toLowerCase() === normalizedInput ||
+      entry.username.toLowerCase() === normalizedInput ||
+      (targetEmail && entry.email.toLowerCase() === targetEmail);
+    if (!matchesAlias) continue;
+
+    collectedAliases.add(entry.userId);
+    entry.isEnabled = isEnabled;
+    entry.isActive = isEnabled ? computeEffectivePresenceStatus(entry) === 'active' : false;
+    entry.disabledAt = isEnabled ? undefined : nowIso;
+    if (!isEnabled) {
+      entry.presenceStatus = 'not_active';
+    }
+    entry.updatedAt = nowIso;
+    store[id] = entry;
+  }
+
   persistUserStore(store);
-  const livePresence = computeEffectivePresenceStatus(current);
+
+  const canonical = store[primaryMatch.userId] || primaryMatch;
+  const livePresence = computeEffectivePresenceStatus(canonical);
   return {
-    userId: current.userId,
-    username: current.username,
-    email: current.email,
+    userId: canonical.userId,
+    username: canonical.username,
+    email: canonical.email,
     role: 'secondary',
-    createdAt: current.createdAt,
-    lastLoginAt: current.lastLoginAt,
-    isActive: current.isEnabled !== false && livePresence === 'active',
-    isEnabled: current.isEnabled !== false,
-    disabledAt: current.disabledAt,
+    createdAt: canonical.createdAt,
+    lastLoginAt: canonical.lastLoginAt,
+    isActive: canonical.isEnabled !== false && livePresence === 'active',
+    isEnabled: canonical.isEnabled !== false,
+    disabledAt: canonical.disabledAt,
     presenceStatus: livePresence,
-    lastHeartbeatAt: current.lastHeartbeatAt,
-    lastLogoutAt: current.lastLogoutAt,
-    byocProjectId: current.byocProjectId,
+    lastHeartbeatAt: canonical.lastHeartbeatAt,
+    lastLogoutAt: canonical.lastLogoutAt,
+    byocProjectId: canonical.byocProjectId,
+    aliasUserIds: Array.from(collectedAliases),
   };
 }
 
@@ -684,9 +858,8 @@ export function getAllStoredCredentialTokens(): string[] {
 
 export function listSecondaryUsers(nowMs = Date.now()): SecondaryUserSummary[] {
   const store = readUserStore();
-  return Object.values(store)
+  const rawSummaries: SecondaryUserSummary[] = Object.values(store)
     .filter((u) => u.role === 'secondary')
-    .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
     .map((u) => {
       const enabled = u.isEnabled !== undefined ? u.isEnabled !== false : u.isActive !== false;
       const presence = computeEffectivePresenceStatus(u, nowMs);
@@ -706,6 +879,7 @@ export function listSecondaryUsers(nowMs = Date.now()): SecondaryUserSummary[] {
         byocProjectId: u.byocProjectId,
       };
     });
+  return deduplicateSecondaryUsers(rawSummaries);
 }
 
 export function clearInMemoryPasswordOverrideForTests(): void {
@@ -768,9 +942,21 @@ export function validateLoginCredentials(
     };
   }
 
+  const store = readUserStore();
+  const matchedEmail = (account.email || '').trim().toLowerCase();
+  const hasDisabledAlias =
+    account.role !== 'admin' &&
+    matchedEmail.length > 0 &&
+    Object.values(store).some(
+      (u) =>
+        u.role === 'secondary' &&
+        u.email.trim().toLowerCase() === matchedEmail &&
+        (u.isEnabled !== undefined ? u.isEnabled === false : u.isActive === false),
+    );
+
   const isEnabled =
     account.isEnabled !== undefined ? account.isEnabled !== false : account.isActive !== false;
-  if (!isEnabled && account.role !== 'admin') {
+  if ((!isEnabled || hasDisabledAlias) && account.role !== 'admin') {
     return {
       ok: false,
       code: 'ACCOUNT_DISABLED',

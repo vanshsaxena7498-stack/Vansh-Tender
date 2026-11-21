@@ -492,7 +492,8 @@ export function buildSecondaryUserCloudPayload<TTime>(
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
   const safeEmail = params.email.trim().toLowerCase();
-  const isEnabled = params.isEnabled !== false && params.isActive !== false;
+  const isEnabled =
+    typeof params.isEnabled === 'boolean' ? params.isEnabled : params.isActive !== false;
   const presenceStatus =
     isEnabled && params.presenceStatus === 'active' ? 'active' : 'not_active';
   return {
@@ -514,4 +515,88 @@ export function buildSecondaryUserCloudPayload<TTime>(
   };
 }
 
+export function normalizeAdminFirestoreTimestamp(val: unknown, fallback = ''): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    return new Date(val).toISOString();
+  }
+  if (val && typeof val === 'object') {
+    const maybeTs = val as { toDate?: () => Date; seconds?: number };
+    if (typeof maybeTs.toDate === 'function') {
+      try {
+        return maybeTs.toDate().toISOString();
+      } catch {
+        return fallback;
+      }
+    }
+    if (typeof maybeTs.seconds === 'number' && Number.isFinite(maybeTs.seconds)) {
+      return new Date(maybeTs.seconds * 1000).toISOString();
+    }
+  }
+  return fallback;
+}
+
+export function isLegacyDocExcludedFromAdmin(
+  data: Record<string, unknown>,
+  knownAdminUids: ReadonlySet<string>,
+  excludedSecondaryOwnerUids: ReadonlySet<string>,
+): boolean {
+  const tenantId = typeof data.tenantId === 'string' ? data.tenantId.trim() : '';
+  if (tenantId && tenantId !== 'admin_vanshsales') {
+    return true;
+  }
+  const workspaceUserId = typeof data.userId === 'string' ? data.userId.trim() : '';
+  if (workspaceUserId.startsWith('sec_')) {
+    return true;
+  }
+  const ownerEmail = typeof data.ownerEmail === 'string' ? data.ownerEmail.trim().toLowerCase() : '';
+  if (ownerEmail && ownerEmail !== 'vanshsaxena7498@gmail.com') {
+    return true;
+  }
+  const docOwner = typeof data.ownerUid === 'string' ? data.ownerUid.trim() : '';
+  if (!docOwner) {
+    return false;
+  }
+  if (knownAdminUids.has(docOwner)) {
+    return false;
+  }
+  if (docOwner.startsWith('sec_') || excludedSecondaryOwnerUids.has(docOwner)) {
+    return true;
+  }
+  return false;
+}
+
+export function mergeAdminRecordsById<T extends { id: string }>(
+  primary: T[],
+  supplemental: T[],
+): T[] {
+  const byId = new Map<string, T>();
+  for (const item of primary) {
+    if (!item?.id) continue;
+    if (!byId.has(item.id)) {
+      byId.set(item.id, item);
+    }
+  }
+  for (const item of supplemental) {
+    if (!item?.id) continue;
+    if (!byId.has(item.id)) {
+      byId.set(item.id, item);
+    }
+  }
+  return Array.from(byId.values());
+}
+
+export function mergeAdminAttachmentMaps(
+  primary: ReadonlyMap<string, string>,
+  supplemental: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const combined = new Map<string, string>();
+  for (const [k, v] of supplemental.entries()) {
+    if (v) combined.set(k, v);
+  }
+  for (const [k, v] of primary.entries()) {
+    if (v) combined.set(k, v);
+  }
+  return combined;
+}
 

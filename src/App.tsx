@@ -69,6 +69,7 @@ import {
   ADMIN_RECOVERY_EMAIL,
   ADMIN_USER_ID,
   buildEmptySecondaryWorkspace,
+  deduplicateSecondaryUsers,
   getAllStoredCredentialTokens,
   getStoredCredentialToken,
   listSecondaryUsers,
@@ -83,10 +84,14 @@ import { computeNotifications } from './utils/calculations';
 import {
   backupAllToCloud,
   clearCloudSessionCache,
+  type CloudTargetContext,
+  type CloudWorkspaceDataset,
+  createEmptyCloudDataset,
   deleteEmdRecordFromCloud,
   deleteMafTrackerFromCloud,
   deleteTenderFromCloud,
   ensureUserRootDocument,
+  fetchAdminCloudWorkspaceWithFallback,
   fetchAllFromCloud,
   fetchSecondaryUsersFromCloud,
   getCentralAdminCloudTarget,
@@ -102,9 +107,10 @@ import {
   syncSheetConfigToCloud,
   syncTenderToCloud,
   uploadMafDocumentFile,
-  type CloudTargetContext,
 } from './utils/cloudSync';
 import {
+  mergeAdminAttachmentMaps,
+  mergeAdminRecordsById,
   mergeCloudEmdWithFiles,
   mergeCloudMafTrackersWithFiles,
   mergeCloudProfileWithLocal,
@@ -127,7 +133,7 @@ import {
 import { safeReadJsonResponse } from './utils/httpHelpers';
 import {
   buildTenderAttachmentExtractionSignature,
-  findTenderAttachmentSlot,
+  evaluateTenderMafAttachmentGate,
   mergeAutoMafIntoTrackers,
   type ExtractedSpecItem,
 } from './utils/mafAutoGenerate';
@@ -302,7 +308,10 @@ export default function App() {
   const dispatchedEmailKeysRef = useRef<Set<string>>(new Set());
   const emailRetryStateRef = useRef<Map<string, EmailRetryRecord>>(new Map());
   const mafExtractionSignatureRef = useRef<Map<string, string>>(new Map());
+  const mafExtractionInFlightRef = useRef<Set<string>>(new Set());
+  const localWorkspaceClearedRef = useRef<boolean>(false);
   const adminOfflineSnapshotRef = useRef<SecondaryWorkspaceSnapshot | null>(null);
+  const adminSupplementalRef = useRef<CloudWorkspaceDataset>(createEmptyCloudDataset());
   const activeRoleRef = useRef<'admin' | 'secondary' | null>(null);
   const activeCrmUserIdRef = useRef<string | null>(null);
 
@@ -555,13 +564,23 @@ export default function App() {
         }
       }
 
+      localWorkspaceClearedRef.current = false;
       setCloudSyncing(true);
       try {
         await ensureUserRootDocument(activeCloudUser, activeTenantId, currentUser, targetRef);
         if (cancelled) return;
 
-        const cloud = await fetchAllFromCloud(cloudUid, activeTenantId, targetRef);
-        if (cancelled) return;
+        let cloud: CloudWorkspaceDataset;
+        if (currentUser.role === 'admin') {
+          const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(activeCloudUser);
+          if (cancelled) return;
+          adminSupplementalRef.current = adminWorkspace.supplemental;
+          cloud = adminWorkspace.merged;
+        } else {
+          adminSupplementalRef.current = createEmptyCloudDataset();
+          cloud = await fetchAllFromCloud(cloudUid, activeTenantId, targetRef);
+          if (cancelled) return;
+        }
 
         attachmentFilesRef.current = cloud.attachmentFiles;
 
@@ -644,6 +663,7 @@ export default function App() {
 
         if (cancelled) return;
 
+        const isAdminSession = currentUser.role === 'admin';
         unsubCloud = subscribeToUserCloudData(
           cloudUid,
           {
@@ -670,32 +690,51 @@ export default function App() {
               markSyncedNow();
             },
             onEmailAlerts: (remoteLogs) => {
-              setEmailLogs((prev) => mergeEmailLogs(remoteLogs, prev));
+              const combinedLogs = isAdminSession
+                ? mergeAdminRecordsById(remoteLogs, adminSupplementalRef.current.emailAlerts)
+                : remoteLogs;
+              setEmailLogs((prev) => mergeEmailLogs(combinedLogs, prev));
               markSyncedNow();
             },
             onTenders: (remoteTenders) => {
+              if (localWorkspaceClearedRef.current) return;
+              const combinedTenders = isAdminSession
+                ? mergeAdminRecordsById(remoteTenders, adminSupplementalRef.current.tenders)
+                : remoteTenders;
               setTenders((prev) =>
-                mergeCloudTendersWithFiles(remoteTenders, attachmentFilesRef.current, prev),
+                mergeCloudTendersWithFiles(combinedTenders, attachmentFilesRef.current, prev),
               );
               markSyncedNow();
             },
             onEmdRecords: (remoteEmd) => {
+              if (localWorkspaceClearedRef.current) return;
+              const combinedEmd = isAdminSession
+                ? mergeAdminRecordsById(remoteEmd, adminSupplementalRef.current.emdRecords)
+                : remoteEmd;
               setEmdRecords((prev) =>
-                mergeCloudEmdWithFiles(remoteEmd, attachmentFilesRef.current, prev),
+                mergeCloudEmdWithFiles(combinedEmd, attachmentFilesRef.current, prev),
               );
               markSyncedNow();
             },
             onMafTrackers: (remoteMaf) => {
+              if (localWorkspaceClearedRef.current) return;
+              const combinedMaf = isAdminSession
+                ? mergeAdminRecordsById(remoteMaf, adminSupplementalRef.current.mafTrackers)
+                : remoteMaf;
               setMafTrackers((prev) =>
-                mergeCloudMafTrackersWithFiles(remoteMaf, attachmentFilesRef.current, prev),
+                mergeCloudMafTrackersWithFiles(combinedMaf, attachmentFilesRef.current, prev),
               );
               markSyncedNow();
             },
             onAttachmentFiles: (remoteFiles) => {
-              attachmentFilesRef.current = remoteFiles;
-              setTenders((prev) => mergeCloudTendersWithFiles(prev, remoteFiles, prev));
-              setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, remoteFiles, prev));
-              setMafTrackers((prev) => mergeCloudMafTrackersWithFiles(prev, remoteFiles, prev));
+              if (localWorkspaceClearedRef.current) return;
+              const combinedFiles = isAdminSession
+                ? mergeAdminAttachmentMaps(remoteFiles, adminSupplementalRef.current.attachmentFiles)
+                : remoteFiles;
+              attachmentFilesRef.current = combinedFiles;
+              setTenders((prev) => mergeCloudTendersWithFiles(prev, combinedFiles, prev));
+              setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, combinedFiles, prev));
+              setMafTrackers((prev) => mergeCloudMafTrackersWithFiles(prev, combinedFiles, prev));
               markSyncedNow();
             },
             onError: (err) => {
@@ -766,6 +805,7 @@ export default function App() {
   };
 
   const handleConnectCloud = async () => {
+    localWorkspaceClearedRef.current = false;
     setCloudFeedback(null);
     const session = stateRef.current.currentUser;
     if (session?.role === 'secondary') {
@@ -849,19 +889,34 @@ export default function App() {
       workspaceTenantId: tenantId,
     } = stateRef.current;
     const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
+    const preserveExistingCloud = localWorkspaceClearedRef.current;
+    localWorkspaceClearedRef.current = false;
     void runCloudTask(
       (user, target) =>
-        replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId, target),
-      `Synced ${curTenders.length} tenders, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
+        preserveExistingCloud
+          ? backupAllToCloud(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId, target)
+          : replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId, target),
+      preserveExistingCloud
+        ? `Synced ${curTenders.length} local tenders, ${curMaf.length} MAF trackers & ${curEmd.length} EMD/BG records non-destructively to Firestore.`
+        : `Synced ${curTenders.length} tenders, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
     );
   };
 
   const handleRestoreFromCloud = () => {
+    localWorkspaceClearedRef.current = false;
     const tenantId = stateRef.current.workspaceTenantId;
     const userSession = stateRef.current.currentUser;
     void runCloudTask(async (user, target) => {
       await ensureUserRootDocument(user, tenantId, userSession, target);
-      const cloud = await fetchAllFromCloud(user.uid, tenantId, target);
+      let cloud: CloudWorkspaceDataset;
+      if (userSession?.role === 'admin') {
+        const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(user);
+        adminSupplementalRef.current = adminWorkspace.supplemental;
+        cloud = adminWorkspace.merged;
+      } else {
+        adminSupplementalRef.current = createEmptyCloudDataset();
+        cloud = await fetchAllFromCloud(user.uid, tenantId, target);
+      }
       attachmentFilesRef.current = cloud.attachmentFiles;
       if (cloud.profile) {
         setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
@@ -869,6 +924,22 @@ export default function App() {
       if (cloud.preferences) {
         setAdminPin(cloud.preferences.adminPin);
         setDarkMode(cloud.preferences.darkMode);
+      }
+      if (cloud.emailConfig) {
+        setEmailSettings(cloud.emailConfig);
+      }
+      if (cloud.sheetConfig) {
+        setSheetSettings(cloud.sheetConfig);
+        setSheetSyncStatus(
+          cloud.sheetConfig.webhookUrl
+            ? cloud.sheetConfig.lastSyncedAt
+              ? 'synced'
+              : 'idle'
+            : 'unconfigured',
+        );
+      }
+      if (cloud.emailAlerts.length > 0) {
+        setEmailLogs((prev) => mergeEmailLogs(cloud.emailAlerts, prev));
       }
       setTenders((prev) =>
         mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
@@ -897,65 +968,43 @@ export default function App() {
       return;
     }
 
-    const merged = new Map<string, SecondaryUserSummary>();
-    const upsertAll = (items: SecondaryUserSummary[]) => {
-      for (const item of items) {
-        if (!item?.userId || !item.email) continue;
-        const key = item.userId.trim().toLowerCase();
-        const prev = merged.get(key);
-        const pickLatest = (a?: string, b?: string) => (a && (!b || a > b) ? a : b);
-        const isIncomingNewer =
-          !prev ||
-          (item.lastHeartbeatAt && (!prev.lastHeartbeatAt || item.lastHeartbeatAt >= prev.lastHeartbeatAt)) ||
-          (item.disabledAt && (!prev.disabledAt || item.disabledAt >= prev.disabledAt));
-        merged.set(key, {
-          ...prev,
-          ...item,
-          role: 'secondary',
-          lastLoginAt: pickLatest(item.lastLoginAt, prev?.lastLoginAt),
-          lastHeartbeatAt: pickLatest(item.lastHeartbeatAt, prev?.lastHeartbeatAt),
-          byocProjectId: item.byocProjectId || prev?.byocProjectId,
-          isEnabled: isIncomingNewer
-            ? (item.isEnabled !== undefined ? item.isEnabled : prev?.isEnabled ?? true)
-            : (prev?.isEnabled !== undefined ? prev.isEnabled : item.isEnabled ?? true),
-        });
-      }
-    };
+    const collected: SecondaryUserSummary[] = [...listSecondaryUsers()];
+    const fbUser = stateRef.current.firebaseUser;
+    const isAdminGoogle =
+      Boolean(fbUser) &&
+      (fbUser?.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase();
+    const firebaseIdToken = isAdminGoogle && fbUser ? await fbUser.getIdToken().catch(() => '') : '';
 
-    upsertAll(listSecondaryUsers());
-
-    if (adminSessionToken) {
+    if (adminSessionToken || firebaseIdToken) {
       try {
         const res = await fetch('/api/auth/secondary-users', {
-          headers: { 'x-crm-admin-token': adminSessionToken },
+          headers: {
+            ...(adminSessionToken ? { 'x-crm-admin-token': adminSessionToken } : {}),
+            ...(firebaseIdToken ? { 'x-firebase-id-token': firebaseIdToken } : {}),
+          },
         });
         const parsed = await safeReadJsonResponse<{
           ok?: boolean;
           users?: SecondaryUserSummary[];
         }>(res);
         if (parsed.ok && Array.isArray(parsed.data?.users)) {
-          upsertAll(parsed.data.users);
+          collected.push(...parsed.data.users);
         }
       } catch {
         // Non-fatal fallback to local + cloud lists
       }
     }
 
-    const fbUser = stateRef.current.firebaseUser;
-    if (fbUser && (fbUser.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()) {
+    if (isAdminGoogle && fbUser) {
       try {
         const cloudUsers = await fetchSecondaryUsersFromCloud(fbUser);
-        upsertAll(cloudUsers);
+        collected.push(...cloudUsers);
       } catch {
         // Non-fatal if rules/network delay occurs
       }
     }
 
-    setSecondaryUsers(
-      Array.from(merged.values()).sort((a, b) =>
-        (b.createdAt || '').localeCompare(a.createdAt || ''),
-      ),
-    );
+    setSecondaryUsers(deduplicateSecondaryUsers(collected));
   };
 
   useEffect(() => {
@@ -1109,20 +1158,33 @@ export default function App() {
 
   const handleToggleSecondaryUserStatus = async (targetUserId: string, enable: boolean) => {
     if (stateRef.current.currentUser?.role !== 'admin') return;
-    const targetSummary = secondaryUsers.find((u) => u.userId === targetUserId);
+    const targetSummary = secondaryUsers.find(
+      (u) => u.userId === targetUserId || (u.aliasUserIds ?? []).includes(targetUserId),
+    );
     setTogglingSecondaryUserId(targetUserId);
     try {
+      const fbUser = stateRef.current.firebaseUser;
+      const isAdminGoogle =
+        Boolean(fbUser) &&
+        (fbUser?.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase();
+      const firebaseIdToken =
+        isAdminGoogle && fbUser ? await fbUser.getIdToken().catch(() => '') : '';
+
       const res = await fetch('/api/auth/secondary-users/status', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(adminSessionToken ? { 'x-crm-admin-token': adminSessionToken } : {}),
+          ...(firebaseIdToken ? { 'x-firebase-id-token': firebaseIdToken } : {}),
         },
         body: JSON.stringify({
           userId: targetUserId,
           username: targetSummary?.username,
           email: targetSummary?.email,
+          aliasUserIds: targetSummary?.aliasUserIds,
+          byocProjectId: targetSummary?.byocProjectId,
           isEnabled: enable,
+          ...(firebaseIdToken ? { firebaseIdToken } : {}),
           clientCredentialTokens: getAllStoredCredentialTokens(),
         }),
       });
@@ -1142,7 +1204,14 @@ export default function App() {
         return;
       }
 
-      const updatedLocal = setSecondaryUserEnabled(targetUserId, enable);
+      const nowIso = new Date().toISOString();
+      const updatedLocal = setSecondaryUserEnabled(targetUserId, enable, nowIso, {
+        username: targetSummary?.username,
+        email: targetSummary?.email,
+        aliasUserIds: targetSummary?.aliasUserIds,
+        byocProjectId: targetSummary?.byocProjectId,
+        createdAt: targetSummary?.createdAt,
+      });
       if (parsed.data.credentialToken && (parsed.data.user || targetSummary)) {
         const refUser = parsed.data.user || targetSummary!;
         saveResetPasswordCredential(refUser.username, '', parsed.data.credentialToken, {
@@ -1150,7 +1219,7 @@ export default function App() {
           email: refUser.email,
           role: 'secondary',
           isEnabled: enable,
-          disabledAt: enable ? undefined : new Date().toISOString(),
+          disabledAt: enable ? undefined : nowIso,
           presenceStatus: enable ? refUser.presenceStatus ?? 'not_active' : 'not_active',
           byocProjectId: refUser.byocProjectId,
         });
@@ -1165,19 +1234,29 @@ export default function App() {
               isEnabled: enable,
               isActive: false,
               presenceStatus: enable ? targetSummary.presenceStatus ?? 'not_active' : 'not_active',
-              disabledAt: enable ? undefined : new Date().toISOString(),
+              disabledAt: enable ? undefined : nowIso,
             }
           : null);
 
       if (nextRecord) {
+        const targetNormEmail = (nextRecord.email || targetSummary?.email || '').trim().toLowerCase();
         setSecondaryUsers((prev) =>
-          prev.map((u) => (u.userId === targetUserId ? { ...u, ...nextRecord } : u)),
+          deduplicateSecondaryUsers(
+            prev.map((u) =>
+              u.userId === targetUserId ||
+              (targetNormEmail && u.email.trim().toLowerCase() === targetNormEmail) ||
+              (u.aliasUserIds ?? []).includes(targetUserId)
+                ? {
+                    ...u,
+                    ...nextRecord,
+                    isEnabled: enable,
+                    disabledAt: enable ? undefined : nextRecord.disabledAt || nowIso,
+                  }
+                : u,
+            ),
+          ),
         );
-        const fbUser = stateRef.current.firebaseUser;
-        if (
-          fbUser &&
-          (fbUser.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()
-        ) {
+        if (isAdminGoogle && fbUser) {
           void syncSecondaryUserToCloud(fbUser, nextRecord).catch(() => {
             // Non-fatal if central Firestore sync fails
           });
@@ -1495,19 +1574,21 @@ export default function App() {
   };
 
   const triggerAutoMafFromTender = async (tender: Tender): Promise<void> => {
-    const att1 = findTenderAttachmentSlot(tender.attachments, 1);
-    const att2 = findTenderAttachmentSlot(tender.attachments, 2);
+    const gate = evaluateTenderMafAttachmentGate(
+      tender,
+      (att) => att.dataUrl || attachmentFilesRef.current.get(att.id) || '',
+    );
 
-    const resolveDataUrl = (att?: { id: string; dataUrl: string }) => {
-      if (!att) return '';
-      return att.dataUrl || attachmentFilesRef.current.get(att.id) || '';
-    };
+    // Strict Gate: Do NOT start/create MAF Status entries until BOTH Attachment 1 (Bid Document)
+    // AND Attachment 2 (Specification Document) are present on the tender.
+    if (!gate.ready || !gate.attachment1 || !gate.attachment2) {
+      return;
+    }
 
-    const att1DataUrl = resolveDataUrl(att1);
-    const att2DataUrl = resolveDataUrl(att2);
-
-    // Attachment 2 (Specification / BOQ document) drives per-item breakdown
-    if (!att2 || !att2DataUrl) return;
+    const att1 = gate.attachment1;
+    const att2 = gate.attachment2;
+    const att1DataUrl = gate.attachment1DataUrl;
+    const att2DataUrl = gate.attachment2DataUrl;
 
     const sig = buildTenderAttachmentExtractionSignature(tender);
     const prevSig = mafExtractionSignatureRef.current.get(tender.id);
@@ -1518,23 +1599,21 @@ export default function App() {
         (normalizedTenderCode && t.tenderId.trim().toLowerCase() === normalizedTenderCode),
     );
 
-    if (prevSig === sig && hasExistingTracker) {
+    if ((prevSig === sig && hasExistingTracker) || mafExtractionInFlightRef.current.has(sig)) {
       return;
     }
 
+    mafExtractionInFlightRef.current.add(sig);
     try {
       const res = await fetch('/api/maf/extract-from-attachments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          attachment1:
-            att1 && att1DataUrl
-              ? {
-                  fileName: att1.fileName,
-                  mimeType: att1.fileType,
-                  dataUrl: att1DataUrl,
-                }
-              : null,
+          attachment1: {
+            fileName: att1.fileName,
+            mimeType: att1.fileType,
+            dataUrl: att1DataUrl,
+          },
           attachment2: {
             fileName: att2.fileName,
             mimeType: att2.fileType,
@@ -1595,6 +1674,8 @@ export default function App() {
       }
     } catch {
       // Non-fatal: tender save itself already succeeded
+    } finally {
+      mafExtractionInFlightRef.current.delete(sig);
     }
   };
 
@@ -1820,9 +1901,11 @@ export default function App() {
   };
 
   const handleUpdateTenderInline = (rawUpdated: Tender) => {
+    const nowIso = new Date().toISOString();
     const updated: Tender = {
       ...rawUpdated,
-      updatedAt: new Date().toISOString(),
+      updatedAt: nowIso,
+      lastUpdatedAt: nowIso,
     };
     cacheAttachmentPayloads(updated.attachments);
     const nextTenders = stateRef.current.tenders.map((t) =>
@@ -1861,6 +1944,9 @@ export default function App() {
 
   const handleDeleteTender = (id: string) => {
     const deletedTender = stateRef.current.tenders.find((t) => t.id === id) ?? null;
+    adminSupplementalRef.current.tenders = adminSupplementalRef.current.tenders.filter(
+      (t) => t.id !== id,
+    );
     const nextTenders = stateRef.current.tenders.filter((t) => t.id !== id);
     stateRef.current.tenders = nextTenders;
     setTenders(nextTenders);
@@ -1927,6 +2013,9 @@ export default function App() {
 
   const handleDeleteEmdRecord = (id: string) => {
     const deletedRecord = stateRef.current.emdRecords.find((r) => r.id === id) ?? null;
+    adminSupplementalRef.current.emdRecords = adminSupplementalRef.current.emdRecords.filter(
+      (r) => r.id !== id,
+    );
     const nextEmdRecords = stateRef.current.emdRecords.filter((r) => r.id !== id);
     stateRef.current.emdRecords = nextEmdRecords;
     setEmdRecords(nextEmdRecords);
@@ -2015,6 +2104,9 @@ export default function App() {
   const handleDeleteMafTracker = (trackerId: string) => {
     const prevSnapshot = stateRef.current.mafTrackers;
     const target = prevSnapshot.find((t) => t.id === trackerId);
+    adminSupplementalRef.current.mafTrackers = adminSupplementalRef.current.mafTrackers.filter(
+      (t) => t.id !== trackerId,
+    );
     const nextList = prevSnapshot.filter((t) => t.id !== trackerId);
     const activeTenant = stateRef.current.workspaceTenantId;
     void syncMafOptimistic(
@@ -2271,10 +2363,13 @@ export default function App() {
     const activeCentralFbUser = stateRef.current.firebaseUser;
 
     clearCloudSessionCache();
+    localWorkspaceClearedRef.current = false;
+    adminSupplementalRef.current = createEmptyCloudDataset();
     attachmentFilesRef.current.clear();
     dispatchedEmailKeysRef.current.clear();
     emailRetryStateRef.current.clear();
     mafExtractionSignatureRef.current.clear();
+    mafExtractionInFlightRef.current.clear();
     setSelectedTenderId(null);
     setActiveTab('dashboard');
     setCloudFeedback(null);
@@ -2421,10 +2516,13 @@ export default function App() {
     }
 
     clearCloudSessionCache();
+    localWorkspaceClearedRef.current = false;
+    adminSupplementalRef.current = createEmptyCloudDataset();
     attachmentFilesRef.current.clear();
     dispatchedEmailKeysRef.current.clear();
     emailRetryStateRef.current.clear();
     mafExtractionSignatureRef.current.clear();
+    mafExtractionInFlightRef.current.clear();
     setByocConfig(null);
     setByocContextState(null);
     setByocAuthUser(null);
@@ -2452,6 +2550,7 @@ export default function App() {
   };
 
   const handleImportBackup = (payload: CrmBackupPayload) => {
+    localWorkspaceClearedRef.current = false;
     for (const t of payload.tenders) cacheAttachmentPayloads(t.attachments);
     for (const r of payload.emdRecords) cacheAttachmentPayloads(r.attachments);
     for (const m of payload.mafTrackers ?? []) cacheMafPayloads(m.itemsMAF);
@@ -2493,6 +2592,8 @@ export default function App() {
 
   const handleResetDemoData = () => {
     if (stateRef.current.currentUser?.role !== 'admin') return;
+    localWorkspaceClearedRef.current = false;
+    adminSupplementalRef.current = createEmptyCloudDataset();
     stateRef.current.firmProfile = DEFAULT_FIRM_PROFILE;
     stateRef.current.tenders = SEED_TENDERS;
     stateRef.current.emdRecords = SEED_EMD_RECORDS;
@@ -2527,7 +2628,15 @@ export default function App() {
   };
 
   const handleClearAllData = () => {
+    // Strictly clear local/CRM workspace state only.
+    // NEVER send delete/replace commands to Google Cloud Firestore, BYOC storage, or Google Drive Sheet.
+    localWorkspaceClearedRef.current = true;
+    adminSupplementalRef.current = createEmptyCloudDataset();
     attachmentFilesRef.current.clear();
+    mafExtractionSignatureRef.current.clear();
+    mafExtractionInFlightRef.current.clear();
+    dispatchedEmailKeysRef.current.clear();
+    emailRetryStateRef.current.clear();
     stateRef.current.tenders = [];
     stateRef.current.emdRecords = [];
     stateRef.current.mafTrackers = [];
@@ -2535,20 +2644,10 @@ export default function App() {
     setEmdRecords([]);
     setMafTrackers([]);
     setSelectedTenderId(null);
-    const prefs: UserPreferences = {
-      adminPin: stateRef.current.adminPin,
-      darkMode: stateRef.current.darkMode,
-    };
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) =>
-      replaceCloudDataset(user, stateRef.current.firmProfile, prefs, [], [], [], activeTenant, target),
+    showToast(
+      'ok',
+      'Local CRM data cleared. Google Cloud / BYOC & Google Sheet records remain intact — use "Restore from Cloud" anytime to reload.',
     );
-    void pushToGoogleSheet({
-      action: 'FULL_SYNC',
-      entityType: 'BULK',
-      tendersSnapshot: [],
-      emdSnapshot: [],
-    });
   };
 
   if (!isAuthenticated) {

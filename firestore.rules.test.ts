@@ -632,6 +632,54 @@ test('SecondaryUserRecord enforces presence enum, isEnabled lock, and blocks non
   assert.equal(changed.every((k) => ownerUpdatableKeys.has(k)), false);
 });
 
+test('Bootstrapped Admin can list/read sibling Admin UIDs & legacy collections read-only while non-admin users are denied', () => {
+  const isBootstrappedAdmin = (auth: AuthContext | null): boolean =>
+    isVerifiedUser(auth) && auth.token.email === 'vanshsaxena7498@gmail.com';
+
+  const adminAuth: AuthContext = {
+    uid: 'JdizphoE56bNDu7OPtS4WZxrb0H2',
+    token: { email: 'vanshsaxena7498@gmail.com', email_verified: true },
+  };
+  const unverifiedAdmin: AuthContext = {
+    uid: 'JdizphoE56bNDu7OPtS4WZxrb0H2',
+    token: { email: 'vanshsaxena7498@gmail.com', email_verified: false },
+  };
+  const secondaryAuth: AuthContext = {
+    uid: 'sec_uid_niyan',
+    token: { email: 'info.niyantrana@gmail.com', email_verified: true },
+  };
+
+  assert.equal(isBootstrappedAdmin(adminAuth), true);
+  assert.equal(isBootstrappedAdmin(unverifiedAdmin), false);
+  assert.equal(isBootstrappedAdmin(secondaryAuth), false);
+
+  const canListUserSubcollection = (
+    auth: AuthContext | null,
+    userId: string,
+    docOwnerUid: string,
+  ): boolean =>
+    isVerifiedUser(auth) &&
+    (isBootstrappedAdmin(auth) || (auth.uid === userId && docOwnerUid === auth.uid));
+
+  assert.equal(
+    canListUserSubcollection(adminAuth, '4uQty7KjogbYUmjY1ZxnJMtn7rj1', '4uQty7KjogbYUmjY1ZxnJMtn7rj1'),
+    true,
+  );
+  assert.equal(
+    canListUserSubcollection(secondaryAuth, '4uQty7KjogbYUmjY1ZxnJMtn7rj1', '4uQty7KjogbYUmjY1ZxnJMtn7rj1'),
+    false,
+  );
+  assert.equal(
+    canListUserSubcollection(secondaryAuth, 'sec_uid_niyan', 'victimUid'),
+    false,
+  );
+  assert.equal(
+    canListUserSubcollection(secondaryAuth, 'sec_uid_niyan', 'sec_uid_niyan'),
+    true,
+  );
+});
+
+
 
 
 

@@ -308,5 +308,6 @@ export interface SecondaryUserSummary {
   lastHeartbeatAt?: string;
   lastLogoutAt?: string;
   byocProjectId?: string;
+  aliasUserIds?: string[];
 }
 

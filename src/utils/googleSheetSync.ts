@@ -227,6 +227,47 @@ export interface GoogleSheetSyncPayload {
 const MONTH_BANNER_REGEX =
   /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$/i;
 
+export const SHEET_STATUS_HIGHLIGHT_COLORS = {
+  red: '#F4CCCC',
+  orange: '#FCE5CD',
+  green: '#D9EAD3',
+  defaultWhite: '#FFFFFF',
+} as const;
+
+export function getSheetStatusRowHighlightColor(status: unknown): string {
+  const normalized = sanitizeSheetText(status).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized) return SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite;
+
+  if (
+    normalized === 'cancelled' ||
+    normalized === 'cancelled / retendered' ||
+    normalized === 'tender not filled' ||
+    normalized.startsWith('cancelled')
+  ) {
+    return SHEET_STATUS_HIGHLIGHT_COLORS.red;
+  }
+
+  if (
+    normalized === 'documentation identified' ||
+    normalized === 'identified / reviewing' ||
+    normalized === 'doc preparation'
+  ) {
+    return SHEET_STATUS_HIGHLIGHT_COLORS.orange;
+  }
+
+  if (
+    normalized === 'submitted' ||
+    normalized === 'technical stage' ||
+    normalized === 'technical eval' ||
+    normalized === 'financial stage' ||
+    normalized === 'financial / boq eval'
+  ) {
+    return SHEET_STATUS_HIGHLIGHT_COLORS.green;
+  }
+
+  return SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite;
+}
+
 /**
  * Normalizes sheet text cleanly as UTF-8, preserving technical symbols like ≤, ≥, –
  * and repairing double-encoded mojibake or unit comparison artifacts (e.g., "(?10 KVA)" -> "(≤10 KVA)")
@@ -1224,6 +1265,35 @@ function writeBannerAndHeaderRow_(sheet, currentRow, bannerLabel, totalCols) {
   return headerRow + 1;
 }
 
+function getStatusRowBackground_(statusVal) {
+  var s = sanitizeText_(statusVal).toLowerCase().replace(/\\s+/g, ' ').trim();
+  if (!s) return '#FFFFFF';
+  if (s === 'cancelled' || s === 'cancelled / retendered' || s === 'tender not filled' || s.indexOf('cancelled') === 0) {
+    return '#F4CCCC';
+  }
+  if (s === 'documentation identified' || s === 'identified / reviewing' || s === 'doc preparation') {
+    return '#FCE5CD';
+  }
+  if (
+    s === 'submitted' ||
+    s === 'technical stage' ||
+    s === 'technical eval' ||
+    s === 'financial stage' ||
+    s === 'financial / boq eval'
+  ) {
+    return '#D9EAD3';
+  }
+  return '#FFFFFF';
+}
+
+function buildRowBackgroundColors_(totalCols, bgColor) {
+  var rowColors = [];
+  for (var c = 0; c < totalCols; c++) {
+    rowColors.push(bgColor);
+  }
+  return rowColors;
+}
+
 function rewriteMonthlyMisSheet_(sheet, payload) {
   var totalCols = MIS_MONTHLY_HEADERS.length; // 21 columns (Column A to Column U)
   var existingLastRow = sheet.getLastRow();
@@ -1257,8 +1327,9 @@ function rewriteMonthlyMisSheet_(sheet, payload) {
     var bannerLabel = sanitizeText_(block.monthLabel || formatFullMonthLabel_(block.monthKey));
     currentRow = writeBannerAndHeaderRow_(sheet, currentRow, bannerLabel, totalCols);
 
-    // 3. Data Rows: Fresh S.No. (1, 2, 3...) per month across all 21 MIS columns
+    // 3. Data Rows: Fresh S.No. (1, 2, 3...) per month across all 21 MIS columns with status-based light row highlighting
     var dataRows = [];
+    var rowBackgrounds = [];
     for (var r = 0; r < items.length; r++) {
       var t = items[r];
       var stageStr = sanitizeText_(t.stage || '');
@@ -1293,12 +1364,13 @@ function rewriteMonthlyMisSheet_(sheet, payload) {
         sanitizeText_(t.assignedOwner || defaultOwner),
         sanitizeText_(t.remarksNextAction || t.resultInfo)
       ]);
+      rowBackgrounds.push(buildRowBackgroundColors_(totalCols, getStatusRowBackground_(stageStr)));
     }
 
     var dataRange = sheet.getRange(currentRow, 1, dataRows.length, totalCols);
     dataRange
       .setValues(dataRows)
-      .setBackground('#FFFFFF')
+      .setBackgrounds(rowBackgrounds)
       .setFontColor('#0F172A')
       .setFontWeight('normal')
       .setHorizontalAlignment('left')

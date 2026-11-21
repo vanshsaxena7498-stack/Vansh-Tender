@@ -331,4 +331,86 @@ test('setSecondaryUserEnabled blocks disabled user login with ACCOUNT_DISABLED a
   }
 });
 
+test('deduplicateSecondaryUsers collapses duplicate email entries and setSecondaryUserEnabled updates aliases without data loss', async () => {
+  const { deduplicateSecondaryUsers } = await import('./authCredentials');
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  const { mockWindow } = createMockWindowStorage([
+    ['crm_secondary_workspace_sec_niyan_a1', '{"tenders":[{"id":"keep-me"}]}'],
+  ]);
+  (globalThis as { window: unknown }).window = mockWindow;
+
+  try {
+    clearInMemoryPasswordOverrideForTests();
+
+    const deduped = deduplicateSecondaryUsers([
+      {
+        userId: 'sec_niyan_old',
+        username: 'Niyan',
+        email: 'Info.Niyantrana@GMAIL.COM',
+        role: 'secondary',
+        createdAt: '2026-11-10T10:00:00.000Z',
+        isActive: false,
+        isEnabled: true,
+        presenceStatus: 'not_active',
+      },
+      {
+        userId: 'sec_niyan_new',
+        username: 'Niyan',
+        email: 'info.niyantrana@gmail.com',
+        role: 'secondary',
+        createdAt: '2026-11-18T10:00:00.000Z',
+        lastHeartbeatAt: '2026-11-20T05:30:00.000Z',
+        isActive: true,
+        isEnabled: true,
+        presenceStatus: 'active',
+        byocProjectId: 'niyan-cloud',
+      },
+    ]);
+
+    assert.equal(deduped.length, 1);
+    assert.equal(deduped[0]?.userId, 'sec_niyan_new');
+    assert.deepEqual(deduped[0]?.aliasUserIds?.sort(), ['sec_niyan_new', 'sec_niyan_old']);
+    assert.equal(deduped[0]?.byocProjectId, 'niyan-cloud');
+
+    // Register primary & duplicate alias locally, then disable via metadata upsert
+    registerSecondaryUserAccount({
+      userId: 'sec_niyan_a1',
+      username: 'Niyan',
+      email: 'info.niyantrana@gmail.com',
+      password: 'NiyanPassword@1',
+    });
+
+    const disabledAlias = setSecondaryUserEnabled(
+      'sec_niyan_cloud_only',
+      false,
+      '2026-11-20T06:00:00.000Z',
+      {
+        username: 'NiyanCloud',
+        email: 'info.niyantrana@gmail.com',
+        aliasUserIds: ['sec_niyan_a1', 'sec_niyan_cloud_only'],
+        byocProjectId: 'niyan-cloud',
+      },
+    );
+    assert.equal(disabledAlias?.isEnabled, false);
+    assert.ok(disabledAlias?.aliasUserIds?.includes('sec_niyan_a1'));
+
+    // Same-email original user is also blocked cleanly & local workspace snapshot preserved
+    const loginAttempt = validateLoginCredentials('Niyan', 'NiyanPassword@1');
+    assert.equal(loginAttempt.ok, false);
+    assert.equal(loginAttempt.code, 'ACCOUNT_DISABLED');
+    assert.equal(
+      mockWindow.localStorage.getItem('crm_secondary_workspace_sec_niyan_a1'),
+      '{"tenders":[{"id":"keep-me"}]}',
+    );
+  } finally {
+    clearInMemoryPasswordOverrideForTests();
+    if (prevWindow === undefined) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window: unknown }).window = prevWindow;
+    }
+  }
+});
+
+
 

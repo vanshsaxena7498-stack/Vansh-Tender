@@ -8,6 +8,7 @@ import {
   formatFullMonthYearLabel,
   formatIndianDateForSheet,
   formatIndianDateTimeForSheet,
+  getSheetStatusRowHighlightColor,
   getTenderInteractionMonthKey,
   GOOGLE_APPS_SCRIPT_CODE_GS,
   groupTendersByInteractionMonth,
@@ -16,6 +17,7 @@ import {
   mapMisRowToTenderFields,
   MIS_MONTHLY_TENDER_HEADERS,
   sanitizeSheetText,
+  SHEET_STATUS_HIGHLIGHT_COLORS,
 } from './googleSheetSync';
 
 function makeTender(overrides: Partial<Tender>): Tender {
@@ -399,6 +401,15 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost initializes all 21 headers on PING/empty
           }
           return rangeObj;
         },
+        setBackgrounds(bgs: string[][]) {
+          for (let r = 0; r < bgs.length; r += 1) {
+            for (let c = 0; c < (bgs[r]?.length ?? 0); c += 1) {
+              const key = `${row + r},${col + c}`;
+              sheet.cells.set(key, { ...(sheet.cells.get(key) ?? { value: '' }), bg: bgs[r][c] });
+            }
+          }
+          return rangeObj;
+        },
         setFontColor(fg: string) {
           for (let r = 0; r < numRows; r += 1) {
             for (let c = 0; c < numCols; c += 1) {
@@ -584,6 +595,79 @@ test('GOOGLE_APPS_SCRIPT_CODE_GS doPost initializes all 21 headers on PING/empty
   assert.equal(sheet.cells.get('25,1')?.value, 1);
   assert.equal(sheet.cells.get('25,2')?.value, 'GEM/2026/B/6001');
   assert.equal(sheet.cells.get('25,20')?.value, 'Vansh');
+
+  // 3. Status-based row highlighting across all 21 columns + clean re-sync update
+  const highlightedTenders: Tender[] = [
+    makeTender({ id: 's1', tenderId: 'GEM/1', stage: 'Tender Not Filled', updatedAt: '2026-11-01T10:00:00Z' }),
+    makeTender({ id: 's2', tenderId: 'GEM/2', stage: 'Cancelled / Retendered', updatedAt: '2026-11-02T10:00:00Z' }),
+    makeTender({ id: 's3', tenderId: 'GEM/3', stage: 'Identified / Reviewing', updatedAt: '2026-11-03T10:00:00Z' }),
+    makeTender({ id: 's4', tenderId: 'GEM/4', stage: 'Doc Preparation', updatedAt: '2026-11-04T10:00:00Z' }),
+    makeTender({ id: 's5', tenderId: 'GEM/5', stage: 'Submitted', updatedAt: '2026-11-05T10:00:00Z' }),
+    makeTender({ id: 's6', tenderId: 'GEM/6', stage: 'Technical Eval', updatedAt: '2026-11-06T10:00:00Z' }),
+    makeTender({ id: 's7', tenderId: 'GEM/7', stage: 'Financial / BOQ Eval', updatedAt: '2026-11-07T10:00:00Z' }),
+    makeTender({ id: 's8', tenderId: 'GEM/8', stage: 'L1 / Won', updatedAt: '2026-11-08T10:00:00Z' }),
+  ];
+
+  const highlightPayload = buildSheetSyncPayload({
+    action: 'FULL_SYNC',
+    entityType: 'BULK',
+    tenders: highlightedTenders,
+    emdRecords: [],
+  });
+  scriptExports.doPost({ postData: { contents: JSON.stringify(highlightPayload) } });
+
+  // Row 3 = s1 (Tender Not Filled -> Red), Row 4 = s2 (Cancelled -> Red)
+  assert.equal(sheet.cells.get('3,1')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.red);
+  assert.equal(sheet.cells.get('3,21')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.red);
+  assert.equal(sheet.cells.get('4,14')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.red);
+  // Row 5 = s3 (Identified / Reviewing -> Orange), Row 6 = s4 (Doc Preparation -> Orange)
+  assert.equal(sheet.cells.get('5,1')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.orange);
+  assert.equal(sheet.cells.get('6,14')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.orange);
+  // Row 7 = s5 (Submitted -> Green), Row 8 = s6 (Technical Eval -> Green), Row 9 = s7 (Financial / BOQ Eval -> Green)
+  assert.equal(sheet.cells.get('7,1')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(sheet.cells.get('8,14')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(sheet.cells.get('9,21')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  // Row 10 = s8 (L1 / Won -> White default)
+  assert.equal(sheet.cells.get('10,1')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite);
+
+  // Subsequent sync changes s3 status from Identified / Reviewing (Orange) -> Submitted (Green) and s1 -> L1 / Won (White)
+  const updatedHighlightPayload = buildSheetSyncPayload({
+    action: 'UPDATE',
+    entityType: 'TENDER',
+    tenders: highlightedTenders.map((t) =>
+      t.id === 's3'
+        ? { ...t, stage: 'Submitted' }
+        : t.id === 's1'
+          ? { ...t, stage: 'L1 / Won' }
+          : t,
+    ),
+    emdRecords: [],
+  });
+  scriptExports.doPost({ postData: { contents: JSON.stringify(updatedHighlightPayload) } });
+  assert.equal(sheet.cells.get('3,1')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite);
+  assert.equal(sheet.cells.get('5,14')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(sheet.cells.get('5,21')?.bg, SHEET_STATUS_HIGHLIGHT_COLORS.green);
 });
+
+test('getSheetStatusRowHighlightColor maps red, orange, green, and default white statuses accurately', () => {
+  assert.equal(getSheetStatusRowHighlightColor('Cancelled'), SHEET_STATUS_HIGHLIGHT_COLORS.red);
+  assert.equal(getSheetStatusRowHighlightColor('Cancelled / Retendered'), SHEET_STATUS_HIGHLIGHT_COLORS.red);
+  assert.equal(getSheetStatusRowHighlightColor('Tender Not Filled'), SHEET_STATUS_HIGHLIGHT_COLORS.red);
+
+  assert.equal(getSheetStatusRowHighlightColor('Documentation Identified'), SHEET_STATUS_HIGHLIGHT_COLORS.orange);
+  assert.equal(getSheetStatusRowHighlightColor('Identified / Reviewing'), SHEET_STATUS_HIGHLIGHT_COLORS.orange);
+  assert.equal(getSheetStatusRowHighlightColor('Doc Preparation'), SHEET_STATUS_HIGHLIGHT_COLORS.orange);
+
+  assert.equal(getSheetStatusRowHighlightColor('Submitted'), SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(getSheetStatusRowHighlightColor('Technical Stage'), SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(getSheetStatusRowHighlightColor('Technical Eval'), SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(getSheetStatusRowHighlightColor('Financial Stage'), SHEET_STATUS_HIGHLIGHT_COLORS.green);
+  assert.equal(getSheetStatusRowHighlightColor('Financial / BOQ Eval'), SHEET_STATUS_HIGHLIGHT_COLORS.green);
+
+  assert.equal(getSheetStatusRowHighlightColor('L1 / Won'), SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite);
+  assert.equal(getSheetStatusRowHighlightColor('Lost (L2/L3)'), SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite);
+  assert.equal(getSheetStatusRowHighlightColor(''), SHEET_STATUS_HIGHLIGHT_COLORS.defaultWhite);
+});
+
 
 

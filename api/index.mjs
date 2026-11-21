@@ -643,6 +643,7 @@ var DEFAULT_EMAIL_RECIPIENT_NAME = "Vansh";
 var IS_VERCEL = Boolean(process.env.VERCEL);
 var DATA_DIR = IS_VERCEL ? path.join(os.tmpdir(), "vansh-crm-data") : path.resolve(process.cwd(), ".data");
 var STATE_FILE = path.join(DATA_DIR, "crm-server-state.json");
+var SERVER_PRESENCE_TTL_MS = 9e4;
 function getHmacSecret() {
   return process.env.CRM_TOKEN_SECRET || process.env.SMTP_PASS || process.env.RESEND_API_KEY || "vansh-tender-software-otp-hmac-v1";
 }
@@ -732,6 +733,7 @@ function verifyVerifiedResetToken(token) {
   return null;
 }
 function signUserCredentialToken(record) {
+  const isEnabled = record.isEnabled !== void 0 ? record.isEnabled !== false : record.isActive !== false;
   return signSignedToken({
     kind: "crm_user_cred",
     userId: record.userId,
@@ -742,13 +744,16 @@ function signUserCredentialToken(record) {
     hash: record.hash,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
-    isActive: record.isActive
+    isActive: record.isActive,
+    isEnabled,
+    byocProjectId: record.byocProjectId
   });
 }
 function verifyUserCredentialToken(token) {
   const parsed = verifySignedToken(token);
   if (!parsed) return null;
   if (parsed.kind === "crm_user_cred" && typeof parsed.userId === "string" && typeof parsed.username === "string" && typeof parsed.email === "string" && typeof parsed.salt === "string" && typeof parsed.hash === "string" && typeof parsed.updatedAt === "string") {
+    const isEnabled = typeof parsed.isEnabled === "boolean" ? parsed.isEnabled : parsed.isActive !== false;
     return {
       userId: parsed.userId,
       username: parsed.username,
@@ -758,7 +763,9 @@ function verifyUserCredentialToken(token) {
       hash: parsed.hash,
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : parsed.updatedAt,
       updatedAt: parsed.updatedAt,
-      isActive: parsed.isActive !== false
+      isActive: isEnabled,
+      isEnabled,
+      byocProjectId: typeof parsed.byocProjectId === "string" ? parsed.byocProjectId : void 0
     };
   }
   if (parsed.kind === "crm_pwd" && parsed.username === ADMIN_USERNAME && typeof parsed.salt === "string" && typeof parsed.hash === "string" && typeof parsed.updatedAt === "string") {
@@ -804,7 +811,18 @@ function readCookieValue(cookieHeader, name) {
   }
   return "";
 }
-function sanitizeServerUserForClient(user) {
+function computeServerPresenceStatus(user, nowMs = Date.now()) {
+  const enabled = user.isEnabled !== void 0 ? user.isEnabled !== false : user.isActive !== false;
+  if (!enabled) return "not_active";
+  if (user.presenceStatus !== "active") return "not_active";
+  if (!user.lastHeartbeatAt) return "not_active";
+  const hbMs = Date.parse(user.lastHeartbeatAt);
+  if (Number.isNaN(hbMs)) return "not_active";
+  return nowMs - hbMs <= SERVER_PRESENCE_TTL_MS ? "active" : "not_active";
+}
+function sanitizeServerUserForClient(user, aliasUserIds) {
+  const isEnabled = user.isEnabled !== void 0 ? user.isEnabled !== false : user.isActive !== false;
+  const presenceStatus = computeServerPresenceStatus(user);
   return {
     userId: user.userId,
     username: user.username,
@@ -812,8 +830,39 @@ function sanitizeServerUserForClient(user) {
     role: user.role,
     createdAt: user.createdAt,
     lastLoginAt: user.lastLoginAt,
-    isActive: user.isActive !== false
+    isActive: isEnabled && presenceStatus === "active",
+    isEnabled,
+    disabledAt: user.disabledAt,
+    presenceStatus,
+    lastHeartbeatAt: user.lastHeartbeatAt,
+    lastLogoutAt: user.lastLogoutAt,
+    byocProjectId: user.byocProjectId,
+    byocConfig: user.byocConfig ?? null,
+    ...aliasUserIds && aliasUserIds.length > 0 ? { aliasUserIds } : {}
   };
+}
+function deduplicateServerSecondaryUsers(users) {
+  const byEmail = /* @__PURE__ */ new Map();
+  const recencyScore = (u) => [u.disabledAt, u.lastHeartbeatAt, u.lastLoginAt, u.lastLogoutAt, u.updatedAt, u.createdAt].filter((v) => typeof v === "string" && v.length > 0).sort().pop() || "";
+  for (const user of users) {
+    if (user.role !== "secondary") continue;
+    const normEmail = (user.email || "").trim().toLowerCase();
+    const key = normEmail || user.userId.toLowerCase();
+    const existing = byEmail.get(key);
+    if (!existing) {
+      byEmail.set(key, { canonical: user, aliases: /* @__PURE__ */ new Set([user.userId]) });
+      continue;
+    }
+    existing.aliases.add(user.userId);
+    if (recencyScore(user) >= recencyScore(existing.canonical)) {
+      existing.canonical = user;
+    }
+  }
+  return Array.from(byEmail.values()).sort(
+    (a, b) => (b.canonical.createdAt || "").localeCompare(a.canonical.createdAt || "")
+  ).map(
+    ({ canonical, aliases }) => sanitizeServerUserForClient(canonical, Array.from(aliases))
+  );
 }
 function maskEmailAddress(email) {
   const trimmed = email.trim();
@@ -1187,12 +1236,40 @@ function createApiRouter() {
     const trimmed = identifier.trim();
     if (!trimmed) return null;
     const lower = trimmed.toLowerCase();
+    let best = null;
     for (const user of pool.values()) {
       if (user.userId.toLowerCase() === lower || user.username.toLowerCase() === lower || user.email.toLowerCase() === lower) {
-        return user;
+        if (!best || (user.updatedAt || "") > (best.updatedAt || "") || (user.updatedAt || "") === (best.updatedAt || "") && user.userId === trimmed) {
+          best = user;
+        }
       }
     }
-    return null;
+    return best;
+  }
+  function findLatestSecondaryByEmail(pool, email) {
+    const norm = email.trim().toLowerCase();
+    if (!norm) return null;
+    let latest = null;
+    for (const user of pool.values()) {
+      if (user.role !== "secondary") continue;
+      if ((user.email || "").trim().toLowerCase() !== norm) continue;
+      if (!latest || (user.updatedAt || "") >= (latest.updatedAt || "")) {
+        latest = user;
+      }
+    }
+    return latest;
+  }
+  async function isAdminAuthorizedRequest(req, body) {
+    const adminToken = typeof req.headers["x-crm-admin-token"] === "string" ? req.headers["x-crm-admin-token"].trim() : "";
+    if (adminToken && verifyAdminSessionToken(adminToken)) {
+      return true;
+    }
+    const headerFbToken = typeof req.headers["x-firebase-id-token"] === "string" ? req.headers["x-firebase-id-token"].trim() : "";
+    const bodyFbToken = body && typeof body.firebaseIdToken === "string" ? body.firebaseIdToken.trim() : "";
+    const firebaseIdToken = headerFbToken || bodyFbToken;
+    if (!firebaseIdToken) return false;
+    const verified = await verifyGoogleIdTokenForEmail(firebaseIdToken, RECOVERY_EMAIL);
+    return verified.ok;
   }
   router.get("/health", (_req, res) => {
     res.json({
@@ -1218,17 +1295,33 @@ function createApiRouter() {
     const matched = findUserInPool(pool, identifier);
     const isEmailInput = identifier.includes("@");
     const usernameMatches = matched && (isEmailInput || identifier === matched.username || identifier === matched.userId);
-    if (!matched || !usernameMatches || matched.isActive === false || !verifyHashedSecret(password, matched.salt, matched.hash)) {
+    if (!matched || !usernameMatches || !verifyHashedSecret(password, matched.salt, matched.hash)) {
       res.status(401).json({
         ok: false,
+        code: "INVALID_CREDENTIALS",
         error: "Invalid User ID or password. Please check your credentials and try again."
+      });
+      return;
+    }
+    const latestSameEmail = matched.role === "secondary" ? findLatestSecondaryByEmail(pool, matched.email) : null;
+    const accountEnabled = matched.isEnabled !== void 0 ? matched.isEnabled !== false : matched.isActive !== false;
+    const latestEmailEnabled = latestSameEmail && latestSameEmail.isEnabled !== void 0 ? latestSameEmail.isEnabled !== false : latestSameEmail ? latestSameEmail.isActive !== false : true;
+    if ((!accountEnabled || !latestEmailEnabled) && matched.role !== "admin") {
+      res.status(403).json({
+        ok: false,
+        code: "ACCOUNT_DISABLED",
+        error: "Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access."
       });
       return;
     }
     const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const updatedUser = {
       ...matched,
-      lastLoginAt: nowIso
+      lastLoginAt: nowIso,
+      isActive: true,
+      isEnabled: true,
+      presenceStatus: "active",
+      lastHeartbeatAt: nowIso
     };
     state = {
       ...state,
@@ -1255,6 +1348,102 @@ function createApiRouter() {
       ...adminSessionToken ? { adminSessionToken } : {}
     });
   });
+  router.post("/auth/presence/heartbeat", (req, res) => {
+    const body = req.body || {};
+    const identifier = typeof body.userId === "string" && body.userId.trim() || typeof body.identifier === "string" && body.identifier.trim() || "";
+    if (!identifier) {
+      res.status(400).json({ ok: false, error: "userId is required." });
+      return;
+    }
+    const pool = buildUserPool(req, body);
+    const matched = pool.get(identifier) || findUserInPool(pool, identifier);
+    if (!matched) {
+      res.status(404).json({ ok: false, error: "User session not found." });
+      return;
+    }
+    const latestSameEmail = matched.role === "secondary" ? findLatestSecondaryByEmail(pool, matched.email) : null;
+    const isEnabled = matched.isEnabled !== void 0 ? matched.isEnabled !== false : matched.isActive !== false;
+    const latestEmailEnabled = latestSameEmail && latestSameEmail.isEnabled !== void 0 ? latestSameEmail.isEnabled !== false : latestSameEmail ? latestSameEmail.isActive !== false : true;
+    if ((!isEnabled || !latestEmailEnabled) && matched.role !== "admin") {
+      res.status(403).json({
+        ok: false,
+        code: "ACCOUNT_DISABLED",
+        disabled: true,
+        error: "Your CRM ID has been disabled by the Primary Administrator (VanshSales). Session terminated."
+      });
+      return;
+    }
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const nextByocProject = typeof body.byocProjectId === "string" ? body.byocProjectId.trim() : matched.byocProjectId;
+    const nextByocConfig = body.byocConfig && typeof body.byocConfig === "object" ? body.byocConfig : matched.byocConfig;
+    const updatedUser = {
+      ...matched,
+      isActive: true,
+      isEnabled: true,
+      presenceStatus: "active",
+      lastHeartbeatAt: nowIso,
+      updatedAt: nowIso,
+      byocProjectId: nextByocProject,
+      byocConfig: nextByocConfig
+    };
+    state = {
+      ...state,
+      users: {
+        ...state.users,
+        [updatedUser.userId]: updatedUser
+      }
+    };
+    saveServerState(state);
+    res.json({
+      ok: true,
+      user: sanitizeServerUserForClient(updatedUser),
+      presenceStatus: "active",
+      isEnabled: true,
+      lastHeartbeatAt: nowIso
+    });
+  });
+  router.post(
+    "/auth/logout",
+    express.text({ type: "text/plain", limit: "64kb" }),
+    (req, res) => {
+      let body = {};
+      if (typeof req.body === "string" && req.body.trim()) {
+        try {
+          body = JSON.parse(req.body);
+        } catch {
+          body = {};
+        }
+      } else if (req.body && typeof req.body === "object") {
+        body = req.body;
+      }
+      const identifier = typeof body.userId === "string" && body.userId.trim() || typeof body.identifier === "string" && body.identifier.trim() || "";
+      if (!identifier) {
+        res.json({ ok: true });
+        return;
+      }
+      const pool = buildUserPool(req, body);
+      const matched = pool.get(identifier) || findUserInPool(pool, identifier);
+      if (matched) {
+        const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+        const updatedUser = {
+          ...matched,
+          presenceStatus: "not_active",
+          isActive: false,
+          lastLogoutAt: nowIso,
+          updatedAt: nowIso
+        };
+        state = {
+          ...state,
+          users: {
+            ...state.users,
+            [updatedUser.userId]: updatedUser
+          }
+        };
+        saveServerState(state);
+      }
+      res.json({ ok: true, presenceStatus: "not_active" });
+    }
+  );
   router.post("/auth/signup/send-otp", async (req, res) => {
     try {
       if (!checkOtpRateLimit(req, "signup-otp")) {
@@ -1509,7 +1698,9 @@ function createApiRouter() {
         hash,
         createdAt: nowIso,
         updatedAt: nowIso,
-        isActive: true
+        isActive: true,
+        isEnabled: true,
+        presenceStatus: "not_active"
       };
       const nextOtps = { ...state.pendingOtps };
       delete nextOtps[`signup:${email}`];
@@ -1905,19 +2096,114 @@ function createApiRouter() {
       });
     }
   });
-  router.get("/auth/secondary-users", (req, res) => {
-    const adminToken = typeof req.headers["x-crm-admin-token"] === "string" ? req.headers["x-crm-admin-token"].trim() : "";
-    if (!adminToken || !verifyAdminSessionToken(adminToken)) {
+  router.get("/auth/secondary-users", async (req, res) => {
+    if (!await isAdminAuthorizedRequest(req)) {
       res.status(403).json({
         ok: false,
         error: "Admin session authorization is required to view secondary accounts."
       });
       return;
     }
-    const secondaryUsers = Object.values(state.users || {}).filter((u) => u.role === "secondary").sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || "")).map(sanitizeServerUserForClient);
+    const secondaryUsers = deduplicateServerSecondaryUsers(Object.values(state.users || {}));
     res.json({
       ok: true,
       users: secondaryUsers
+    });
+  });
+  router.post("/auth/secondary-users/status", async (req, res) => {
+    const body = req.body || {};
+    if (!await isAdminAuthorizedRequest(req, body)) {
+      res.status(403).json({
+        ok: false,
+        error: "Admin session authorization is required to change secondary user status."
+      });
+      return;
+    }
+    const rawUserId = typeof body.userId === "string" ? body.userId.trim() : "";
+    const rawUsername = typeof body.username === "string" ? body.username.trim() : "";
+    const rawEmail = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const aliasUserIds = Array.isArray(body.aliasUserIds) ? body.aliasUserIds.filter((v) => typeof v === "string" && v.trim().length > 0) : [];
+    const targetIdentifier = rawUserId || rawUsername || rawEmail;
+    if (!targetIdentifier || typeof body.isEnabled !== "boolean") {
+      res.status(400).json({ ok: false, error: "userId and boolean isEnabled are required." });
+      return;
+    }
+    const pool = buildUserPool(req, body);
+    let target = pool.get(targetIdentifier) || findUserInPool(pool, targetIdentifier) || (rawEmail ? findUserInPool(pool, rawEmail) : null) || (rawUsername ? findUserInPool(pool, rawUsername) : null);
+    if (!target) {
+      for (const aliasId of aliasUserIds) {
+        const hit = pool.get(aliasId) || findUserInPool(pool, aliasId);
+        if (hit && hit.role !== "admin") {
+          target = hit;
+          break;
+        }
+      }
+    }
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const isEnabled = body.isEnabled;
+    if (!target) {
+      if (rawUsername && rawEmail && isValidEmailAddress(rawEmail) && rawUsername.toLowerCase() !== ADMIN_USERNAME.toLowerCase() && rawEmail !== RECOVERY_EMAIL.toLowerCase()) {
+        const { salt, hash } = hashSecret(crypto.randomBytes(16).toString("hex"));
+        target = {
+          userId: rawUserId || `sec_${rawUsername.toLowerCase().replace(/[^a-z0-9_-]+/g, "_")}`,
+          username: rawUsername,
+          email: rawEmail,
+          role: "secondary",
+          salt,
+          hash,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          isActive: false,
+          isEnabled,
+          presenceStatus: "not_active",
+          byocProjectId: typeof body.byocProjectId === "string" && body.byocProjectId.trim() ? body.byocProjectId.trim() : void 0
+        };
+      } else {
+        res.status(404).json({ ok: false, error: "Secondary user account not found." });
+        return;
+      }
+    }
+    if (target.role === "admin") {
+      res.status(404).json({ ok: false, error: "Secondary user account not found." });
+      return;
+    }
+    const targetEmail = (rawEmail || target.email || "").trim().toLowerCase();
+    const matchedIds = /* @__PURE__ */ new Set([target.userId, ...aliasUserIds]);
+    if (rawUserId) matchedIds.add(rawUserId);
+    const nextUsers = { ...state.users };
+    for (const [uid, existingUser] of Object.entries(nextUsers)) {
+      if (existingUser.role === "admin") continue;
+      const matchesSameAccount = matchedIds.has(uid) || matchedIds.has(existingUser.userId) || targetEmail && existingUser.email.trim().toLowerCase() === targetEmail;
+      if (!matchesSameAccount) continue;
+      matchedIds.add(existingUser.userId);
+      nextUsers[uid] = {
+        ...existingUser,
+        isEnabled,
+        isActive: isEnabled ? computeServerPresenceStatus(existingUser) === "active" : false,
+        disabledAt: isEnabled ? void 0 : nowIso,
+        presenceStatus: isEnabled ? existingUser.presenceStatus ?? "not_active" : "not_active",
+        updatedAt: nowIso
+      };
+    }
+    const updatedUser = {
+      ...target,
+      isEnabled,
+      isActive: isEnabled ? computeServerPresenceStatus(target) === "active" : false,
+      disabledAt: isEnabled ? void 0 : nowIso,
+      presenceStatus: isEnabled ? target.presenceStatus ?? "not_active" : "not_active",
+      updatedAt: nowIso
+    };
+    nextUsers[updatedUser.userId] = updatedUser;
+    state = {
+      ...state,
+      users: nextUsers
+    };
+    saveServerState(state);
+    res.json({
+      ok: true,
+      user: sanitizeServerUserForClient(updatedUser, Array.from(matchedIds)),
+      credentialToken: signUserCredentialToken(updatedUser),
+      message: isEnabled ? `Re-enabled access for ${updatedUser.username}.` : `Disabled access for ${updatedUser.username}. Active sessions will be locked out.`
     });
   });
   router.get("/notifications/email/status", (req, res) => {
@@ -2514,11 +2800,11 @@ ${decodedText}` }],
       const att1 = parseAttachmentPayload(body.attachment1);
       const att2 = parseAttachmentPayload(body.attachment2);
       const fallbackDepartment = typeof body.fallbackDepartment === "string" ? body.fallbackDepartment.trim() : "";
-      if (!att1 && !att2) {
+      if (!att1 || !att2) {
         res.status(400).json({
           ok: false,
           success: false,
-          error: "At least Attachment 1 or Attachment 2 content is required."
+          error: "Both Attachment 1 (Bid Document) and Attachment 2 (Specification Document) are required before auto-generating MAF entries."
         });
         return;
       }

@@ -414,6 +414,91 @@ test('buildCloudTenderPayload includes all 33 blueprint keys with expanded MIS f
   assert.equal(payload.assignedOwner, 'Vansh');
 });
 
+test('buildSecondaryUserCloudPayload preserves isEnabled=true when secondary user is offline', async () => {
+  const { buildSecondaryUserCloudPayload } = await import('./cloudSyncHelpers');
+  const offlineEnabled = buildSecondaryUserCloudPayload(
+    {
+      ownerUid: 'uid-niyan',
+      userId: 'sec_niyan',
+      username: 'Niyan',
+      email: 'info.niyantrana@gmail.com',
+      isActive: false,
+      isEnabled: true,
+      presenceStatus: 'not_active',
+    },
+    TOKEN,
+  );
+  assert.equal(offlineEnabled.isEnabled, true);
+  assert.equal(offlineEnabled.isActive, false);
+  assert.equal(offlineEnabled.presenceStatus, 'not_active');
+});
+
+test('Admin multi-source helpers normalize timestamps, exclude secondary workspaces, and merge without duplicates', async () => {
+  const {
+    normalizeAdminFirestoreTimestamp,
+    isLegacyDocExcludedFromAdmin,
+    mergeAdminRecordsById,
+    mergeAdminAttachmentMaps,
+  } = await import('./cloudSyncHelpers');
+
+  assert.equal(
+    normalizeAdminFirestoreTimestamp({ seconds: 1700000000 }),
+    new Date(1700000000 * 1000).toISOString(),
+  );
+  assert.equal(
+    normalizeAdminFirestoreTimestamp({ toDate: () => new Date('2026-11-10T00:00:00.000Z') }),
+    '2026-11-10T00:00:00.000Z',
+  );
+  assert.equal(normalizeAdminFirestoreTimestamp('2026-11-10'), '2026-11-10');
+
+  const knownAdminUids = new Set(['4uQty7KjogbYUmjY1ZxnJMtn7rj1', 'JdizphoE56bNDu7OPtS4WZxrb0H2']);
+  const excludedSecondaryUids = new Set(['sec_uid_niyan']);
+
+  assert.equal(
+    isLegacyDocExcludedFromAdmin({ ownerUid: '4uQty7KjogbYUmjY1ZxnJMtn7rj1' }, knownAdminUids, excludedSecondaryUids),
+    false,
+  );
+  assert.equal(
+    isLegacyDocExcludedFromAdmin({}, knownAdminUids, excludedSecondaryUids),
+    false,
+  );
+  assert.equal(
+    isLegacyDocExcludedFromAdmin({ ownerUid: 'sec_uid_niyan' }, knownAdminUids, excludedSecondaryUids),
+    true,
+  );
+  assert.equal(
+    isLegacyDocExcludedFromAdmin({ tenantId: 'sec_niyan' }, knownAdminUids, excludedSecondaryUids),
+    true,
+  );
+  assert.equal(
+    isLegacyDocExcludedFromAdmin({ ownerEmail: 'info.niyantrana@gmail.com' }, knownAdminUids, excludedSecondaryUids),
+    true,
+  );
+
+  const merged = mergeAdminRecordsById(
+    [{ id: 't-1', title: 'Primary Title' }],
+    [
+      { id: 't-1', title: 'Legacy Stale Title' },
+      { id: 't-2', title: 'Legacy Recovered Tender' },
+    ],
+  );
+  assert.deepEqual(merged, [
+    { id: 't-1', title: 'Primary Title' },
+    { id: 't-2', title: 'Legacy Recovered Tender' },
+  ]);
+
+  const mergedFiles = mergeAdminAttachmentMaps(
+    new Map([['att-1', 'primary-data']]),
+    new Map([
+      ['att-1', 'legacy-data'],
+      ['att-2', 'legacy-recovered'],
+    ]),
+  );
+  assert.equal(mergedFiles.get('att-1'), 'primary-data');
+  assert.equal(mergedFiles.get('att-2'), 'legacy-recovered');
+});
+
+
 
 
 

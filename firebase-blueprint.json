@@ -935,6 +935,12 @@
       },
       "description": "User's EMD and Bank Guarantee records stored exclusively in Firestore."
     },
+    "/users/{userId}/emd_bg_tracker/{emdDocId}": {
+      "schema": {
+        "$ref": "#/entities/EmdBgRecord"
+      },
+      "description": "Legacy user-scoped EMD and Bank Guarantee tracker records (read-only recovery for Bootstrapped Admin)."
+    },
     "/users/{userId}/attachmentFiles/{attachmentId}": {
       "schema": {
         "$ref": "#/entities/AttachmentFile"
@@ -1030,6 +1036,66 @@
         "$ref": "#/entities/GoogleSheetConfig"
       },
       "description": "Isolated Google Apps Script Webhook configuration for a secondary CRM workspace."
+    },
+    "/tenders/{docId}": {
+      "schema": {
+        "$ref": "#/entities/Tender"
+      },
+      "description": "Legacy top-level tenders collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/emdRecords/{docId}": {
+      "schema": {
+        "$ref": "#/entities/EmdBgRecord"
+      },
+      "description": "Legacy top-level EMD/BG collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/emd_bg_tracker/{docId}": {
+      "schema": {
+        "$ref": "#/entities/EmdBgRecord"
+      },
+      "description": "Legacy top-level EMD/BG tracker collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/maf_tracker/{docId}": {
+      "schema": {
+        "$ref": "#/entities/MafTracker"
+      },
+      "description": "Legacy top-level MAF tracker collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/attachmentFiles/{docId}": {
+      "schema": {
+        "$ref": "#/entities/AttachmentFile"
+      },
+      "description": "Legacy top-level attachment files collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/settings/{docId}": {
+      "schema": {
+        "$ref": "#/entities/UserPreferences"
+      },
+      "description": "Legacy top-level settings collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/profile/{docId}": {
+      "schema": {
+        "$ref": "#/entities/FirmProfile"
+      },
+      "description": "Legacy top-level firm profile collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/sheetConfig/{docId}": {
+      "schema": {
+        "$ref": "#/entities/GoogleSheetConfig"
+      },
+      "description": "Legacy top-level Google Sheet config collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/emailConfig/{docId}": {
+      "schema": {
+        "$ref": "#/entities/EmailAlertConfig"
+      },
+      "description": "Legacy top-level email alert config collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/emailAlerts/{docId}": {
+      "schema": {
+        "$ref": "#/entities/EmailAlertLog"
+      },
+      "description": "Legacy top-level email alert logs collection (strictly read-only recovery for Bootstrapped Admin)."
     }
   }
 }

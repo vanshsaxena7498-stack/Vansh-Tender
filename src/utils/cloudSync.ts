@@ -22,6 +22,7 @@ import {
 import { assertIsolatedTargetDescriptor } from '../lib/byocConfigHelpers.ts';
 import {
   db as centralDb,
+  defaultDb,
   firebaseConfig as centralFirebaseConfig,
   handleFirestoreError,
   OperationType,
@@ -54,6 +55,10 @@ import {
   buildCloudTenderPayload,
   buildSecondaryUserCloudPayload,
   buildWorkspaceRootPayload,
+  isLegacyDocExcludedFromAdmin,
+  mergeAdminAttachmentMaps,
+  mergeAdminRecordsById,
+  normalizeAdminFirestoreTimestamp,
   sanitizeDocId,
 } from './cloudSyncHelpers.ts';
 import {
@@ -165,12 +170,14 @@ function getScopedCollection(
   return collection(ctx.db, 'users', uid, colName);
 }
 
-function docToTender(data: Record<string, unknown>): Tender {
-  const dept = String(data.department ?? '');
+function docToTender(data: Record<string, unknown>, fallbackDocId = ''): Tender {
+  const dept = String(data.department ?? data.organization ?? data.clientName ?? '');
+  const nowIso = new Date().toISOString();
+  const resolvedId = String(data.id || fallbackDocId || '');
   return {
-    id: String(data.id ?? ''),
-    tenderId: String(data.tenderId ?? ''),
-    portal: data.portal as Tender['portal'],
+    id: resolvedId,
+    tenderId: String(data.tenderId ?? data.tenderNo ?? data.bidNo ?? resolvedId),
+    portal: (data.portal as Tender['portal']) || 'GeM',
     clientName: typeof data.clientName === 'string' && data.clientName ? data.clientName : dept,
     department: dept,
     locationDepartment:
@@ -179,9 +186,9 @@ function docToTender(data: Record<string, unknown>): Tender {
         : dept,
     location: String(data.location ?? ''),
     category: String(data.category ?? ''),
-    title: String(data.title ?? ''),
+    title: String(data.title ?? data.workTitle ?? ''),
     publishDate: String(data.publishDate ?? ''),
-    submissionDueDate: String(data.submissionDueDate ?? ''),
+    submissionDueDate: String(data.submissionDueDate ?? data.dueDate ?? ''),
     preBidDate: String(data.preBidDate ?? ''),
     technicalOpeningDate: String(data.technicalOpeningDate ?? ''),
     financialOpeningDate: String(data.financialOpeningDate ?? ''),
@@ -191,9 +198,9 @@ function docToTender(data: Record<string, unknown>): Tender {
     l1QuotedValue: Number(data.l1QuotedValue ?? 0),
     ourPositionRank: String(data.ourPositionRank ?? ''),
     assignedOwner: String(data.assignedOwner ?? ''),
-    emdStatus: data.emdStatus as Tender['emdStatus'],
+    emdStatus: (data.emdStatus as Tender['emdStatus']) || 'No EMD',
     emdAmount: Number(data.emdAmount ?? 0),
-    stage: data.stage as Tender['stage'],
+    stage: (data.stage as Tender['stage']) || 'Identified / Reviewing',
     resultInfo: String(data.resultInfo ?? ''),
     completionDate: String(data.completionDate ?? ''),
     checklist: Array.isArray(data.checklist) ? (data.checklist as Tender['checklist']) : [],
@@ -201,25 +208,27 @@ function docToTender(data: Record<string, unknown>): Tender {
     attachments: Array.isArray(data.attachments)
       ? (data.attachments as Tender['attachments'])
       : [],
-    createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
-    updatedAt: String(data.clientUpdatedAt ?? new Date().toISOString()),
+    createdAt: normalizeAdminFirestoreTimestamp(data.clientCreatedAt ?? data.createdAt, nowIso),
+    updatedAt: normalizeAdminFirestoreTimestamp(data.clientUpdatedAt ?? data.updatedAt, nowIso),
   };
 }
 
-function docToEmdRecord(data: Record<string, unknown>): EmdBgRecord {
+function docToEmdRecord(data: Record<string, unknown>, fallbackDocId = ''): EmdBgRecord {
+  const resolvedId = String(data.id || fallbackDocId || '');
   return {
-    id: String(data.id ?? ''),
+    id: resolvedId,
     tenderRefId: String(data.tenderRefId ?? ''),
-    tenderId: String(data.tenderId ?? ''),
+    tenderId: String(data.tenderId ?? resolvedId),
     department: String(data.department ?? ''),
-    instrumentType: data.instrumentType as EmdBgRecord['instrumentType'],
+    instrumentType:
+      (data.instrumentType as EmdBgRecord['instrumentType']) || 'Online / NEFT / RTGS',
     referenceNo: String(data.referenceNo ?? ''),
     bankName: String(data.bankName ?? ''),
     amount: Number(data.amount ?? 0),
     issueDate: String(data.issueDate ?? ''),
     expiryDate: String(data.expiryDate ?? ''),
     claimEndDate: String(data.claimEndDate ?? ''),
-    status: data.status as EmdBgRecord['status'],
+    status: (data.status as EmdBgRecord['status']) || 'Active / Locked',
     refundDate: String(data.refundDate ?? ''),
     refundRef: String(data.refundRef ?? ''),
     remarks: String(data.remarks ?? ''),
@@ -229,14 +238,16 @@ function docToEmdRecord(data: Record<string, unknown>): EmdBgRecord {
   };
 }
 
-function docToMafTracker(data: Record<string, unknown>): MafTrackerRecord {
+function docToMafTracker(data: Record<string, unknown>, fallbackDocId = ''): MafTrackerRecord {
+  const nowIso = new Date().toISOString();
+  const resolvedId = String(data.id || fallbackDocId || '');
   const rawItems = Array.isArray(data.itemsMAF)
     ? (data.itemsMAF as MafTrackerRecord['itemsMAF'])
     : [];
   return {
-    id: String(data.id ?? ''),
+    id: resolvedId,
     tenderRefId: String(data.tenderRefId ?? ''),
-    tenderId: String(data.tenderId ?? ''),
+    tenderId: String(data.tenderId ?? resolvedId),
     tenderTitle: String(data.tenderTitle ?? ''),
     department: String(data.department ?? ''),
     tenderDueDate: String(data.tenderDueDate ?? ''),
@@ -252,8 +263,8 @@ function docToMafTracker(data: Record<string, unknown>): MafTrackerRecord {
         mafRequestedDate: getMafRequestedDate(item),
       };
     }),
-    createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
-    updatedAt: String(data.clientUpdatedAt ?? new Date().toISOString()),
+    createdAt: normalizeAdminFirestoreTimestamp(data.clientCreatedAt ?? data.createdAt, nowIso),
+    updatedAt: normalizeAdminFirestoreTimestamp(data.clientUpdatedAt ?? data.updatedAt, nowIso),
   };
 }
 
@@ -292,10 +303,11 @@ function docToSheetConfig(data: Record<string, unknown>): GoogleSheetSettings {
   };
 }
 
-function docToEmailAlertLog(data: Record<string, unknown>): EmailAlertLog {
+function docToEmailAlertLog(data: Record<string, unknown>, fallbackDocId = ''): EmailAlertLog {
+  const nowIso = new Date().toISOString();
   return {
-    id: String(data.id ?? ''),
-    slotKey: String(data.slotKey ?? data.id ?? ''),
+    id: String(data.id ?? fallbackDocId ?? ''),
+    slotKey: String(data.slotKey ?? data.id ?? fallbackDocId ?? ''),
     tenderRefId: String(data.tenderRefId ?? ''),
     tenderId: String(data.tenderId ?? ''),
     slot: (data.slot as EmailAlertLog['slot']) || 'slot_11am',
@@ -306,7 +318,7 @@ function docToEmailAlertLog(data: Record<string, unknown>): EmailAlertLog {
     provider: String(data.provider ?? 'smtp'),
     subject: String(data.subject ?? ''),
     message: String(data.message ?? ''),
-    createdAt: String(data.clientCreatedAt ?? new Date().toISOString()),
+    createdAt: normalizeAdminFirestoreTimestamp(data.clientCreatedAt ?? data.createdAt, nowIso),
   };
 }
 
@@ -385,36 +397,44 @@ export async function syncSecondaryUserToCloud(
   user: User,
   summary: SecondaryUserSummary,
 ): Promise<void> {
-  const safeId = sanitizeDocId(summary.userId);
-  const ref = doc(centralDb, 'secondaryUsers', safeId);
-  try {
-    const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
-    const ownerUid =
-      snap.exists() && typeof snap.data().ownerUid === 'string'
-        ? snap.data().ownerUid
-        : user.uid;
-    const payload = buildSecondaryUserCloudPayload(
-      {
-        ownerUid,
-        userId: safeId,
-        username: summary.username,
-        email: summary.email,
-        isActive: summary.isActive,
-        isEnabled: summary.isEnabled,
-        presenceStatus: summary.presenceStatus,
-        lastHeartbeatAt: summary.lastHeartbeatAt,
-        lastLogoutAt: summary.lastLogoutAt,
-        byocProjectId: summary.byocProjectId,
-        createdAtIso: summary.createdAt,
-        lastLoginAtIso: summary.lastLoginAt,
-      },
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-  } catch {
-    // Non-fatal if central directory write isn't permitted for current auth user
+  const candidateIds = Array.from(
+    new Set([summary.userId, ...(summary.aliasUserIds ?? [])].map((id) => sanitizeDocId(id))),
+  );
+  const primarySafeId = sanitizeDocId(summary.userId);
+  for (const safeId of candidateIds) {
+    const ref = doc(centralDb, 'secondaryUsers', safeId);
+    try {
+      const snap = await getDoc(ref);
+      // Update canonical doc always; only update alias docs that already exist
+      if (safeId !== primarySafeId && !snap.exists()) continue;
+      const existingData = snap.exists() ? snap.data() : null;
+      const existingCreatedAt = existingData?.createdAt;
+      const ownerUid =
+        existingData && typeof existingData.ownerUid === 'string'
+          ? existingData.ownerUid
+          : user.uid;
+      const payload = buildSecondaryUserCloudPayload(
+        {
+          ownerUid,
+          userId: safeId,
+          username: summary.username,
+          email: summary.email,
+          isActive: summary.isActive,
+          isEnabled: summary.isEnabled,
+          presenceStatus: summary.presenceStatus,
+          lastHeartbeatAt: summary.lastHeartbeatAt,
+          lastLogoutAt: summary.lastLogoutAt,
+          byocProjectId: summary.byocProjectId,
+          createdAtIso: summary.createdAt,
+          lastLoginAtIso: summary.lastLoginAt,
+        },
+        serverTimestamp(),
+        existingCreatedAt,
+      );
+      await setDoc(ref, payload);
+    } catch {
+      // Non-fatal if central directory write isn't permitted for current auth user
+    }
   }
 }
 
@@ -428,7 +448,8 @@ export async function fetchSecondaryUsersFromCloud(
     return snap.docs
       .map((d) => {
         const data = d.data();
-        const isEnabled = data.isEnabled !== false && data.isActive !== false;
+        const isEnabled =
+          typeof data.isEnabled === 'boolean' ? data.isEnabled : data.isActive !== false;
         return {
           userId: String(data.userId ?? d.id),
           username: String(data.username ?? ''),
@@ -439,10 +460,10 @@ export async function fetchSecondaryUsersFromCloud(
             typeof data.clientLastLoginAt === 'string' && data.clientLastLoginAt
               ? data.clientLastLoginAt
               : undefined,
-          isActive: data.isActive !== false,
+          isActive: isEnabled && data.isActive !== false,
           isEnabled,
           presenceStatus:
-            data.presenceStatus === 'active' || data.presenceStatus === 'not_active'
+            isEnabled && (data.presenceStatus === 'active' || data.presenceStatus === 'not_active')
               ? (data.presenceStatus as 'active' | 'not_active')
               : 'not_active',
           lastHeartbeatAt:
@@ -1057,6 +1078,276 @@ export async function fetchAllFromCloud(
     mafTrackers,
     attachmentFiles,
   };
+}
+
+export const KNOWN_ADMIN_UIDS = [
+  '4uQty7KjogbYUmjY1ZxnJMtn7rj1',
+  'JdizphoE56bNDu7OPtS4WZxrb0H2',
+] as const;
+
+export interface CloudWorkspaceDataset {
+  profile: FirmProfile | null;
+  preferences: UserPreferences | null;
+  emailConfig: EmailAlertSettings | null;
+  sheetConfig: GoogleSheetSettings | null;
+  emailAlerts: EmailAlertLog[];
+  tenders: Tender[];
+  emdRecords: EmdBgRecord[];
+  mafTrackers: MafTrackerRecord[];
+  attachmentFiles: Map<string, string>;
+}
+
+export function createEmptyCloudDataset(): CloudWorkspaceDataset {
+  return {
+    profile: null,
+    preferences: null,
+    emailConfig: null,
+    sheetConfig: null,
+    emailAlerts: [],
+    tenders: [],
+    emdRecords: [],
+    mafTrackers: [],
+    attachmentFiles: new Map<string, string>(),
+  };
+}
+
+async function safeGetDocs(colRef: ReturnType<typeof collection>) {
+  try {
+    return await getDocs(colRef);
+  } catch {
+    return null;
+  }
+}
+
+async function safeGetDoc(docRef: ReturnType<typeof doc>) {
+  try {
+    return await getDoc(docRef);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strictly for Bootstrapped Primary Admin (vanshsaxena7498@gmail.com).
+ * Read-only hydration across current UID, sibling Admin UIDs, legacy root collections,
+ * and the (default) Firestore database without mutating live records or pulling secondary workspaces.
+ */
+export async function fetchAdminCloudWorkspaceWithFallback(
+  adminUser: User,
+): Promise<{
+  primary: CloudWorkspaceDataset;
+  supplemental: CloudWorkspaceDataset;
+  merged: CloudWorkspaceDataset;
+}> {
+  const centralTarget = getCentralAdminCloudTarget();
+  const primary = await fetchAllFromCloud(adminUser.uid, null, centralTarget);
+  const supplemental = createEmptyCloudDataset();
+
+  if (!isBootstrappedAdminUser(adminUser)) {
+    return { primary, supplemental, merged: primary };
+  }
+
+  const knownAdminUidSet = new Set<string>([adminUser.uid, ...KNOWN_ADMIN_UIDS]);
+  const excludedSecondaryOwnerUids = new Set<string>();
+
+  try {
+    const secSnap = await safeGetDocs(collection(centralDb, 'secondaryUsers'));
+    if (secSnap) {
+      for (const d of secSnap.docs) {
+        const data = d.data();
+        const ownerUid = typeof data.ownerUid === 'string' ? data.ownerUid.trim() : '';
+        const secId = typeof data.userId === 'string' ? data.userId.trim() : '';
+        if (ownerUid && !knownAdminUidSet.has(ownerUid)) {
+          excludedSecondaryOwnerUids.add(ownerUid);
+        }
+        if (secId && !knownAdminUidSet.has(secId)) {
+          excludedSecondaryOwnerUids.add(secId);
+        }
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  const dbsToInspect: Firestore[] = defaultDb ? [centralDb, defaultDb] : [centralDb];
+  const uidsToInspect = Array.from(knownAdminUidSet);
+
+  const absorbCollectionDocs = (
+    docs: Array<{ id: string; data: () => Record<string, unknown> }>,
+    kind:
+      | 'tenders'
+      | 'emdRecords'
+      | 'maf_tracker'
+      | 'attachmentFiles'
+      | 'emailAlerts'
+      | 'profile'
+      | 'settings'
+      | 'emailConfig'
+      | 'sheetConfig',
+    uidOwnerHint?: string,
+  ) => {
+    for (const d of docs) {
+      const raw = d.data();
+      if (isLegacyDocExcludedFromAdmin(raw, knownAdminUidSet, excludedSecondaryOwnerUids)) {
+        continue;
+      }
+      if (kind === 'tenders') {
+        const item = docToTender(raw, d.id);
+        if (item.id && (item.title || item.tenderId)) {
+          supplemental.tenders = mergeAdminRecordsById(supplemental.tenders, [item]);
+        }
+      } else if (kind === 'emdRecords') {
+        const item = docToEmdRecord(raw, d.id);
+        if (item.id && (item.tenderId || item.referenceNo)) {
+          supplemental.emdRecords = mergeAdminRecordsById(supplemental.emdRecords, [item]);
+        }
+      } else if (kind === 'maf_tracker') {
+        const item = docToMafTracker(raw, d.id);
+        if (item.id && (item.tenderId || item.itemsMAF.length > 0)) {
+          supplemental.mafTrackers = mergeAdminRecordsById(supplemental.mafTrackers, [item]);
+        }
+      } else if (kind === 'attachmentFiles') {
+        if (typeof raw.dataUrl === 'string' && raw.dataUrl.length > 0) {
+          const attId = String(raw.id ?? d.id);
+          if (!supplemental.attachmentFiles.has(attId)) {
+            supplemental.attachmentFiles.set(attId, raw.dataUrl);
+          }
+        }
+      } else if (kind === 'emailAlerts') {
+        const item = docToEmailAlertLog(raw, d.id);
+        if (item.id) {
+          supplemental.emailAlerts = mergeAdminRecordsById(supplemental.emailAlerts, [item]);
+        }
+      } else if (kind === 'profile') {
+        if (!supplemental.profile && (typeof raw.firmName === 'string' || typeof raw.adminName === 'string')) {
+          supplemental.profile = docToProfile(raw);
+        }
+      } else if (kind === 'settings') {
+        if (!supplemental.preferences && (raw.adminPin !== undefined || raw.darkMode !== undefined)) {
+          supplemental.preferences = docToPreferences(raw);
+        }
+      } else if (kind === 'emailConfig') {
+        if (!supplemental.emailConfig && typeof raw.recipientEmail === 'string') {
+          supplemental.emailConfig = docToEmailConfig(raw);
+        }
+      } else if (kind === 'sheetConfig') {
+        if (!supplemental.sheetConfig && typeof raw.webhookUrl === 'string') {
+          supplemental.sheetConfig = docToSheetConfig(raw);
+        }
+      }
+    }
+    void uidOwnerHint;
+  };
+
+  for (const targetDb of dbsToInspect) {
+    const isCentralPrimaryDb = targetDb === centralDb;
+
+    // 1. Inspect /users/{uid}/... across current UID (unfiltered fallback + emd_bg_tracker) & sibling Admin UIDs
+    for (const candidateUid of uidsToInspect) {
+      const skipStrictCurrentMatches = isCentralPrimaryDb && candidateUid === adminUser.uid;
+      const rootDocSnap = await safeGetDoc(doc(targetDb, 'users', candidateUid));
+      if (rootDocSnap?.exists()) {
+        const rootEmail = String(rootDocSnap.data().email ?? '')
+          .trim()
+          .toLowerCase();
+        if (rootEmail && rootEmail !== 'vanshsaxena7498@gmail.com') {
+          excludedSecondaryOwnerUids.add(candidateUid);
+          continue;
+        }
+      }
+
+      if (!skipStrictCurrentMatches) {
+        const [pSnap, sSnap, ecSnap, scSnap] = await Promise.all([
+          safeGetDoc(doc(targetDb, 'users', candidateUid, 'profile', 'firm')),
+          safeGetDoc(doc(targetDb, 'users', candidateUid, 'settings', 'preferences')),
+          safeGetDoc(doc(targetDb, 'users', candidateUid, 'emailConfig', 'default')),
+          safeGetDoc(doc(targetDb, 'users', candidateUid, 'sheetConfig', 'default')),
+        ]);
+        if (pSnap?.exists()) absorbCollectionDocs([{ id: pSnap.id, data: () => pSnap.data() }], 'profile', candidateUid);
+        if (sSnap?.exists()) absorbCollectionDocs([{ id: sSnap.id, data: () => sSnap.data() }], 'settings', candidateUid);
+        if (ecSnap?.exists()) absorbCollectionDocs([{ id: ecSnap.id, data: () => ecSnap.data() }], 'emailConfig', candidateUid);
+        if (scSnap?.exists()) absorbCollectionDocs([{ id: scSnap.id, data: () => scSnap.data() }], 'sheetConfig', candidateUid);
+      }
+
+      const [
+        tSnap,
+        eSnap,
+        eLegacySnap,
+        mSnap,
+        fSnap,
+        eaSnap,
+      ] = await Promise.all([
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'tenders')),
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'emdRecords')),
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'emd_bg_tracker')),
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'maf_tracker')),
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'attachmentFiles')),
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'emailAlerts')),
+      ]);
+
+      if (tSnap) absorbCollectionDocs(tSnap.docs, 'tenders', candidateUid);
+      if (eSnap) absorbCollectionDocs(eSnap.docs, 'emdRecords', candidateUid);
+      if (eLegacySnap) absorbCollectionDocs(eLegacySnap.docs, 'emdRecords', candidateUid);
+      if (mSnap) absorbCollectionDocs(mSnap.docs, 'maf_tracker', candidateUid);
+      if (fSnap) absorbCollectionDocs(fSnap.docs, 'attachmentFiles', candidateUid);
+      if (eaSnap) absorbCollectionDocs(eaSnap.docs, 'emailAlerts', candidateUid);
+    }
+
+    // 2. Inspect legacy root collections
+    const [
+      rootTenders,
+      rootEmd,
+      rootEmdLegacy,
+      rootMaf,
+      rootFiles,
+      rootEmailAlerts,
+      rootProfile,
+      rootSettings,
+      rootEmailConfig,
+      rootSheetConfig,
+    ] = await Promise.all([
+      safeGetDocs(collection(targetDb, 'tenders')),
+      safeGetDocs(collection(targetDb, 'emdRecords')),
+      safeGetDocs(collection(targetDb, 'emd_bg_tracker')),
+      safeGetDocs(collection(targetDb, 'maf_tracker')),
+      safeGetDocs(collection(targetDb, 'attachmentFiles')),
+      safeGetDocs(collection(targetDb, 'emailAlerts')),
+      safeGetDocs(collection(targetDb, 'profile')),
+      safeGetDocs(collection(targetDb, 'settings')),
+      safeGetDocs(collection(targetDb, 'emailConfig')),
+      safeGetDocs(collection(targetDb, 'sheetConfig')),
+    ]);
+
+    if (rootTenders) absorbCollectionDocs(rootTenders.docs, 'tenders');
+    if (rootEmd) absorbCollectionDocs(rootEmd.docs, 'emdRecords');
+    if (rootEmdLegacy) absorbCollectionDocs(rootEmdLegacy.docs, 'emdRecords');
+    if (rootMaf) absorbCollectionDocs(rootMaf.docs, 'maf_tracker');
+    if (rootFiles) absorbCollectionDocs(rootFiles.docs, 'attachmentFiles');
+    if (rootEmailAlerts) absorbCollectionDocs(rootEmailAlerts.docs, 'emailAlerts');
+    if (rootProfile) absorbCollectionDocs(rootProfile.docs, 'profile');
+    if (rootSettings) absorbCollectionDocs(rootSettings.docs, 'settings');
+    if (rootEmailConfig) absorbCollectionDocs(rootEmailConfig.docs, 'emailConfig');
+    if (rootSheetConfig) absorbCollectionDocs(rootSheetConfig.docs, 'sheetConfig');
+  }
+
+  const merged: CloudWorkspaceDataset = {
+    profile: primary.profile || supplemental.profile,
+    preferences: primary.preferences || supplemental.preferences,
+    emailConfig: primary.emailConfig || supplemental.emailConfig,
+    sheetConfig: primary.sheetConfig || supplemental.sheetConfig,
+    emailAlerts: mergeAdminRecordsById(primary.emailAlerts, supplemental.emailAlerts).sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt),
+    ),
+    tenders: mergeAdminRecordsById(primary.tenders, supplemental.tenders),
+    emdRecords: mergeAdminRecordsById(primary.emdRecords, supplemental.emdRecords),
+    mafTrackers: mergeAdminRecordsById(primary.mafTrackers, supplemental.mafTrackers),
+    attachmentFiles: mergeAdminAttachmentMaps(
+      primary.attachmentFiles,
+      supplemental.attachmentFiles,
+    ),
+  };
+
+  return { primary, supplemental, merged };
 }
 
 export async function backupAllToCloud(

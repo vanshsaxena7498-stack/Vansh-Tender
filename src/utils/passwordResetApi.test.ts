@@ -540,6 +540,155 @@ test('Secondary user signup OTP, per-user forgot password, Admin-only directory,
       const sheetJson = (await sheetRes.json()) as { ok: boolean; error: string };
       assert.equal(sheetJson.ok, false);
       assert.match(sheetJson.error, /non-JSON response/i);
+
+      // 7. Secondary user Disable / Enable via Vercel __api_path rewrite + direct endpoint + disabled login lock
+      const secListBefore = await prevFetch(`${baseUrl}/api/auth/secondary-users`, {
+        headers: { 'x-crm-admin-token': adminSessionToken },
+      });
+      const secListJson = (await secListBefore.json()) as {
+        users: Array<{ userId: string; username: string; email: string }>;
+      };
+      const priyaEntry = secListJson.users.find((u) => u.email === 'priya.biddesk@gmail.com');
+      assert.ok(priyaEntry);
+
+      const disableRes = await prevFetch(
+        `${baseUrl}/api/index?__api_path=/auth/secondary-users/status`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-crm-admin-token': adminSessionToken,
+          },
+          body: JSON.stringify({
+            userId: priyaEntry.userId,
+            username: priyaEntry.username,
+            email: priyaEntry.email,
+            isEnabled: false,
+            clientCredentialTokens: [secResetJson.credentialToken],
+          }),
+        },
+      );
+      assert.equal(disableRes.status, 200);
+      const disableJson = (await disableRes.json()) as {
+        ok: boolean;
+        user: { isEnabled: boolean; presenceStatus: string };
+      };
+      assert.equal(disableJson.ok, true);
+      assert.equal(disableJson.user.isEnabled, false);
+      assert.equal(disableJson.user.presenceStatus, 'not_active');
+
+      // Unknown without metadata still returns 404 cleanly (not "API endpoint not found")
+      const missingUserStatusRes = await prevFetch(`${baseUrl}/api/auth/secondary-users/status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-crm-admin-token': adminSessionToken,
+        },
+        body: JSON.stringify({ userId: 'nonexistent_uid', isEnabled: false }),
+      });
+      assert.equal(missingUserStatusRes.status, 404);
+
+      // Re-enable works cleanly
+      const enableRes = await prevFetch(`${baseUrl}/api/auth/secondary-users/status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-crm-admin-token': adminSessionToken,
+        },
+        body: JSON.stringify({
+          userId: priyaEntry.userId,
+          username: priyaEntry.username,
+          email: priyaEntry.email,
+          isEnabled: true,
+          clientCredentialTokens: [secResetJson.credentialToken],
+        }),
+      });
+      assert.equal(enableRes.status, 200);
+      const enableJson = (await enableRes.json()) as {
+        ok: boolean;
+        user: { isEnabled: boolean };
+      };
+      assert.equal(enableJson.ok, true);
+      assert.equal(enableJson.user.isEnabled, true);
+    });
+
+    // 8. Cold-start serverless instance handles secondary user status toggle via metadata upsert without 404
+    if (fs.existsSync(STATE_FILE)) {
+      fs.unlinkSync(STATE_FILE);
+    }
+    await withHttpServer(handler as unknown as http.RequestListener, async (coldUrl) => {
+      let coldAdminLogin = await prevFetch(`${coldUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: 'VanshSales', password: 'UpdatedPass@2029' }),
+      });
+      if (coldAdminLogin.status !== 200) {
+        coldAdminLogin = await prevFetch(`${coldUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifier: 'VanshSales', password: 'Vansh@2027' }),
+        });
+      }
+      assert.equal(coldAdminLogin.status, 200);
+      const coldAdminJson = (await coldAdminLogin.json()) as { adminSessionToken?: string };
+      const coldAdminToken = coldAdminJson.adminSessionToken || '';
+      assert.ok(coldAdminToken);
+
+      const coldToggleRes = await prevFetch(
+        `${coldUrl}/api/index?__api_path=/auth/secondary-users/status`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-crm-admin-token': coldAdminToken,
+          },
+          body: JSON.stringify({
+            userId: 'sec_niyan_cloud_99',
+            username: 'Niyan',
+            email: 'info.niyantrana@gmail.com',
+            aliasUserIds: ['sec_niyan_old'],
+            byocProjectId: 'niyan-byoc-project',
+            isEnabled: false,
+          }),
+        },
+      );
+      assert.equal(coldToggleRes.status, 200);
+      const coldToggleJson = (await coldToggleRes.json()) as {
+        ok: boolean;
+        user: { userId: string; isEnabled: boolean; aliasUserIds?: string[] };
+      };
+      assert.equal(coldToggleJson.ok, true);
+      assert.equal(coldToggleJson.user.isEnabled, false);
+      assert.ok((coldToggleJson.user.aliasUserIds || []).includes('sec_niyan_old'));
+
+      // 9. Server-side MAF extraction gate rejects requests with only Attachment 1 or only Attachment 2
+      const attOnly1Res = await prevFetch(`${coldUrl}/api/maf/extract-from-attachments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          attachment1: {
+            fileName: 'bid.pdf',
+            mimeType: 'application/pdf',
+            dataUrl: 'data:application/pdf;base64,AAAA',
+          },
+          attachment2: null,
+        }),
+      });
+      assert.equal(attOnly1Res.status, 400);
+
+      const attOnly2Res = await prevFetch(`${coldUrl}/api/maf/extract-from-attachments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          attachment1: null,
+          attachment2: {
+            fileName: 'spec.csv',
+            mimeType: 'text/csv',
+            dataUrl: 'data:text/csv;base64,' + Buffer.from('Item,Qty\nUPS,2 Nos').toString('base64'),
+          },
+        }),
+      });
+      assert.equal(attOnly2Res.status, 400);
     });
   } finally {
     globalThis.fetch = prevFetch;
@@ -550,4 +699,5 @@ test('Secondary user signup OTP, per-user forgot password, Admin-only directory,
     }
   }
 });
+
 

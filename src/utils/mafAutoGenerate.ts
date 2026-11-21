@@ -63,6 +63,41 @@ export function findTenderAttachmentSlot(
   return undefined;
 }
 
+export function evaluateTenderMafAttachmentGate(
+  tender: Tender,
+  resolveAttachmentDataUrl?: (att: AttachmentItem) => string,
+): {
+  ready: boolean;
+  attachment1: AttachmentItem | undefined;
+  attachment2: AttachmentItem | undefined;
+  attachment1DataUrl: string;
+  attachment2DataUrl: string;
+} {
+  const attachment1 = findTenderAttachmentSlot(tender.attachments, 1);
+  const attachment2 = findTenderAttachmentSlot(tender.attachments, 2);
+  const attachment1DataUrl = attachment1
+    ? (resolveAttachmentDataUrl ? resolveAttachmentDataUrl(attachment1) : attachment1.dataUrl) || ''
+    : '';
+  const attachment2DataUrl = attachment2
+    ? (resolveAttachmentDataUrl ? resolveAttachmentDataUrl(attachment2) : attachment2.dataUrl) || ''
+    : '';
+
+  const ready = Boolean(
+    attachment1 &&
+      attachment1DataUrl.trim() &&
+      attachment2 &&
+      attachment2DataUrl.trim(),
+  );
+
+  return {
+    ready,
+    attachment1,
+    attachment2,
+    attachment1DataUrl,
+    attachment2DataUrl,
+  };
+}
+
 export function buildTenderAttachmentExtractionSignature(tender: Tender): string {
   const att1 = findTenderAttachmentSlot(tender.attachments, 1);
   const att2 = findTenderAttachmentSlot(tender.attachments, 2);

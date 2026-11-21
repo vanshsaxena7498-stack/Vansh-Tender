@@ -402,7 +402,10 @@ function computeServerPresenceStatus(
   return nowMs - hbMs <= SERVER_PRESENCE_TTL_MS ? 'active' : 'not_active';
 }
 
-function sanitizeServerUserForClient(user: CrmServerUserRecord) {
+function sanitizeServerUserForClient(
+  user: CrmServerUserRecord,
+  aliasUserIds?: string[],
+) {
   const isEnabled =
     user.isEnabled !== undefined ? user.isEnabled !== false : user.isActive !== false;
   const presenceStatus = computeServerPresenceStatus(user);
@@ -421,7 +424,43 @@ function sanitizeServerUserForClient(user: CrmServerUserRecord) {
     lastLogoutAt: user.lastLogoutAt,
     byocProjectId: user.byocProjectId,
     byocConfig: user.byocConfig ?? null,
+    ...(aliasUserIds && aliasUserIds.length > 0 ? { aliasUserIds } : {}),
   };
+}
+
+function deduplicateServerSecondaryUsers(users: CrmServerUserRecord[]) {
+  const byEmail = new Map<
+    string,
+    { canonical: CrmServerUserRecord; aliases: Set<string> }
+  >();
+  const recencyScore = (u: CrmServerUserRecord) =>
+    [u.disabledAt, u.lastHeartbeatAt, u.lastLoginAt, u.lastLogoutAt, u.updatedAt, u.createdAt]
+      .filter((v): v is string => typeof v === 'string' && v.length > 0)
+      .sort()
+      .pop() || '';
+
+  for (const user of users) {
+    if (user.role !== 'secondary') continue;
+    const normEmail = (user.email || '').trim().toLowerCase();
+    const key = normEmail || user.userId.toLowerCase();
+    const existing = byEmail.get(key);
+    if (!existing) {
+      byEmail.set(key, { canonical: user, aliases: new Set([user.userId]) });
+      continue;
+    }
+    existing.aliases.add(user.userId);
+    if (recencyScore(user) >= recencyScore(existing.canonical)) {
+      existing.canonical = user;
+    }
+  }
+
+  return Array.from(byEmail.values())
+    .sort((a, b) =>
+      (b.canonical.createdAt || '').localeCompare(a.canonical.createdAt || ''),
+    )
+    .map(({ canonical, aliases }) =>
+      sanitizeServerUserForClient(canonical, Array.from(aliases)),
+    );
 }
 
 function maskEmailAddress(email: string): string {
@@ -878,16 +917,63 @@ export function createApiRouter(): Router {
     const trimmed = identifier.trim();
     if (!trimmed) return null;
     const lower = trimmed.toLowerCase();
+    let best: CrmServerUserRecord | null = null;
     for (const user of pool.values()) {
       if (
         user.userId.toLowerCase() === lower ||
         user.username.toLowerCase() === lower ||
         user.email.toLowerCase() === lower
       ) {
-        return user;
+        if (
+          !best ||
+          (user.updatedAt || '') > (best.updatedAt || '') ||
+          ((user.updatedAt || '') === (best.updatedAt || '') && user.userId === trimmed)
+        ) {
+          best = user;
+        }
       }
     }
-    return null;
+    return best;
+  }
+
+  function findLatestSecondaryByEmail(
+    pool: Map<string, CrmServerUserRecord>,
+    email: string,
+  ): CrmServerUserRecord | null {
+    const norm = email.trim().toLowerCase();
+    if (!norm) return null;
+    let latest: CrmServerUserRecord | null = null;
+    for (const user of pool.values()) {
+      if (user.role !== 'secondary') continue;
+      if ((user.email || '').trim().toLowerCase() !== norm) continue;
+      if (!latest || (user.updatedAt || '') >= (latest.updatedAt || '')) {
+        latest = user;
+      }
+    }
+    return latest;
+  }
+
+  async function isAdminAuthorizedRequest(
+    req: Request,
+    body?: Record<string, unknown>,
+  ): Promise<boolean> {
+    const adminToken =
+      typeof req.headers['x-crm-admin-token'] === 'string'
+        ? req.headers['x-crm-admin-token'].trim()
+        : '';
+    if (adminToken && verifyAdminSessionToken(adminToken)) {
+      return true;
+    }
+    const headerFbToken =
+      typeof req.headers['x-firebase-id-token'] === 'string'
+        ? req.headers['x-firebase-id-token'].trim()
+        : '';
+    const bodyFbToken =
+      body && typeof body.firebaseIdToken === 'string' ? body.firebaseIdToken.trim() : '';
+    const firebaseIdToken = headerFbToken || bodyFbToken;
+    if (!firebaseIdToken) return false;
+    const verified = await verifyGoogleIdTokenForEmail(firebaseIdToken, RECOVERY_EMAIL);
+    return verified.ok;
   }
 
   router.get('/health', (_req: Request, res: Response) => {
@@ -947,9 +1033,17 @@ export function createApiRouter(): Router {
       return;
     }
 
+    const latestSameEmail =
+      matched.role === 'secondary' ? findLatestSecondaryByEmail(pool, matched.email) : null;
     const accountEnabled =
       matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
-    if (!accountEnabled && matched.role !== 'admin') {
+    const latestEmailEnabled =
+      latestSameEmail && latestSameEmail.isEnabled !== undefined
+        ? latestSameEmail.isEnabled !== false
+        : latestSameEmail
+          ? latestSameEmail.isActive !== false
+          : true;
+    if ((!accountEnabled || !latestEmailEnabled) && matched.role !== 'admin') {
       res.status(403).json({
         ok: false,
         code: 'ACCOUNT_DISABLED',
@@ -1025,9 +1119,17 @@ export function createApiRouter(): Router {
       return;
     }
 
+    const latestSameEmail =
+      matched.role === 'secondary' ? findLatestSecondaryByEmail(pool, matched.email) : null;
     const isEnabled =
       matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
-    if (!isEnabled && matched.role !== 'admin') {
+    const latestEmailEnabled =
+      latestSameEmail && latestSameEmail.isEnabled !== undefined
+        ? latestSameEmail.isEnabled !== false
+        : latestSameEmail
+          ? latestSameEmail.isActive !== false
+          : true;
+    if ((!isEnabled || !latestEmailEnabled) && matched.role !== 'admin') {
       res.status(403).json({
         ok: false,
         code: 'ACCOUNT_DISABLED',
@@ -1921,22 +2023,15 @@ export function createApiRouter(): Router {
     }
   });
 
-  router.get('/auth/secondary-users', (req: Request, res: Response) => {
-    const adminToken =
-      typeof req.headers['x-crm-admin-token'] === 'string'
-        ? req.headers['x-crm-admin-token'].trim()
-        : '';
-    if (!adminToken || !verifyAdminSessionToken(adminToken)) {
+  router.get('/auth/secondary-users', async (req: Request, res: Response) => {
+    if (!(await isAdminAuthorizedRequest(req))) {
       res.status(403).json({
         ok: false,
         error: 'Admin session authorization is required to view secondary accounts.',
       });
       return;
     }
-    const secondaryUsers = Object.values(state.users || {})
-      .filter((u) => u.role === 'secondary')
-      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
-      .map(sanitizeServerUserForClient);
+    const secondaryUsers = deduplicateServerSecondaryUsers(Object.values(state.users || {}));
 
     res.json({
       ok: true,
@@ -1944,12 +2039,19 @@ export function createApiRouter(): Router {
     });
   });
 
-  router.post('/auth/secondary-users/status', (req: Request, res: Response) => {
-    const adminToken =
-      typeof req.headers['x-crm-admin-token'] === 'string'
-        ? req.headers['x-crm-admin-token'].trim()
-        : '';
-    if (!adminToken || !verifyAdminSessionToken(adminToken)) {
+  router.post('/auth/secondary-users/status', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      userId?: unknown;
+      username?: unknown;
+      email?: unknown;
+      aliasUserIds?: unknown;
+      isEnabled?: unknown;
+      byocProjectId?: unknown;
+      firebaseIdToken?: unknown;
+      clientCredentialTokens?: unknown;
+    };
+
+    if (!(await isAdminAuthorizedRequest(req, body as Record<string, unknown>))) {
       res.status(403).json({
         ok: false,
         error: 'Admin session authorization is required to change secondary user status.',
@@ -1957,32 +2059,100 @@ export function createApiRouter(): Router {
       return;
     }
 
-    const body = (req.body || {}) as {
-      userId?: unknown;
-      username?: unknown;
-      email?: unknown;
-      isEnabled?: unknown;
-      clientCredentialTokens?: unknown;
-    };
-    const targetIdentifier =
-      (typeof body.userId === 'string' && body.userId.trim()) ||
-      (typeof body.username === 'string' && body.username.trim()) ||
-      (typeof body.email === 'string' && body.email.trim()) ||
-      '';
+    const rawUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
+    const rawUsername = typeof body.username === 'string' ? body.username.trim() : '';
+    const rawEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const aliasUserIds = Array.isArray(body.aliasUserIds)
+      ? body.aliasUserIds.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      : [];
+    const targetIdentifier = rawUserId || rawUsername || rawEmail;
     if (!targetIdentifier || typeof body.isEnabled !== 'boolean') {
       res.status(400).json({ ok: false, error: 'userId and boolean isEnabled are required.' });
       return;
     }
 
     const pool = buildUserPool(req, body as Record<string, unknown>);
-    const target = pool.get(targetIdentifier) || findUserInPool(pool, targetIdentifier);
-    if (!target || target.role === 'admin') {
-      res.status(404).json({ ok: false, error: 'Secondary user account not found.' });
-      return;
+    let target =
+      pool.get(targetIdentifier) ||
+      findUserInPool(pool, targetIdentifier) ||
+      (rawEmail ? findUserInPool(pool, rawEmail) : null) ||
+      (rawUsername ? findUserInPool(pool, rawUsername) : null);
+
+    if (!target) {
+      for (const aliasId of aliasUserIds) {
+        const hit = pool.get(aliasId) || findUserInPool(pool, aliasId);
+        if (hit && hit.role !== 'admin') {
+          target = hit;
+          break;
+        }
+      }
     }
 
     const nowIso = new Date().toISOString();
     const isEnabled = body.isEnabled;
+
+    if (!target) {
+      // Handle serverless cold-starts where secondary user exists in Firestore / Admin UI
+      // without being in this ephemeral lambda's /tmp state yet.
+      if (
+        rawUsername &&
+        rawEmail &&
+        isValidEmailAddress(rawEmail) &&
+        rawUsername.toLowerCase() !== ADMIN_USERNAME.toLowerCase() &&
+        rawEmail !== RECOVERY_EMAIL.toLowerCase()
+      ) {
+        const { salt, hash } = hashSecret(crypto.randomBytes(16).toString('hex'));
+        target = {
+          userId: rawUserId || `sec_${rawUsername.toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`,
+          username: rawUsername,
+          email: rawEmail,
+          role: 'secondary',
+          salt,
+          hash,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          isActive: false,
+          isEnabled,
+          presenceStatus: 'not_active',
+          byocProjectId:
+            typeof body.byocProjectId === 'string' && body.byocProjectId.trim()
+              ? body.byocProjectId.trim()
+              : undefined,
+        };
+      } else {
+        res.status(404).json({ ok: false, error: 'Secondary user account not found.' });
+        return;
+      }
+    }
+
+    if (target.role === 'admin') {
+      res.status(404).json({ ok: false, error: 'Secondary user account not found.' });
+      return;
+    }
+
+    const targetEmail = (rawEmail || target.email || '').trim().toLowerCase();
+    const matchedIds = new Set<string>([target.userId, ...aliasUserIds]);
+    if (rawUserId) matchedIds.add(rawUserId);
+
+    const nextUsers = { ...state.users };
+    for (const [uid, existingUser] of Object.entries(nextUsers)) {
+      if (existingUser.role === 'admin') continue;
+      const matchesSameAccount =
+        matchedIds.has(uid) ||
+        matchedIds.has(existingUser.userId) ||
+        (targetEmail && existingUser.email.trim().toLowerCase() === targetEmail);
+      if (!matchesSameAccount) continue;
+      matchedIds.add(existingUser.userId);
+      nextUsers[uid] = {
+        ...existingUser,
+        isEnabled,
+        isActive: isEnabled ? computeServerPresenceStatus(existingUser) === 'active' : false,
+        disabledAt: isEnabled ? undefined : nowIso,
+        presenceStatus: isEnabled ? existingUser.presenceStatus ?? 'not_active' : 'not_active',
+        updatedAt: nowIso,
+      };
+    }
+
     const updatedUser: CrmServerUserRecord = {
       ...target,
       isEnabled,
@@ -1991,19 +2161,17 @@ export function createApiRouter(): Router {
       presenceStatus: isEnabled ? target.presenceStatus ?? 'not_active' : 'not_active',
       updatedAt: nowIso,
     };
+    nextUsers[updatedUser.userId] = updatedUser;
 
     state = {
       ...state,
-      users: {
-        ...state.users,
-        [updatedUser.userId]: updatedUser,
-      },
+      users: nextUsers,
     };
     saveServerState(state);
 
     res.json({
       ok: true,
-      user: sanitizeServerUserForClient(updatedUser),
+      user: sanitizeServerUserForClient(updatedUser, Array.from(matchedIds)),
       credentialToken: signUserCredentialToken(updatedUser),
       message: isEnabled
         ? `Re-enabled access for ${updatedUser.username}.`
@@ -2752,11 +2920,11 @@ export function createApiRouter(): Router {
       const fallbackDepartment =
         typeof body.fallbackDepartment === 'string' ? body.fallbackDepartment.trim() : '';
 
-      if (!att1 && !att2) {
+      if (!att1 || !att2) {
         res.status(400).json({
           ok: false,
           success: false,
-          error: 'At least Attachment 1 or Attachment 2 content is required.',
+          error: 'Both Attachment 1 (Bid Document) and Attachment 2 (Specification Document) are required before auto-generating MAF entries.',
         });
         return;
       }

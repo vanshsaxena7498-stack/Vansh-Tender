@@ -789,7 +789,7 @@ service cloud.firestore {
 
     match /users/{userId} {
       allow get: if isVerifiedUser() && isValidId(userId) && (isOwner(userId) || isAdmin());
-      allow list: if false;
+      allow list: if isBootstrappedAdmin();
       allow create: if isVerifiedUser() &&
         isValidId(userId) &&
         isOwner(userId) &&
@@ -815,11 +815,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(profileId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(profileId) &&
@@ -865,11 +869,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(settingId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(settingId) &&
@@ -910,11 +918,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(attachmentId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(attachmentId) &&
@@ -956,11 +968,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(tenderDocId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(tenderDocId) &&
@@ -1040,11 +1056,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(emdDocId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(emdDocId) &&
@@ -1106,15 +1126,25 @@ service cloud.firestore {
           hasValidParentUser(userId);
       }
 
+      match /emd_bg_tracker/{emdDocId} {
+        allow get: if isBootstrappedAdmin() && isValidId(userId) && isValidId(emdDocId);
+        allow list: if isBootstrappedAdmin();
+        allow create, update, delete: if false;
+      }
+
       match /maf_tracker/{mafDocId} {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(mafDocId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(mafDocId) &&
@@ -1163,11 +1193,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
@@ -1211,11 +1245,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(alertId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(alertId) &&
@@ -1255,11 +1293,15 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
-          (isOwner(userId) || isAdmin()) &&
-          hasValidParentUser(userId);
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
         allow list: if isVerifiedUser() &&
-          request.auth.uid == userId &&
-          resource.data.ownerUid == request.auth.uid;
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
@@ -1836,7 +1878,7 @@ service cloud.firestore {
         isValidId(secondaryUserId) &&
         (isAdmin() || existing().ownerUid == request.auth.uid);
       allow list: if isVerifiedUser() &&
-        (isAdmin() || resource.data.ownerUid == request.auth.uid);
+        (isBootstrappedAdmin() || resource.data.ownerUid == request.auth.uid);
       allow create: if isVerifiedUser() &&
         isValidId(secondaryUserId) &&
         isValidSecondaryUserRecord(incoming(), secondaryUserId) &&
@@ -1870,6 +1912,67 @@ service cloud.firestore {
       allow delete: if isVerifiedUser() &&
         isValidId(secondaryUserId) &&
         isAdmin();
+    }
+
+    // Legacy top-level collections: strictly read-only for Bootstrapped Primary Admin recovery
+    match /tenders/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /emdRecords/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /emd_bg_tracker/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /maf_tracker/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /attachmentFiles/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /settings/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /profile/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /sheetConfig/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /emailConfig/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /emailAlerts/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
     }
   }
 }
