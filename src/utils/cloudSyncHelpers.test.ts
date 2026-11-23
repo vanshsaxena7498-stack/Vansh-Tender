@@ -368,7 +368,7 @@ test('buildWorkspaceRootPayload and buildSecondaryUserCloudPayload enforce bound
   assert.equal(Object.keys(secUserPayload).length, 15);
 });
 
-test('buildCloudTenderPayload includes all 33 blueprint keys with expanded MIS fields', () => {
+test('buildCloudTenderPayload includes all 40 blueprint keys with expanded MIS & BID/RA fields', () => {
   const tender: Tender = {
     id: 'mis-tnd-1',
     tenderId: 'GEM/2026/B/7788',
@@ -395,6 +395,13 @@ test('buildCloudTenderPayload includes all 33 blueprint keys with expanded MIS f
     stage: 'L1 / Won',
     resultInfo: 'Awarded',
     completionDate: '2026-11-25',
+    technicalStatus: 'Technically Qualified',
+    technicalOpeningDateTime: '2026-11-18T11:30',
+    technicalRemarks: 'Compliant OEM MAF & specs',
+    financialRaStatus: 'L1 / Awarded',
+    financialOpeningRaDateTime: '2026-11-25T15:00',
+    raFinalValue: 1095000,
+    raFinancialRemarks: 'Finalized via RA round 2',
     checklist: [],
     remarks: [],
     attachments: [],
@@ -403,7 +410,7 @@ test('buildCloudTenderPayload includes all 33 blueprint keys with expanded MIS f
   };
 
   const payload = buildCloudTenderPayload(tender, 'uid-admin-1', TOKEN);
-  assert.equal(Object.keys(payload).length, 33);
+  assert.equal(Object.keys(payload).length, 40);
   assert.equal(payload.clientName, 'Indian Army Signals');
   assert.equal(payload.locationDepartment, 'Signals / Panchkula');
   assert.equal(payload.technicalOpeningDate, '2026-11-18');
@@ -412,6 +419,13 @@ test('buildCloudTenderPayload includes all 33 blueprint keys with expanded MIS f
   assert.equal(payload.l1QuotedValue, 1120000);
   assert.equal(payload.ourPositionRank, 'L1');
   assert.equal(payload.assignedOwner, 'Vansh');
+  assert.equal(payload.technicalStatus, 'Technically Qualified');
+  assert.equal(payload.technicalOpeningDateTime, '2026-11-18T11:30');
+  assert.equal(payload.technicalRemarks, 'Compliant OEM MAF & specs');
+  assert.equal(payload.financialRaStatus, 'L1 / Awarded');
+  assert.equal(payload.financialOpeningRaDateTime, '2026-11-25T15:00');
+  assert.equal(payload.raFinalValue, 1095000);
+  assert.equal(payload.raFinancialRemarks, 'Finalized via RA round 2');
 });
 
 test('buildSecondaryUserCloudPayload preserves isEnabled=true when secondary user is offline', async () => {
@@ -497,6 +511,37 @@ test('Admin multi-source helpers normalize timestamps, exclude secondary workspa
   assert.equal(mergedFiles.get('att-1'), 'primary-data');
   assert.equal(mergedFiles.get('att-2'), 'legacy-recovered');
 });
+
+test('buildCloudOemPayload validates all 12 blueprint fields and enforces field bounds', async () => {
+  const { buildCloudOemPayload } = await import('./cloudSyncHelpers');
+  const payload = buildCloudOemPayload(
+    {
+      id: 'oem/nvs',
+      oemName: '  NVS  ',
+      companyName: '  Newtech ',
+      concernedPersonName: ' Sandeep Tyagi ',
+      email: ' sandeep.tyagi@nvsledwall.com ',
+      phone: ' +91 8800686947 ',
+      remarks: ' Indoor LED Video Wall ',
+      createdAt: '2026-11-20T10:00:00Z',
+      updatedAt: '2026-11-22T10:00:00Z',
+    },
+    'uid-admin-1',
+    TOKEN,
+  );
+  assert.equal(Object.keys(payload).length, 12);
+  assert.equal(payload.ownerUid, 'uid-admin-1');
+  assert.equal(payload.id, 'oem_nvs');
+  assert.equal(payload.oemName, 'NVS');
+  assert.equal(payload.companyName, 'Newtech');
+  assert.equal(payload.concernedPersonName, 'Sandeep Tyagi');
+  assert.equal(payload.email, 'sandeep.tyagi@nvsledwall.com');
+  assert.equal(payload.phone, '+91 8800686947');
+  assert.equal(payload.remarks, 'Indoor LED Video Wall');
+  assert.equal(payload.createdAt, TOKEN);
+  assert.equal(payload.updatedAt, TOKEN);
+});
+
 
 
 

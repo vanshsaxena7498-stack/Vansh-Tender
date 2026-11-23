@@ -173,12 +173,36 @@ test('findDailyTenderByCode and findMatchingDailyTender match registered Daily T
   assert.equal(mismatchedCodeWithOldRef, undefined);
 });
 
-test('validateMafItemDraft and validateMafUploadFile enforce required fields, allow blank OEM for Pending items, and enforce 5MB PDF/image bounds', () => {
+test('validateMafItemDraft and validateMafUploadFile enforce required fields, allow blank OEM for Pending items, restrict OEMs to directory when provided, and enforce 5MB PDF/image bounds', () => {
   assert.ok(validateMafItemDraft({ itemName: '', oemName: 'Cisco' }));
   assert.ok(validateMafItemDraft({ itemName: 'Switches', oemName: '  ' }));
   assert.equal(validateMafItemDraft({ itemName: 'Switches', oemName: '', mafStatus: 'Pending' }), null);
   assert.equal(validateMafItemDraft({ itemName: 'Switches', oemName: '', allowBlankOem: true }), null);
   assert.equal(validateMafItemDraft({ itemName: 'Switches', oemName: 'Cisco' }), null);
+  assert.equal(
+    validateMafItemDraft({
+      itemName: 'LED Wall',
+      oemName: 'NVS',
+      allowedOemNames: ['NVS', 'Cisco'],
+    }),
+    null,
+  );
+  assert.ok(
+    validateMafItemDraft({
+      itemName: 'LED Wall',
+      oemName: 'UnlistedBrand',
+      allowedOemNames: ['NVS', 'Cisco'],
+    }),
+  );
+  assert.equal(
+    validateMafItemDraft({
+      itemName: 'LED Wall',
+      oemName: '',
+      mafStatus: 'Pending',
+      allowedOemNames: ['NVS', 'Cisco'],
+    }),
+    null,
+  );
 
   assert.equal(
     validateMafUploadFile({ name: 'maf_signed.pdf', type: 'application/pdf', size: 1024 * 1024 }),

@@ -4,6 +4,7 @@ import {
   DEFAULT_FIRM_PROFILE,
   SEED_EMD_RECORDS,
   SEED_MAF_TRACKERS,
+  SEED_OEM_DETAILS,
   SEED_TENDERS,
 } from '../data/seedData';
 import { DEFAULT_GOOGLE_SHEET_SETTINGS } from './googleSheetSync';
@@ -30,6 +31,7 @@ test('estimateCloudStorageUsage accurately computes seed dataset below 1 MB', ()
     tenders: SEED_TENDERS,
     emdRecords: SEED_EMD_RECORDS,
     mafTrackers: SEED_MAF_TRACKERS,
+    oemRecords: SEED_OEM_DETAILS,
     emailSettings: DEFAULT_EMAIL_ALERT_SETTINGS,
     emailLogs: [],
     sheetSettings: DEFAULT_GOOGLE_SHEET_SETTINGS,
@@ -41,7 +43,11 @@ test('estimateCloudStorageUsage accurately computes seed dataset below 1 MB', ()
   assert.ok(result.usagePercent < 0.1);
   assert.equal(result.firestoreAttachmentCount, 0);
   assert.equal(result.externalStorageFileCount, 6);
-  assert.equal(result.categories.length, 5);
+  assert.equal(result.categories.length, 6);
+  const oemCat = result.categories.find((c) => c.key === 'oems');
+  assert.ok(oemCat);
+  assert.equal(oemCat.docCount, SEED_OEM_DETAILS.length);
+  assert.ok(oemCat.bytes > 0);
 });
 
 test('estimateCloudStorageUsage includes deduplicated Firestore attachments and tracks external Storage PDFs separately', () => {

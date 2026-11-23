@@ -5,6 +5,7 @@ import type {
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
+  OemRecord,
   Tender,
   UserPreferences,
 } from '../types/crm';
@@ -14,6 +15,7 @@ import {
   buildCloudEmailConfigPayload,
   buildCloudEmdPayload,
   buildCloudMafTrackerPayload,
+  buildCloudOemPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudSheetConfigPayload,
@@ -41,7 +43,7 @@ export function formatStorageSize(bytes: number): string {
 }
 
 export interface StorageCategorySummary {
-  key: 'attachments' | 'tenders' | 'emd' | 'maf' | 'system';
+  key: 'attachments' | 'tenders' | 'emd' | 'maf' | 'oems' | 'system';
   label: string;
   docCount: number;
   bytes: number;
@@ -67,6 +69,7 @@ export interface EstimateCloudStorageInput {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
+  oemRecords?: OemRecord[];
   emailSettings: EmailAlertSettings;
   emailLogs: EmailAlertLog[];
   sheetSettings: GoogleSheetSettings;
@@ -113,6 +116,15 @@ export function estimateCloudStorageUsage(
         }
       }
     }
+  }
+
+  // 3b. OEM Details
+  const oemList = input.oemRecords ?? [];
+  let oemBytes = 0;
+  for (const oem of oemList) {
+    oemBytes += measureJsonBytes(
+      buildCloudOemPayload(oem, ownerUid, SAMPLE_ISO_TIMESTAMP, SAMPLE_ISO_TIMESTAMP),
+    );
   }
 
   // 4. Attachments stored in Firestore (/users/{uid}/attachmentFiles/{id})
@@ -267,12 +279,13 @@ export function estimateCloudStorageUsage(
     );
   }
 
-  const totalBytes = attachmentBytes + tenderBytes + emdBytes + mafBytes + systemBytes;
+  const totalBytes = attachmentBytes + tenderBytes + emdBytes + mafBytes + oemBytes + systemBytes;
   const totalDocs =
     attachmentDocPayloads.size +
     input.tenders.length +
     input.emdRecords.length +
     input.mafTrackers.length +
+    oemList.length +
     systemDocs;
 
   const usagePercent = Math.min(100, (totalBytes / FIRESTORE_FREE_QUOTA_BYTES) * 100);
@@ -302,6 +315,12 @@ export function estimateCloudStorageUsage(
       label: 'MAF Tracker',
       docCount: input.mafTrackers.length,
       bytes: mafBytes,
+    },
+    {
+      key: 'oems',
+      label: 'OEM Directory',
+      docCount: oemList.length,
+      bytes: oemBytes,
     },
     {
       key: 'system',

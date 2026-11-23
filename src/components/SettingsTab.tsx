@@ -46,6 +46,7 @@ import type {
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
+  OemRecord,
   SecondaryUserSummary,
   SheetSyncStatus,
   Tender,
@@ -66,6 +67,7 @@ interface SettingsTabProps {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
+  oemRecords: OemRecord[];
   onSaveProfile: (profile: FirmProfile) => void;
   onLogout: () => void;
   onImportBackup: (payload: CrmBackupPayload) => void;
@@ -108,6 +110,7 @@ export function SettingsTab({
   tenders,
   emdRecords,
   mafTrackers,
+  oemRecords,
   onSaveProfile,
   onLogout,
   onImportBackup,
@@ -468,19 +471,23 @@ export function SettingsTab({
 
   const handleDownloadJsonBackup = () => {
     const payload: CrmBackupPayload = {
-      version: 2,
+      version: 3,
       exportedAt: new Date().toISOString(),
       profile,
       tenders,
       emdRecords,
       mafTrackers,
+      oemDetails: oemRecords,
     };
     downloadTextFile(
       `BidLedger_Full_Backup_${new Date().toISOString().slice(0, 10)}.json`,
       JSON.stringify(payload, null, 2),
       'application/json',
     );
-    setBackupMsg({ type: 'ok', msg: 'Full JSON backup downloaded (including MAF Trackers).' });
+    setBackupMsg({
+      type: 'ok',
+      msg: 'Full JSON backup downloaded (including OEM Details & MAF Trackers).',
+    });
   };
 
   const handleExportAllCsv = () => {
@@ -516,6 +523,28 @@ export function SettingsTab({
       'text/csv;charset=utf-8;',
     );
 
+    const oHeaders = [
+      'OEM / Manufacturer Name',
+      'Company Name',
+      'Concerned Person Name',
+      'Email ID',
+      'Phone No.',
+      'Remarks',
+    ];
+    const oRows = oemRecords.map((o) => [
+      o.oemName,
+      o.companyName,
+      o.concernedPersonName,
+      o.email,
+      o.phone,
+      o.remarks,
+    ]);
+    downloadTextFile(
+      `BidLedger_OEM_Details_${new Date().toISOString().slice(0, 10)}.csv`,
+      buildCsvContent(oHeaders, oRows),
+      'text/csv;charset=utf-8;',
+    );
+
     const eHeaders = [
       'Tender ID',
       'Department',
@@ -547,7 +576,10 @@ export function SettingsTab({
       buildCsvContent(eHeaders, eRows),
       'text/csv;charset=utf-8;',
     );
-    setBackupMsg({ type: 'ok', msg: 'Both Tender & EMD/BG CSV reports downloaded.' });
+    setBackupMsg({
+      type: 'ok',
+      msg: 'Tender, OEM Details & EMD/BG CSV reports downloaded.',
+    });
   };
 
   const handleImportJson = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -560,9 +592,11 @@ export function SettingsTab({
         setBackupMsg({ type: 'err', msg: 'Invalid backup JSON structure.' });
         return;
       }
+      const importedOems = Array.isArray(parsed.oemDetails) ? parsed.oemDetails : [];
       onImportBackup({
         ...parsed,
         mafTrackers: Array.isArray(parsed.mafTrackers) ? parsed.mafTrackers : [],
+        oemDetails: importedOems,
       });
       setFirmName(parsed.profile.firmName);
       setGstin(parsed.profile.gstin);
@@ -571,7 +605,7 @@ export function SettingsTab({
       setAdminPhotoUrl(parsed.profile.adminPhotoUrl ?? '');
       setBackupMsg({
         type: 'ok',
-        msg: `Restored ${parsed.tenders.length} tenders, ${parsed.emdRecords.length} EMD/BG records, and ${(parsed.mafTrackers ?? []).length} MAF trackers.`,
+        msg: `Restored ${parsed.tenders.length} tenders, ${importedOems.length} OEMs, ${parsed.emdRecords.length} EMD/BG records, and ${(parsed.mafTrackers ?? []).length} MAF trackers.`,
       });
     } catch {
       setBackupMsg({ type: 'err', msg: 'Could not parse JSON backup file.' });
@@ -1027,7 +1061,7 @@ export function SettingsTab({
             />
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
             {storageUsage.categories.map((cat) => (
               <div
                 key={cat.key}

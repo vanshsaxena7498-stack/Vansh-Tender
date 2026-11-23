@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
-import { Check, FileText, Link2, Loader2, Trash2, Upload, X } from 'lucide-react';
-import { COMMON_OEM_NAMES } from '../data/seedData';
-import type { MafItemStatus, MafLineItem } from '../types/crm';
+import {
+  AlertTriangle,
+  Building2,
+  Check,
+  FileText,
+  Link2,
+  Loader2,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react';
+import type { MafItemStatus, MafLineItem, OemRecord } from '../types/crm';
 import {
   createMafItemId,
   getMafContactDetails,
@@ -12,12 +21,16 @@ import {
   validateMafItemDraft,
   validateMafUploadFile,
 } from '../utils/mafCalculations';
+import { buildMafContactPatchFromOem, findOemByName } from '../utils/oemDirectory';
+import { OemSelectControl } from './OemSelectControl';
 
 interface MafItemModalProps {
   trackerId: string;
   tenderId: string;
   tenderTitle: string;
   initialItem?: MafLineItem | null;
+  oemRecords: OemRecord[];
+  onGoToOemDetails: () => void;
   onClose: () => void;
   onSave: (item: MafLineItem) => void;
   onUploadFile: (
@@ -36,6 +49,8 @@ export function MafItemModal({
   tenderId,
   tenderTitle,
   initialItem,
+  oemRecords,
+  onGoToOemDetails,
   onClose,
   onSave,
   onUploadFile,
@@ -70,6 +85,9 @@ export function MafItemModal({
   const [errorMsg, setErrorMsg] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const matchedOem = findOemByName(oemRecords, oemName);
+  const hasUnlistedLegacyOem = Boolean(oemName.trim()) && !matchedOem;
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -77,6 +95,24 @@ export function MafItemModal({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
+
+  const handleSelectOem = (selected: OemRecord | null) => {
+    if (selected) {
+      const patch = buildMafContactPatchFromOem(selected);
+      setOemName(patch.oemName);
+      setCompanyName(patch.companyName);
+      setConcernedPersonName(patch.concernedPersonName);
+      setContactNo(patch.contactNo);
+      setMailId(patch.mailId);
+      setErrorMsg('');
+    } else {
+      setOemName('');
+      setCompanyName('');
+      setConcernedPersonName('');
+      setContactNo('');
+      setMailId('');
+    }
+  };
 
   const handleFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -111,6 +147,7 @@ export function MafItemModal({
       companyName,
       mafStatus,
       requiredQuantity,
+      allowedOemNames: oemRecords.map((o) => o.oemName),
     });
     if (validationErr) {
       setErrorMsg(validationErr);
@@ -126,16 +163,21 @@ export function MafItemModal({
       return;
     }
 
-    const cleanPerson = concernedPersonName.trim();
-    const cleanPhone = contactNo.trim();
-    const cleanMail = mailId.trim();
+    const canonicalPatch = matchedOem ? buildMafContactPatchFromOem(matchedOem) : null;
+    const finalOemName = canonicalPatch ? canonicalPatch.oemName : oemName.trim();
+    const finalCompany = canonicalPatch ? canonicalPatch.companyName : companyName.trim();
+    const cleanPerson = canonicalPatch
+      ? canonicalPatch.concernedPersonName
+      : concernedPersonName.trim();
+    const cleanPhone = canonicalPatch ? canonicalPatch.contactNo : contactNo.trim();
+    const cleanMail = canonicalPatch ? canonicalPatch.mailId : mailId.trim();
 
     const savedItem: MafLineItem = {
       itemId,
       itemName: itemName.trim(),
       requiredQuantity: requiredQuantity.trim(),
-      oemName: oemName.trim(),
-      companyName: companyName.trim(),
+      oemName: finalOemName,
+      companyName: finalCompany,
       concernedPersonName: cleanPerson,
       contactNo: cleanPhone,
       mailId: cleanMail,
@@ -193,6 +235,37 @@ export function MafItemModal({
             </div>
           )}
 
+          {oemRecords.length === 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-800 dark:text-amber-300">
+              <span className="inline-flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  No OEMs registered in <strong>OEM Details</strong> yet. Add OEMs first before assigning an OEM here.
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onGoToOemDetails();
+                }}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-700 hover:bg-amber-800 text-white text-[11px] font-medium shrink-0"
+              >
+                <Building2 className="h-3 w-3" aria-hidden="true" />
+                <span>Go to OEM Details</span>
+              </button>
+            </div>
+          )}
+
+          {oemRecords.length > 0 && hasUnlistedLegacyOem && (
+            <div className="flex items-center gap-2 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>
+                &ldquo;{oemName.trim()}&rdquo; is not in your <strong>OEM Details</strong> directory. Select a registered OEM below to auto-fill contact details.
+              </span>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div className="sm:col-span-2">
               <label
@@ -236,37 +309,38 @@ export function MafItemModal({
               >
                 OEM / Manufacturer Name {mafStatus !== 'Pending' ? '*' : ''}
               </label>
-              <input
+              <OemSelectControl
                 id="maf-oem-name"
-                type="text"
-                required={mafStatus !== 'Pending'}
-                list="common-oem-suggestions"
+                oemRecords={oemRecords}
                 value={oemName}
-                onChange={(e) => setOemName(e.target.value)}
-                placeholder="e.g. CP Plus, Hikvision, Cisco"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                required={mafStatus !== 'Pending'}
+                allowClear={mafStatus === 'Pending'}
+                placeholder="Select from OEM Details..."
+                onSelectOem={handleSelectOem}
+                onGoToOemDetails={() => {
+                  onClose();
+                  onGoToOemDetails();
+                }}
               />
-              <datalist id="common-oem-suggestions">
-                {COMMON_OEM_NAMES.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
             </div>
 
             <div>
               <label
                 htmlFor="maf-company-name"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                className="flex items-center justify-between text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                Company Name
+                <span>Company Name</span>
+                <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                  Auto-filled
+                </span>
               </label>
               <input
                 id="maf-company-name"
                 type="text"
+                readOnly
                 value={companyName}
-                onChange={(e) => setCompanyName(e.target.value)}
-                placeholder="e.g. OEM / Authorized Partner Firm"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                placeholder="Auto-filled from OEM Details"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-2 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
               />
             </div>
 
@@ -310,51 +384,60 @@ export function MafItemModal({
             <div>
               <label
                 htmlFor="maf-concerned-person"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                className="flex items-center justify-between text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                Concerned Person Name
+                <span>Concerned Person Name</span>
+                <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                  Auto-filled
+                </span>
               </label>
               <input
                 id="maf-concerned-person"
                 type="text"
+                readOnly
                 value={concernedPersonName}
-                onChange={(e) => setConcernedPersonName(e.target.value)}
-                placeholder="e.g. Ravi Singh"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                placeholder="Auto-filled from OEM Details"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-2 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
               />
             </div>
 
             <div>
               <label
                 htmlFor="maf-contact-no"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                className="flex items-center justify-between text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                Contact No.
+                <span>Contact No.</span>
+                <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                  Auto-filled
+                </span>
               </label>
               <input
                 id="maf-contact-no"
                 type="tel"
+                readOnly
                 value={contactNo}
-                onChange={(e) => setContactNo(e.target.value)}
-                placeholder="e.g. +91 98112 44019"
-                className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                placeholder="Auto-filled from OEM Details"
+                className="font-mono-num w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-2 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
               />
             </div>
 
-            <div>
+            <div className="sm:col-span-3">
               <label
                 htmlFor="maf-mail-id"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
+                className="flex items-center justify-between text-xs font-medium text-slate-700 dark:text-slate-300 mb-1"
               >
-                Mail ID
+                <span>Mail ID</span>
+                <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                  Auto-filled
+                </span>
               </label>
               <input
                 id="maf-mail-id"
                 type="email"
+                readOnly
                 value={mailId}
-                onChange={(e) => setMailId(e.target.value)}
-                placeholder="e.g. ravi.singh@oem.com"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                placeholder="Auto-filled from OEM Details"
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-2 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
               />
             </div>
 

@@ -8,6 +8,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { BidRaStatusTab } from './components/BidRaStatusTab';
 import { BidSearchTab } from './components/BidSearchTab';
 import { DashboardTab } from './components/DashboardTab';
 import { EmdBgFormModal } from './components/EmdBgFormModal';
@@ -17,6 +18,8 @@ import { LoginPage } from './components/LoginPage';
 import { MafItemModal } from './components/MafItemModal';
 import { MafStatusTab } from './components/MafStatusTab';
 import { MafTrackerFormModal } from './components/MafTrackerFormModal';
+import { OemDetailsTab } from './components/OemDetailsTab';
+import { OemFormModal } from './components/OemFormModal';
 import { SettingsTab } from './components/SettingsTab';
 import { Sidebar } from './components/Sidebar';
 import { TenderDetailDrawer } from './components/TenderDetailDrawer';
@@ -26,6 +29,7 @@ import {
   DEFAULT_FIRM_PROFILE,
   SEED_EMD_RECORDS,
   SEED_MAF_TRACKERS,
+  SEED_OEM_DETAILS,
   SEED_TENDERS,
 } from './data/seedData';
 import {
@@ -57,6 +61,7 @@ import type {
   MafLineItem,
   MafTrackerRecord,
   NotificationItem,
+  OemRecord,
   SecondaryUserSummary,
   SheetSyncAction,
   SheetSyncEntityType,
@@ -80,6 +85,10 @@ import {
   setSecondaryUserEnabled,
   type SecondaryWorkspaceSnapshot,
 } from './utils/authCredentials';
+import {
+  isTenderDuePassed,
+  partitionTendersByDueDate,
+} from './utils/bidRaStatus';
 import { computeNotifications } from './utils/calculations';
 import {
   backupAllToCloud,
@@ -89,6 +98,7 @@ import {
   createEmptyCloudDataset,
   deleteEmdRecordFromCloud,
   deleteMafTrackerFromCloud,
+  deleteOemRecordFromCloud,
   deleteTenderFromCloud,
   ensureUserRootDocument,
   fetchAdminCloudWorkspaceWithFallback,
@@ -101,6 +111,7 @@ import {
   syncEmailConfigToCloud,
   syncEmdRecordToCloud,
   syncMafTrackerToCloud,
+  syncOemRecordToCloud,
   syncPreferencesToCloud,
   syncProfileToCloud,
   syncSecondaryUserToCloud,
@@ -215,6 +226,7 @@ export default function App() {
   const [tenders, setTenders] = useState<Tender[]>(SEED_TENDERS);
   const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(SEED_EMD_RECORDS);
   const [mafTrackers, setMafTrackers] = useState<MafTrackerRecord[]>(SEED_MAF_TRACKERS);
+  const [oemRecords, setOemRecords] = useState<OemRecord[]>(SEED_OEM_DETAILS);
   const [firmProfile, setFirmProfile] = useState<FirmProfile>(DEFAULT_FIRM_PROFILE);
   const [adminPin, setAdminPin] = useState<string>('1234');
   const [darkMode, setDarkMode] = useState<boolean>(false);
@@ -292,6 +304,8 @@ export default function App() {
     undefined, // undefined = closed, null = new, Tender = edit
   );
   const [selectedTenderId, setSelectedTenderId] = useState<string | null>(null);
+  const [selectedBidRaTenderId, setSelectedBidRaTenderId] = useState<string | null>(null);
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [emdModalTarget, setEmdModalTarget] = useState<EmdBgRecord | null | undefined>(
     undefined,
   );
@@ -302,6 +316,7 @@ export default function App() {
     tracker: MafTrackerRecord;
     item: MafLineItem | null;
   } | null>(null);
+  const [oemModalTarget, setOemModalTarget] = useState<OemRecord | null | undefined>(undefined);
 
   // In-memory refs for async Firestore listeners, admin offline snapshot, and attachment payloads
   const attachmentFilesRef = useRef<Map<string, string>>(new Map());
@@ -319,6 +334,7 @@ export default function App() {
     tenders,
     emdRecords,
     mafTrackers,
+    oemRecords,
     firmProfile,
     adminPin,
     darkMode,
@@ -337,6 +353,7 @@ export default function App() {
       tenders,
       emdRecords,
       mafTrackers,
+      oemRecords,
       firmProfile,
       adminPin,
       darkMode,
@@ -354,6 +371,7 @@ export default function App() {
     tenders,
     emdRecords,
     mafTrackers,
+    oemRecords,
     firmProfile,
     adminPin,
     darkMode,
@@ -507,6 +525,7 @@ export default function App() {
       tenders,
       emdRecords,
       mafTrackers,
+      oemRecords,
       emailSettings,
       emailLogs,
       sheetSettings,
@@ -522,6 +541,7 @@ export default function App() {
     tenders,
     emdRecords,
     mafTrackers,
+    oemRecords,
     emailSettings,
     emailLogs,
     sheetSettings,
@@ -589,7 +609,8 @@ export default function App() {
           !cloud.preferences &&
           cloud.tenders.length === 0 &&
           cloud.emdRecords.length === 0 &&
-          cloud.mafTrackers.length === 0;
+          cloud.mafTrackers.length === 0 &&
+          cloud.oemRecords.length === 0;
 
         if (cloudIsEmpty) {
           const {
@@ -597,6 +618,7 @@ export default function App() {
             tenders: curTenders,
             emdRecords: curEmd,
             mafTrackers: curMaf,
+            oemRecords: curOems,
             adminPin: curPin,
             darkMode: curDark,
             emailSettings: curEmailSettings,
@@ -612,6 +634,7 @@ export default function App() {
             curMaf,
             activeTenantId,
             targetRef,
+            curOems,
           );
           await syncEmailConfigToCloud(activeCloudUser, curEmailSettings, activeTenantId, targetRef);
           await syncSheetConfigToCloud(activeCloudUser, curSheetSettings, activeTenantId, targetRef);
@@ -656,6 +679,9 @@ export default function App() {
             setMafTrackers((prev) =>
               mergeCloudMafTrackersWithFiles(cloud.mafTrackers, cloud.attachmentFiles, prev),
             );
+          }
+          if (cloud.oemRecords.length > 0) {
+            setOemRecords(cloud.oemRecords);
           }
           markSyncedNow();
           setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
@@ -724,6 +750,16 @@ export default function App() {
               setMafTrackers((prev) =>
                 mergeCloudMafTrackersWithFiles(combinedMaf, attachmentFilesRef.current, prev),
               );
+              markSyncedNow();
+            },
+            onOemRecords: (remoteOems) => {
+              if (localWorkspaceClearedRef.current) return;
+              const combinedOems = isAdminSession
+                ? mergeAdminRecordsById(remoteOems, adminSupplementalRef.current.oemRecords)
+                : remoteOems;
+              if (combinedOems.length > 0 || !isAdminSession) {
+                setOemRecords(combinedOems);
+              }
               markSyncedNow();
             },
             onAttachmentFiles: (remoteFiles) => {
@@ -884,6 +920,7 @@ export default function App() {
       tenders: curTenders,
       emdRecords: curEmd,
       mafTrackers: curMaf,
+      oemRecords: curOems,
       adminPin: curPin,
       darkMode: curDark,
       workspaceTenantId: tenantId,
@@ -894,11 +931,31 @@ export default function App() {
     void runCloudTask(
       (user, target) =>
         preserveExistingCloud
-          ? backupAllToCloud(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId, target)
-          : replaceCloudDataset(user, curProfile, prefs, curTenders, curEmd, curMaf, tenantId, target),
+          ? backupAllToCloud(
+              user,
+              curProfile,
+              prefs,
+              curTenders,
+              curEmd,
+              curMaf,
+              tenantId,
+              target,
+              curOems,
+            )
+          : replaceCloudDataset(
+              user,
+              curProfile,
+              prefs,
+              curTenders,
+              curEmd,
+              curMaf,
+              tenantId,
+              target,
+              curOems,
+            ),
       preserveExistingCloud
-        ? `Synced ${curTenders.length} local tenders, ${curMaf.length} MAF trackers & ${curEmd.length} EMD/BG records non-destructively to Firestore.`
-        : `Synced ${curTenders.length} tenders, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
+        ? `Synced ${curTenders.length} local tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers & ${curEmd.length} EMD/BG records non-destructively to Firestore.`
+        : `Synced ${curTenders.length} tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
     );
   };
 
@@ -950,6 +1007,9 @@ export default function App() {
       setMafTrackers((prev) =>
         mergeCloudMafTrackersWithFiles(cloud.mafTrackers, cloud.attachmentFiles, prev),
       );
+      if (cloud.oemRecords.length > 0 || userSession?.role === 'secondary') {
+        setOemRecords(cloud.oemRecords);
+      }
     }, 'Reloaded latest data from Firebase Firestore.');
   };
 
@@ -1452,6 +1512,24 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [isAuthenticated, emailSettings.enabled]);
 
+  // Automatic Due-Date & Time watcher so tenders move from Daily Tender Data -> BID/RA Status immediately when due time passes
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const refreshNow = () => setNowTick(Date.now());
+    refreshNow();
+    const timer = window.setInterval(refreshNow, 15_000);
+    window.addEventListener('focus', refreshNow);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshNow);
+    };
+  }, [isAuthenticated]);
+
+  const { dailyTenders, bidRaTenders } = useMemo(
+    () => partitionTendersByDueDate(tenders, nowTick),
+    [tenders, nowTick],
+  );
+
   const notifications = useMemo(
     () => computeNotifications(tenders, emdRecords),
     [tenders, emdRecords],
@@ -1471,6 +1549,7 @@ export default function App() {
         tenders,
         emdRecords,
         mafTrackers,
+        oemRecords,
         emailSettings,
         emailLogs,
         sheetSettings,
@@ -1484,6 +1563,7 @@ export default function App() {
       tenders,
       emdRecords,
       mafTrackers,
+      oemRecords,
       emailSettings,
       emailLogs,
       sheetSettings,
@@ -1686,6 +1766,7 @@ export default function App() {
     emdRecord?: EmdBgRecord | null;
     tendersSnapshot?: Tender[];
     emdSnapshot?: EmdBgRecord[];
+    oemSnapshot?: OemRecord[];
     settingsOverride?: GoogleSheetSettings;
     force?: boolean;
   }): Promise<boolean> => {
@@ -1722,6 +1803,7 @@ export default function App() {
       emdRecord: opts.emdRecord ?? null,
       tenders: opts.tendersSnapshot ?? stateRef.current.tenders,
       emdRecords: opts.emdSnapshot ?? stateRef.current.emdRecords,
+      oemDetails: opts.oemSnapshot ?? stateRef.current.oemRecords,
     });
 
     try {
@@ -1853,7 +1935,18 @@ export default function App() {
           ...mergedManual.targetTracker,
           itemsMAF: mergedManual.targetTracker.itemsMAF.map((item) => {
             const manual = manualByKey.get(item.itemName.trim().toLowerCase());
-            return manual ? { ...item, oemName: manual.oemName, mafStatus: manual.mafStatus } : item;
+            return manual
+              ? {
+                  ...item,
+                  oemName: manual.oemName,
+                  companyName: manual.companyName,
+                  concernedPersonName: manual.concernedPersonName,
+                  contactNo: manual.contactNo,
+                  mailId: manual.mailId,
+                  oemContact: manual.oemContact,
+                  mafStatus: manual.mafStatus,
+                }
+              : item;
           }),
         };
         linkedMafToSync = updatedTarget;
@@ -1870,6 +1963,17 @@ export default function App() {
     } else if (changedTrackers.length > 0) {
       stateRef.current.mafTrackers = syncedResult.nextTrackers;
       setMafTrackers(syncedResult.nextTrackers);
+    }
+
+    const nowMs = Date.now();
+    setNowTick(nowMs);
+    if (!initialMafItems || initialMafItems.length === 0) {
+      if (isTenderDuePassed(saved, nowMs)) {
+        showToast(
+          'ok',
+          `Tender ${saved.tenderId} due date has passed — placed in BID/RA Status.`,
+        );
+      }
     }
 
     setTenderModalTarget(undefined);
@@ -1913,6 +2017,7 @@ export default function App() {
     );
     stateRef.current.tenders = nextTenders;
     setTenders(nextTenders);
+    setNowTick(Date.now());
 
     const syncedResult = buildSyncedMafTrackersForTender(
       updated,
@@ -1940,6 +2045,24 @@ export default function App() {
     });
 
     void triggerAutoMafFromTender(updated);
+  };
+
+  const handleSaveBidRaTender = (rawUpdated: Tender) => {
+    const nowMs = Date.now();
+    const stillDuePassed = isTenderDuePassed(rawUpdated, nowMs);
+    handleUpdateTenderInline(rawUpdated);
+    if (!stillDuePassed) {
+      setSelectedBidRaTenderId(null);
+      showToast(
+        'ok',
+        `Updated ${rawUpdated.tenderId} — future due date moved it back to Daily Tender Data.`,
+      );
+    } else {
+      showToast(
+        'ok',
+        `Saved Tender & Technical/Financial/RA update for ${rawUpdated.tenderId}.`,
+      );
+    }
   };
 
   const handleDeleteTender = (id: string) => {
@@ -2247,6 +2370,49 @@ export default function App() {
     );
   };
 
+  // OEM Master Directory Handlers
+  const handleSaveOemRecord = (saved: OemRecord) => {
+    const prevOems = stateRef.current.oemRecords;
+    const isExisting = prevOems.some((o) => o.id === saved.id);
+    const nextOems = isExisting
+      ? prevOems.map((o) => (o.id === saved.id ? saved : o))
+      : [saved, ...prevOems];
+    stateRef.current.oemRecords = nextOems;
+    setOemRecords(nextOems);
+    setOemModalTarget(undefined);
+    showToast(
+      'ok',
+      isExisting ? `Updated OEM "${saved.oemName}".` : `Added OEM "${saved.oemName}" to directory.`,
+    );
+
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user, target) => syncOemRecordToCloud(user, saved, activeTenant, target));
+    void pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      oemSnapshot: nextOems,
+    });
+  };
+
+  const handleDeleteOemRecord = (id: string) => {
+    const removed = stateRef.current.oemRecords.find((o) => o.id === id);
+    adminSupplementalRef.current.oemRecords = adminSupplementalRef.current.oemRecords.filter(
+      (o) => o.id !== id,
+    );
+    const nextOems = stateRef.current.oemRecords.filter((o) => o.id !== id);
+    stateRef.current.oemRecords = nextOems;
+    setOemRecords(nextOems);
+    showToast('ok', `Removed OEM "${removed?.oemName ?? 'record'}" from directory.`);
+
+    const activeTenant = stateRef.current.workspaceTenantId;
+    void runCloudTask((user, target) => deleteOemRecordFromCloud(user, id, activeTenant, target));
+    void pushToGoogleSheet({
+      action: 'FULL_SYNC',
+      entityType: 'BULK',
+      oemSnapshot: nextOems,
+    });
+  };
+
   const handleSaveProfile = (nextProfile: FirmProfile) => {
     stateRef.current.firmProfile = nextProfile;
     setFirmProfile(nextProfile);
@@ -2351,6 +2517,7 @@ export default function App() {
         tenders: stateRef.current.tenders,
         emdRecords: stateRef.current.emdRecords,
         mafTrackers: stateRef.current.mafTrackers,
+        oemRecords: stateRef.current.oemRecords,
         emailSettings: stateRef.current.emailSettings,
         emailLogs: stateRef.current.emailLogs,
         sheetSettings: stateRef.current.sheetSettings,
@@ -2418,6 +2585,7 @@ export default function App() {
       setTenders(emptyOrSaved.tenders);
       setEmdRecords(emptyOrSaved.emdRecords);
       setMafTrackers(emptyOrSaved.mafTrackers);
+      setOemRecords(emptyOrSaved.oemRecords ?? []);
       setEmailSettings(emptyOrSaved.emailSettings);
       setEmailLogs(emptyOrSaved.emailLogs);
       setSheetSettings(emptyOrSaved.sheetSettings);
@@ -2437,6 +2605,7 @@ export default function App() {
         tenders: emptyOrSaved.tenders,
         emdRecords: emptyOrSaved.emdRecords,
         mafTrackers: emptyOrSaved.mafTrackers,
+        oemRecords: emptyOrSaved.oemRecords ?? [],
         emailSettings: emptyOrSaved.emailSettings,
         emailLogs: emptyOrSaved.emailLogs,
         sheetSettings: emptyOrSaved.sheetSettings,
@@ -2462,6 +2631,7 @@ export default function App() {
         setTenders(snap.tenders);
         setEmdRecords(snap.emdRecords);
         setMafTrackers(snap.mafTrackers);
+        setOemRecords(snap.oemRecords ?? SEED_OEM_DETAILS);
         setEmailSettings(snap.emailSettings);
         setEmailLogs(snap.emailLogs);
         setSheetSettings(snap.sheetSettings);
@@ -2481,6 +2651,7 @@ export default function App() {
           tenders: snap.tenders,
           emdRecords: snap.emdRecords,
           mafTrackers: snap.mafTrackers,
+          oemRecords: snap.oemRecords ?? SEED_OEM_DETAILS,
           emailSettings: snap.emailSettings,
           emailLogs: snap.emailLogs,
           sheetSettings: snap.sheetSettings,
@@ -2532,9 +2703,11 @@ export default function App() {
     setMobileMenuOpen(false);
     setTenderModalTarget(undefined);
     setSelectedTenderId(null);
+    setSelectedBidRaTenderId(null);
     setEmdModalTarget(undefined);
     setMafTrackerModalTarget(undefined);
     setMafItemModalTarget(null);
+    setOemModalTarget(undefined);
     if (typeof forceDisabledMessage === 'string' && forceDisabledMessage.trim()) {
       setDisabledNotice(forceDisabledMessage);
     }
@@ -2542,10 +2715,21 @@ export default function App() {
   };
 
   const handleNavigateFromNotification = (item: NotificationItem) => {
-    setActiveTab(item.targetTab);
     if (item.targetTab === 'tenders') {
+      const target = stateRef.current.tenders.find((t) => t.id === item.targetId);
+      if (target && isTenderDuePassed(target, Date.now())) {
+        setActiveTab('bidra');
+        setSelectedBidRaTenderId(target.id);
+        setSelectedTenderId(null);
+        window.scrollTo({ top: 0, left: 0 });
+        return;
+      }
+      setActiveTab('tenders');
       setSelectedTenderId(item.targetId);
+      window.scrollTo({ top: 0, left: 0 });
+      return;
     }
+    setActiveTab(item.targetTab);
     window.scrollTo({ top: 0, left: 0 });
   };
 
@@ -2556,14 +2740,21 @@ export default function App() {
     for (const m of payload.mafTrackers ?? []) cacheMafPayloads(m.itemsMAF);
 
     const nextMaf = payload.mafTrackers ?? [];
+    const nextOems = Array.isArray(payload.oemDetails)
+      ? payload.oemDetails
+      : stateRef.current.oemRecords;
     stateRef.current.tenders = payload.tenders;
     stateRef.current.emdRecords = payload.emdRecords;
     stateRef.current.mafTrackers = nextMaf;
+    stateRef.current.oemRecords = nextOems;
     stateRef.current.firmProfile = payload.profile;
     setFirmProfile(payload.profile);
     setTenders(payload.tenders);
     setEmdRecords(payload.emdRecords);
     setMafTrackers(nextMaf);
+    if (Array.isArray(payload.oemDetails)) {
+      setOemRecords(nextOems);
+    }
 
     const prefs: UserPreferences = {
       adminPin: stateRef.current.adminPin,
@@ -2580,6 +2771,7 @@ export default function App() {
         nextMaf,
         activeTenant,
         target,
+        nextOems,
       ),
     );
     void pushToGoogleSheet({
@@ -2587,6 +2779,7 @@ export default function App() {
       entityType: 'BULK',
       tendersSnapshot: payload.tenders,
       emdSnapshot: payload.emdRecords,
+      oemSnapshot: nextOems,
     });
   };
 
@@ -2598,10 +2791,12 @@ export default function App() {
     stateRef.current.tenders = SEED_TENDERS;
     stateRef.current.emdRecords = SEED_EMD_RECORDS;
     stateRef.current.mafTrackers = SEED_MAF_TRACKERS;
+    stateRef.current.oemRecords = SEED_OEM_DETAILS;
     setFirmProfile(DEFAULT_FIRM_PROFILE);
     setTenders(SEED_TENDERS);
     setEmdRecords(SEED_EMD_RECORDS);
     setMafTrackers(SEED_MAF_TRACKERS);
+    setOemRecords(SEED_OEM_DETAILS);
     setSelectedTenderId(null);
     const prefs: UserPreferences = {
       adminPin: stateRef.current.adminPin,
@@ -2617,6 +2812,7 @@ export default function App() {
         SEED_MAF_TRACKERS,
         null,
         target,
+        SEED_OEM_DETAILS,
       ),
     );
     void pushToGoogleSheet({
@@ -2624,6 +2820,7 @@ export default function App() {
       entityType: 'BULK',
       tendersSnapshot: SEED_TENDERS,
       emdSnapshot: SEED_EMD_RECORDS,
+      oemSnapshot: SEED_OEM_DETAILS,
     });
   };
 
@@ -2640,10 +2837,13 @@ export default function App() {
     stateRef.current.tenders = [];
     stateRef.current.emdRecords = [];
     stateRef.current.mafTrackers = [];
+    stateRef.current.oemRecords = [];
     setTenders([]);
     setEmdRecords([]);
     setMafTrackers([]);
+    setOemRecords([]);
     setSelectedTenderId(null);
+    setSelectedBidRaTenderId(null);
     showToast(
       'ok',
       'Local CRM data cleared. Google Cloud / BYOC & Google Sheet records remain intact — use "Restore from Cloud" anytime to reload.',
@@ -2672,9 +2872,11 @@ export default function App() {
         }}
         firmProfile={firmProfile}
         currentUser={currentUser}
-        tenderCount={tenders.length}
+        tenderCount={dailyTenders.length}
+        oemCount={oemRecords.length}
         mafCount={mafTrackers.length}
         emdCount={emdRecords.length}
+        bidRaCount={bidRaTenders.length}
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
         onLogout={handleLogout}
@@ -2797,8 +2999,14 @@ export default function App() {
               firmProfile={firmProfile}
               darkMode={darkMode}
               onOpenTender={(tender) => {
-                setActiveTab('tenders');
-                setSelectedTenderId(tender.id);
+                if (isTenderDuePassed(tender, nowTick)) {
+                  setActiveTab('bidra');
+                  setSelectedBidRaTenderId(tender.id);
+                  setSelectedTenderId(null);
+                } else {
+                  setActiveTab('tenders');
+                  setSelectedTenderId(tender.id);
+                }
               }}
               onGoToEmdBg={() => setActiveTab('emdbg')}
             />
@@ -2809,8 +3017,14 @@ export default function App() {
               tenders={tenders}
               onSaveScannedTender={(saved, syncToEmd) => handleSaveTender(saved, syncToEmd)}
               onOpenExistingTender={(tender) => {
-                setActiveTab('tenders');
-                setSelectedTenderId(tender.id);
+                if (isTenderDuePassed(tender, nowTick)) {
+                  setActiveTab('bidra');
+                  setSelectedBidRaTenderId(tender.id);
+                  setSelectedTenderId(null);
+                } else {
+                  setActiveTab('tenders');
+                  setSelectedTenderId(tender.id);
+                }
               }}
               onAddManualTender={() => setTenderModalTarget(null)}
               onGoToDailyTenders={() => setActiveTab('tenders')}
@@ -2820,12 +3034,22 @@ export default function App() {
 
           {activeTab === 'tenders' && (
             <TendersTab
-              tenders={tenders}
+              tenders={dailyTenders}
               emdRecords={emdRecords}
               defaultOwner={firmProfile.adminName || currentUser?.username}
               onAddTender={() => setTenderModalTarget(null)}
               onEditTender={(tender) => setTenderModalTarget(tender)}
               onOpenTender={(tender) => setSelectedTenderId(tender.id)}
+            />
+          )}
+
+          {activeTab === 'oems' && (
+            <OemDetailsTab
+              oemRecords={oemRecords}
+              mafTrackers={mafTrackers}
+              onAddOem={() => setOemModalTarget(null)}
+              onEditOem={(oem) => setOemModalTarget(oem)}
+              onDeleteOem={handleDeleteOemRecord}
             />
           )}
 
@@ -2855,12 +3079,23 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'bidra' && (
+            <BidRaStatusTab
+              tenders={bidRaTenders}
+              allTenders={tenders}
+              selectedTenderId={selectedBidRaTenderId}
+              onSelectTenderId={setSelectedBidRaTenderId}
+              onSaveTenderUpdate={handleSaveBidRaTender}
+            />
+          )}
+
           {activeTab === 'settings' && (
             <SettingsTab
               profile={firmProfile}
               tenders={tenders}
               emdRecords={emdRecords}
               mafTrackers={mafTrackers}
+              oemRecords={oemRecords}
               onSaveProfile={handleSaveProfile}
               onLogout={() => handleLogout()}
               onImportBackup={handleImportBackup}
@@ -2928,8 +3163,19 @@ export default function App() {
         <TenderFormModal
           initialTender={tenderModalTarget}
           existingTenders={tenders}
+          oemRecords={oemRecords}
+          onGoToOemDetails={() => setActiveTab('oems')}
           onClose={() => setTenderModalTarget(undefined)}
           onSave={handleSaveTender}
+        />
+      )}
+
+      {oemModalTarget !== undefined && (
+        <OemFormModal
+          initialOem={oemModalTarget}
+          existingOems={oemRecords}
+          onClose={() => setOemModalTarget(undefined)}
+          onSave={handleSaveOemRecord}
         />
       )}
 
@@ -2947,6 +3193,8 @@ export default function App() {
           initialTracker={mafTrackerModalTarget}
           tenders={tenders}
           existingTrackers={mafTrackers}
+          oemRecords={oemRecords}
+          onGoToOemDetails={() => setActiveTab('oems')}
           onClose={() => setMafTrackerModalTarget(undefined)}
           onSave={handleSaveMafTracker}
           onUploadFile={handleUploadMafFile}
@@ -2959,6 +3207,8 @@ export default function App() {
           tenderId={mafItemModalTarget.tracker.tenderId}
           tenderTitle={mafItemModalTarget.tracker.tenderTitle || 'Linked Tender'}
           initialItem={mafItemModalTarget.item}
+          oemRecords={oemRecords}
+          onGoToOemDetails={() => setActiveTab('oems')}
           onClose={() => setMafItemModalTarget(null)}
           onSave={(savedItem) => handleSaveMafItem(mafItemModalTarget.tracker.id, savedItem)}
           onUploadFile={handleUploadMafFile}

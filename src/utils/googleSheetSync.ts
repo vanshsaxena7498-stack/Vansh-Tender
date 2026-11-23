@@ -1,6 +1,7 @@
 import type {
   EmdBgRecord,
   GoogleSheetSettings,
+  OemRecord,
   SheetSyncAction,
   SheetSyncEntityType,
   Tender,
@@ -209,6 +210,17 @@ export interface SheetEmdRowPayload {
   remarks: string;
 }
 
+export interface SheetOemRowPayload {
+  id: string;
+  oemName: string;
+  companyName: string;
+  concernedPersonName: string;
+  email: string;
+  phone: string;
+  remarks: string;
+  updatedAt: string;
+}
+
 export interface GoogleSheetSyncPayload {
   action: SheetSyncAction;
   entityType: SheetSyncEntityType;
@@ -222,6 +234,7 @@ export interface GoogleSheetSyncPayload {
   monthlyBlocks: SheetMonthlyMisBlock[];
   tenders: SheetTenderRowPayload[];
   emdRecords: SheetEmdRowPayload[];
+  oemDetails?: SheetOemRowPayload[];
 }
 
 const MONTH_BANNER_REGEX =
@@ -818,6 +831,19 @@ export function computeMonthlySummaryForSheet(
   };
 }
 
+export function serializeOemForSheet(oem: OemRecord): SheetOemRowPayload {
+  return {
+    id: oem.id,
+    oemName: sanitizeSheetText(oem.oemName),
+    companyName: sanitizeSheetText(oem.companyName),
+    concernedPersonName: sanitizeSheetText(oem.concernedPersonName),
+    email: sanitizeSheetText(oem.email),
+    phone: sanitizeSheetText(oem.phone),
+    remarks: sanitizeSheetText(oem.remarks),
+    updatedAt: formatIndianDateTimeForSheet(oem.updatedAt || oem.createdAt),
+  };
+}
+
 export function buildSheetSyncPayload(params: {
   action: SheetSyncAction;
   entityType: SheetSyncEntityType;
@@ -828,6 +854,7 @@ export function buildSheetSyncPayload(params: {
   emdRecord?: EmdBgRecord | null;
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
+  oemDetails?: OemRecord[];
   triggeredAt?: string;
 }): GoogleSheetSyncPayload {
   const firmName = (params.firmName || '').trim() || 'Corporate Tender Desk';
@@ -857,6 +884,7 @@ export function buildSheetSyncPayload(params: {
     monthlyBlocks,
     tenders: flattenedTenders,
     emdRecords: params.emdRecords.map(serializeEmdForSheet),
+    oemDetails: (params.oemDetails ?? []).map(serializeOemForSheet),
   };
 }
 
@@ -881,6 +909,7 @@ export const GOOGLE_APPS_SCRIPT_CODE_GS = `/**
 var TAB_TENDERS = 'Daily Tender Data';
 var TAB_SUMMARY = 'Monthly MIS Summary';
 var TAB_EMD = 'EMD & BG Tracker';
+var TAB_OEMS = 'OEM Details';
 var BLANK_GAP_ROWS_BETWEEN_MONTHS = 3;
 
 var MIS_MONTHLY_HEADERS = [
@@ -942,6 +971,17 @@ var EMD_HEADERS = [
   'Refund Date (DD/MM/YYYY)',
   'Refund Ref',
   'Remarks'
+];
+
+var OEM_HEADERS = [
+  'S.No.',
+  'OEM / Manufacturer Name',
+  'Company Name',
+  'Concerned Person Name',
+  'Email ID',
+  'Phone No.',
+  'Remarks / Notes',
+  'Last Updated'
 ];
 
 var FULL_MONTH_NAMES = [
@@ -1010,11 +1050,13 @@ function doPost(e) {
     var tenderSheet = getOrCreateSheet_(ss, TAB_TENDERS);
     var summarySheet = getOrCreateSheet_(ss, TAB_SUMMARY);
     var emdSheet = getOrCreateSheet_(ss, TAB_EMD);
+    var oemSheet = getOrCreateSheet_(ss, TAB_OEMS);
 
     // Explicitly enforce zero frozen rows across sheets
     tenderSheet.setFrozenRows(0);
     summarySheet.setFrozenRows(0);
     emdSheet.setFrozenRows(0);
+    oemSheet.setFrozenRows(0);
 
     var action = String(payload.action || 'UPDATE').toUpperCase();
     var entityType = String(payload.entityType || 'TENDER').toUpperCase();
@@ -1023,6 +1065,7 @@ function doPost(e) {
     if (action === 'PING') {
       rewriteMonthlyMisSheet_(tenderSheet, payload);
       ensureEmdHeaders_(emdSheet);
+      replaceAllOemRows_(oemSheet, payload.oemDetails || []);
       refreshMonthlySummary_(summarySheet, payload);
       return jsonResponse_({
         ok: true,
@@ -1056,6 +1099,10 @@ function doPost(e) {
           rowsAffected += 1;
         }
       }
+    }
+
+    if (Array.isArray(payload.oemDetails)) {
+      replaceAllOemRows_(oemSheet, payload.oemDetails);
     }
 
     refreshMonthlySummary_(summarySheet, payload);
@@ -1480,6 +1527,32 @@ function replaceAllEmdRows_(sheet, records) {
   if (!records || records.length === 0) return;
   var rows = records.map(emdToRow_);
   sheet.getRange(2, 1, rows.length, EMD_HEADERS.length).setValues(rows);
+}
+
+function replaceAllOemRows_(sheet, records) {
+  sheet.clear();
+  sheet.setFrozenRows(0);
+  sheet.getRange(1, 1, 1, OEM_HEADERS.length)
+    .setValues([OEM_HEADERS])
+    .setBackground('#0F172A')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold');
+
+  if (!records || records.length === 0) return;
+  var rows = records.map(function (o, idx) {
+    return [
+      idx + 1,
+      sanitizeText_(o.oemName),
+      sanitizeText_(o.companyName),
+      sanitizeText_(o.concernedPersonName),
+      sanitizeText_(o.email),
+      sanitizeText_(o.phone),
+      sanitizeText_(o.remarks),
+      sanitizeText_(o.updatedAt)
+    ];
+  });
+  sheet.getRange(2, 1, rows.length, OEM_HEADERS.length).setValues(rows);
+  sheet.autoResizeColumns(1, OEM_HEADERS.length);
 }
 
 function refreshMonthlySummary_(sheet, payload) {

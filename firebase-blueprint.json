@@ -317,6 +317,33 @@
           "type": "string",
           "maxLength": 32
         },
+        "technicalStatus": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "technicalOpeningDateTime": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "technicalRemarks": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "financialRaStatus": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "financialOpeningRaDateTime": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "raFinalValue": {
+          "type": "number"
+        },
+        "raFinancialRemarks": {
+          "type": "string",
+          "maxLength": 1000
+        },
         "checklist": {
           "type": "array"
         },
@@ -896,6 +923,80 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "OemDetail": {
+      "title": "OemDetail",
+      "description": "Authorized OEM / Manufacturer directory record with concerned person contact details for MAF auto-fill.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "oemName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "companyName": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "concernedPersonName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "phone": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "remarks": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "clientCreatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "clientUpdatedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "id",
+        "oemName",
+        "companyName",
+        "concernedPersonName",
+        "email",
+        "phone",
+        "remarks",
+        "clientCreatedAt",
+        "clientUpdatedAt",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -952,6 +1053,12 @@
         "$ref": "#/entities/MafTracker"
       },
       "description": "Tender-OEM MAF tracker records with nested itemsMAF line items stored exclusively in Firestore."
+    },
+    "/users/{userId}/oemDetails/{oemDocId}": {
+      "schema": {
+        "$ref": "#/entities/OemDetail"
+      },
+      "description": "Authorized OEM / Manufacturer directory records used to populate and restrict MAF selections."
     },
     "/users/{userId}/emailConfig/{configId}": {
       "schema": {
@@ -1018,6 +1125,12 @@
         "$ref": "#/entities/MafTracker"
       },
       "description": "Isolated MAF tracker records for a secondary CRM workspace."
+    },
+    "/users/{userId}/workspaces/{tenantId}/oemDetails/{oemDocId}": {
+      "schema": {
+        "$ref": "#/entities/OemDetail"
+      },
+      "description": "Isolated OEM directory records for a secondary CRM workspace."
     },
     "/users/{userId}/workspaces/{tenantId}/emailConfig/{configId}": {
       "schema": {
@@ -1096,6 +1209,12 @@
         "$ref": "#/entities/EmailAlertLog"
       },
       "description": "Legacy top-level email alert logs collection (strictly read-only recovery for Bootstrapped Admin)."
+    },
+    "/oemDetails/{docId}": {
+      "schema": {
+        "$ref": "#/entities/OemDetail"
+      },
+      "description": "Legacy top-level OEM details collection (strictly read-only recovery for Bootstrapped Admin)."
     }
   }
 }

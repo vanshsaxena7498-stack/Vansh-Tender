@@ -65,8 +65,10 @@ const TAB_TITLES: Record<TabKey, string> = {
   dashboard: 'Monthly Executive Dashboard',
   bidsearch: 'Bid Search · GeM PDF Scanner',
   tenders: 'Daily Tender Operations',
+  oems: 'OEM Details Directory',
   maf: 'MAF Status',
   emdbg: 'EMD & Bank Guarantee Tracker',
+  bidra: 'BID/RA Status & Evaluation',
   settings: 'Admin Settings & Backups',
 };
 

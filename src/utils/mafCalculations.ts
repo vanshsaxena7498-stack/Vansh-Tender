@@ -185,18 +185,29 @@ export function validateMafItemDraft(draft: {
   mafStatus?: MafItemStatus;
   allowBlankOem?: boolean;
   requiredQuantity?: string;
+  allowedOemNames?: readonly string[];
 }): string | null {
   if (!draft.itemName || !draft.itemName.trim()) {
     return 'Item Name is required.';
   }
   const oemExempt = draft.allowBlankOem === true || draft.mafStatus === 'Pending';
-  if (!oemExempt && (!draft.oemName || !draft.oemName.trim())) {
+  const trimmedOem = (draft.oemName ?? '').trim();
+  if (!oemExempt && !trimmedOem) {
     return 'OEM Name is required.';
+  }
+  if (draft.allowedOemNames && trimmedOem) {
+    const normalizedTarget = trimmedOem.replace(/\s+/g, ' ').toLowerCase();
+    const matched = draft.allowedOemNames.some(
+      (candidate) => candidate.trim().replace(/\s+/g, ' ').toLowerCase() === normalizedTarget,
+    );
+    if (!matched) {
+      return 'Selected OEM must exist in the OEM Details directory. Please add it under OEM Details first.';
+    }
   }
   if (draft.itemName.trim().length > 220) {
     return 'Item Name must be 220 characters or fewer.';
   }
-  if (draft.oemName && draft.oemName.trim().length > 150) {
+  if (trimmedOem.length > 150) {
     return 'OEM Name must be 150 characters or fewer.';
   }
   if (draft.companyName && draft.companyName.trim().length > 150) {

@@ -296,6 +296,13 @@ service cloud.firestore {
           'stage',
           'resultInfo',
           'completionDate',
+          'technicalStatus',
+          'technicalOpeningDateTime',
+          'technicalRemarks',
+          'financialRaStatus',
+          'financialOpeningRaDateTime',
+          'raFinalValue',
+          'raFinancialRemarks',
           'checklist',
           'remarks',
           'attachments',
@@ -364,6 +371,13 @@ service cloud.firestore {
         data.resultInfo.size() <= 1000 &&
         data.completionDate is string &&
         data.completionDate.size() <= 32 &&
+        (!('technicalStatus' in data) || (data.technicalStatus is string && data.technicalStatus.size() <= 80)) &&
+        (!('technicalOpeningDateTime' in data) || (data.technicalOpeningDateTime is string && data.technicalOpeningDateTime.size() <= 32)) &&
+        (!('technicalRemarks' in data) || (data.technicalRemarks is string && data.technicalRemarks.size() <= 1000)) &&
+        (!('financialRaStatus' in data) || (data.financialRaStatus is string && data.financialRaStatus.size() <= 80)) &&
+        (!('financialOpeningRaDateTime' in data) || (data.financialOpeningRaDateTime is string && data.financialOpeningRaDateTime.size() <= 32)) &&
+        (!('raFinalValue' in data) || (data.raFinalValue is number && data.raFinalValue >= 0)) &&
+        (!('raFinancialRemarks' in data) || (data.raFinancialRemarks is string && data.raFinancialRemarks.size() <= 1000)) &&
         data.checklist is list &&
         data.checklist.size() <= 30 &&
         (data.checklist.size() == 0 || data.checklist[0] is map) &&
@@ -761,6 +775,61 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidOemRecord(data, userId, oemDocId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'id',
+          'oemName',
+          'companyName',
+          'concernedPersonName',
+          'email',
+          'phone',
+          'remarks',
+          'clientCreatedAt',
+          'clientUpdatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'id',
+          'oemName',
+          'companyName',
+          'concernedPersonName',
+          'email',
+          'phone',
+          'remarks',
+          'clientCreatedAt',
+          'clientUpdatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == userId &&
+        data.ownerUid == request.auth.uid &&
+        isValidId(data.id) &&
+        data.id == oemDocId &&
+        data.oemName is string &&
+        data.oemName.size() >= 1 &&
+        data.oemName.size() <= 150 &&
+        data.companyName is string &&
+        data.companyName.size() <= 150 &&
+        data.concernedPersonName is string &&
+        data.concernedPersonName.size() <= 120 &&
+        data.email is string &&
+        data.email.size() <= 160 &&
+        data.phone is string &&
+        data.phone.size() <= 40 &&
+        data.remarks is string &&
+        data.remarks.size() <= 500 &&
+        data.clientCreatedAt is string &&
+        data.clientCreatedAt.size() <= 40 &&
+        data.clientUpdatedAt is string &&
+        data.clientUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // -------------------------------------------------------------------------
     // Collection Rules
     // -------------------------------------------------------------------------
@@ -1032,6 +1101,13 @@ service cloud.firestore {
                   'stage',
                   'resultInfo',
                   'completionDate',
+                  'technicalStatus',
+                  'technicalOpeningDateTime',
+                  'technicalRemarks',
+                  'financialRaStatus',
+                  'financialOpeningRaDateTime',
+                  'raFinalValue',
+                  'raFinancialRemarks',
                   'checklist',
                   'remarks',
                   'attachments',
@@ -1185,6 +1261,63 @@ service cloud.firestore {
         allow delete: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(mafDocId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /oemDetails/{oemDocId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(oemDocId) &&
+          (
+            isBootstrappedAdmin() ||
+            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
+          );
+        allow list: if isVerifiedUser() &&
+          (
+            isBootstrappedAdmin() ||
+            (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
+          );
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(oemDocId) &&
+          isOwner(userId) &&
+          isValidOemRecord(incoming(), userId, oemDocId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(oemDocId) &&
+          isValidOemRecord(incoming(), userId, oemDocId) &&
+          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              isOwner(userId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'oemName',
+                'companyName',
+                'concernedPersonName',
+                'email',
+                'phone',
+                'remarks',
+                'clientCreatedAt',
+                'clientUpdatedAt',
+                'createdAt',
+                'updatedAt'
+              ])
+            ) ||
+            isAdmin()
+          ) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(oemDocId) &&
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
       }
@@ -1589,6 +1722,13 @@ service cloud.firestore {
                   'stage',
                   'resultInfo',
                   'completionDate',
+                  'technicalStatus',
+                  'technicalOpeningDateTime',
+                  'technicalRemarks',
+                  'financialRaStatus',
+                  'financialOpeningRaDateTime',
+                  'raFinalValue',
+                  'raFinancialRemarks',
                   'checklist',
                   'remarks',
                   'attachments',
@@ -1718,6 +1858,59 @@ service cloud.firestore {
             isValidId(userId) &&
             isValidId(tenantId) &&
             isValidId(mafDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+        }
+
+        match /oemDetails/{oemDocId} {
+          allow get: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(oemDocId) &&
+            (isOwner(userId) || isAdmin()) &&
+            hasValidWorkspace(userId, tenantId);
+          allow list: if isVerifiedUser() &&
+            request.auth.uid == userId &&
+            resource.data.ownerUid == request.auth.uid;
+          allow create: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(oemDocId) &&
+            isOwner(userId) &&
+            isValidOemRecord(incoming(), userId, oemDocId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            hasValidWorkspace(userId, tenantId);
+          allow update: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(oemDocId) &&
+            isValidOemRecord(incoming(), userId, oemDocId) &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().id == existing().id &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            (
+              (
+                isOwner(userId) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'oemName',
+                  'companyName',
+                  'concernedPersonName',
+                  'email',
+                  'phone',
+                  'remarks',
+                  'clientUpdatedAt',
+                  'updatedAt'
+                ])
+              ) ||
+              isAdmin()
+            ) &&
+            hasValidWorkspace(userId, tenantId);
+          allow delete: if isVerifiedUser() &&
+            isValidId(userId) &&
+            isValidId(tenantId) &&
+            isValidId(oemDocId) &&
             (isOwner(userId) || isAdmin()) &&
             hasValidWorkspace(userId, tenantId);
         }
@@ -1970,6 +2163,12 @@ service cloud.firestore {
     }
 
     match /emailAlerts/{docId} {
+      allow get: if isBootstrappedAdmin() && isValidId(docId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /oemDetails/{docId} {
       allow get: if isBootstrappedAdmin() && isValidId(docId);
       allow list: if isBootstrappedAdmin();
       allow create, update, delete: if false;

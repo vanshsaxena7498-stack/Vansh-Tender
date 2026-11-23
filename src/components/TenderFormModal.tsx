@@ -1,28 +1,37 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { ArrowLeft, Check, Plus, ShieldCheck, Trash2 } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Building2, Check, Plus, ShieldCheck, Trash2 } from 'lucide-react';
 import type {
   EmdSecurityType,
   MafItemStatus,
   MafLineItem,
+  OemRecord,
   PortalType,
   Tender,
   TenderStage,
 } from '../types/crm';
-import { COMMON_OEM_NAMES, createDefaultChecklist } from '../data/seedData';
+import { createDefaultChecklist } from '../data/seedData';
 import {
   buildInitialAttachmentSlots,
   extractSavedAttachments,
   TENDER_DEFAULT_SLOT_LABELS,
   type AttachmentSlotState,
 } from '../utils/attachments';
-import { createMafItemId, MAF_STATUS_OPTIONS } from '../utils/mafCalculations';
+import {
+  createMafItemId,
+  MAF_STATUS_OPTIONS,
+  validateMafItemDraft,
+} from '../utils/mafCalculations';
+import { buildMafContactPatchFromOem } from '../utils/oemDirectory';
 import { detectMsmeEmdExemption } from '../utils/bidSearchParser';
 import { getLocalDateInputValue } from '../utils/formatters';
 import { AttachmentSlots } from './AttachmentSlots';
+import { OemSelectControl } from './OemSelectControl';
 
 interface TenderFormModalProps {
   initialTender?: Tender | null;
   existingTenders?: Tender[];
+  oemRecords: OemRecord[];
+  onGoToOemDetails?: () => void;
   onClose: () => void;
   onSave: (tender: Tender, syncToEmd: boolean, initialMafItems?: MafLineItem[]) => void;
 }
@@ -57,6 +66,8 @@ const STAGE_OPTIONS: TenderStage[] = [
 export function TenderFormModal({
   initialTender,
   existingTenders,
+  oemRecords,
+  onGoToOemDetails,
   onClose,
   onSave,
 }: TenderFormModalProps) {
@@ -121,13 +132,29 @@ export function TenderFormModal({
   );
   const [initMafEnabled, setInitMafEnabled] = useState(false);
   const [draftMafItems, setDraftMafItems] = useState<
-    { itemId: string; itemName: string; requiredQuantity: string; oemName: string; mafStatus: MafItemStatus }[]
+    {
+      itemId: string;
+      itemName: string;
+      requiredQuantity: string;
+      oemName: string;
+      companyName: string;
+      concernedPersonName: string;
+      contactNo: string;
+      mailId: string;
+      oemContact: string;
+      mafStatus: MafItemStatus;
+    }[]
   >(() => [
     {
       itemId: createMafItemId(0),
       itemName: '',
       requiredQuantity: '',
       oemName: '',
+      companyName: '',
+      concernedPersonName: '',
+      contactNo: '',
+      mailId: '',
+      oemContact: '',
       mafStatus: 'Not Requested',
     },
   ]);
@@ -235,30 +262,49 @@ export function TenderFormModal({
       lastUpdatedAt: nowIso,
     };
 
-    const initialMafItems: MafLineItem[] | undefined =
-      !isEdit && initMafEnabled
-        ? draftMafItems
-            .filter((row) => row.itemName.trim() && row.oemName.trim())
-            .map((row) => ({
-              itemId: row.itemId,
-              itemName: row.itemName.trim(),
-              requiredQuantity: row.requiredQuantity.trim(),
-              oemName: row.oemName.trim(),
-              concernedPersonName: '',
-              contactNo: '',
-              mailId: '',
-              mafStatus: row.mafStatus,
-              mafRequestedDate: '',
-              mafDocumentUrl: '',
-              mafDocumentName: '',
-              remarks: '',
-              updatedAt: nowIso,
-            }))
-        : undefined;
-
-    if (!isEdit && initMafEnabled && (!initialMafItems || initialMafItems.length === 0)) {
-      setErrorMsg('Please enter at least one Item Name and OEM Name for MAF initialization, or uncheck MAF initialization.');
-      return;
+    let initialMafItems: MafLineItem[] | undefined;
+    if (!isEdit && initMafEnabled) {
+      const allowedOemNames = oemRecords.map((o) => o.oemName);
+      const activeRows = draftMafItems.filter(
+        (row) => row.itemName.trim() || row.oemName.trim(),
+      );
+      if (activeRows.length === 0) {
+        setErrorMsg(
+          'Please enter at least one Item Name and registered OEM for MAF initialization, or uncheck MAF initialization.',
+        );
+        return;
+      }
+      for (let i = 0; i < activeRows.length; i++) {
+        const rowErr = validateMafItemDraft({
+          itemName: activeRows[i].itemName,
+          oemName: activeRows[i].oemName,
+          companyName: activeRows[i].companyName,
+          mafStatus: activeRows[i].mafStatus,
+          requiredQuantity: activeRows[i].requiredQuantity,
+          allowedOemNames,
+        });
+        if (rowErr) {
+          setErrorMsg(`MAF Item #${i + 1}: ${rowErr}`);
+          return;
+        }
+      }
+      initialMafItems = activeRows.map((row) => ({
+        itemId: row.itemId,
+        itemName: row.itemName.trim(),
+        requiredQuantity: row.requiredQuantity.trim(),
+        oemName: row.oemName.trim(),
+        companyName: row.companyName.trim(),
+        concernedPersonName: row.concernedPersonName.trim(),
+        contactNo: row.contactNo.trim(),
+        mailId: row.mailId.trim(),
+        oemContact: row.oemContact.trim(),
+        mafStatus: row.mafStatus,
+        mafRequestedDate: '',
+        mafDocumentUrl: '',
+        mafDocumentName: '',
+        remarks: '',
+        updatedAt: nowIso,
+      }));
     }
 
     onSave(savedTender, supportsEmdSync && syncToEmd, initialMafItems);
@@ -839,6 +885,11 @@ export function TenderFormModal({
                             itemName: '',
                             requiredQuantity: '',
                             oemName: '',
+                            companyName: '',
+                            concernedPersonName: '',
+                            contactNo: '',
+                            mailId: '',
+                            oemContact: '',
                             mafStatus: 'Not Requested',
                           },
                         ])
@@ -853,83 +904,140 @@ export function TenderFormModal({
 
                 {initMafEnabled && (
                   <div className="space-y-2.5 pt-1">
-                    <datalist id="tender-modal-oem-list">
-                      {COMMON_OEM_NAMES.map((oem) => (
-                        <option key={oem} value={oem} />
-                      ))}
-                    </datalist>
+                    {oemRecords.length === 0 && (
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                        <span className="inline-flex items-center gap-1.5">
+                          <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                          <span>No OEMs registered in OEM Details yet.</span>
+                        </span>
+                        {onGoToOemDetails && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onClose();
+                              onGoToOemDetails();
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-amber-700 hover:bg-amber-800 text-white text-[11px] font-medium"
+                          >
+                            <Building2 className="h-3 w-3" aria-hidden="true" />
+                            <span>Go to OEM Details</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
+
                     {draftMafItems.map((row, idx) => (
                       <div
                         key={row.itemId}
-                        className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-center rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 p-3"
+                        className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 p-3 space-y-2"
                       >
-                        <input
-                          type="text"
-                          value={row.itemName}
-                          onChange={(e) =>
-                            setDraftMafItems((prev) =>
-                              prev.map((r, i) => (i === idx ? { ...r, itemName: e.target.value } : r)),
-                            )
-                          }
-                          placeholder={`Item ${idx + 1} Name (e.g. Core Switch)`}
-                          className="sm:col-span-4 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
-                        />
-                        <input
-                          type="text"
-                          value={row.requiredQuantity}
-                          onChange={(e) =>
-                            setDraftMafItems((prev) =>
-                              prev.map((r, i) =>
-                                i === idx ? { ...r, requiredQuantity: e.target.value } : r,
-                              ),
-                            )
-                          }
-                          placeholder="Qty (e.g. 10 Nos)"
-                          className="sm:col-span-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
-                        />
-                        <input
-                          type="text"
-                          list="tender-modal-oem-list"
-                          value={row.oemName}
-                          onChange={(e) =>
-                            setDraftMafItems((prev) =>
-                              prev.map((r, i) => (i === idx ? { ...r, oemName: e.target.value } : r)),
-                            )
-                          }
-                          placeholder="OEM Name (e.g. Cisco)"
-                          className="sm:col-span-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
-                        />
-                        <select
-                          value={row.mafStatus}
-                          onChange={(e) =>
-                            setDraftMafItems((prev) =>
-                              prev.map((r, i) =>
-                                i === idx ? { ...r, mafStatus: e.target.value as MafItemStatus } : r,
-                              ),
-                            )
-                          }
-                          className="sm:col-span-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
-                        >
-                          {MAF_STATUS_OPTIONS.map((st) => (
-                            <option key={st} value={st}>
-                              {st}
-                            </option>
-                          ))}
-                        </select>
-                        <div className="sm:col-span-1 flex justify-end">
-                          {draftMafItems.length > 1 && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setDraftMafItems((prev) => prev.filter((_, i) => i !== idx))
+                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-center">
+                          <input
+                            type="text"
+                            value={row.itemName}
+                            onChange={(e) =>
+                              setDraftMafItems((prev) =>
+                                prev.map((r, i) => (i === idx ? { ...r, itemName: e.target.value } : r)),
+                              )
+                            }
+                            placeholder={`Item ${idx + 1} Name (e.g. Core Switch)`}
+                            className="sm:col-span-4 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                          />
+                          <input
+                            type="text"
+                            value={row.requiredQuantity}
+                            onChange={(e) =>
+                              setDraftMafItems((prev) =>
+                                prev.map((r, i) =>
+                                  i === idx ? { ...r, requiredQuantity: e.target.value } : r,
+                                ),
+                              )
+                            }
+                            placeholder="Qty (e.g. 10 Nos)"
+                            className="sm:col-span-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                          />
+                          <div className="sm:col-span-3">
+                            <OemSelectControl
+                              id={`tender-maf-oem-${idx}`}
+                              compact
+                              oemRecords={oemRecords}
+                              value={row.oemName}
+                              required={row.mafStatus !== 'Pending'}
+                              allowClear={row.mafStatus === 'Pending'}
+                              placeholder="Select OEM..."
+                              onSelectOem={(oem) => {
+                                const patch = oem
+                                  ? buildMafContactPatchFromOem(oem)
+                                  : {
+                                      oemName: '',
+                                      companyName: '',
+                                      concernedPersonName: '',
+                                      contactNo: '',
+                                      mailId: '',
+                                      oemContact: '',
+                                    };
+                                setDraftMafItems((prev) =>
+                                  prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)),
+                                );
+                              }}
+                              onGoToOemDetails={
+                                onGoToOemDetails
+                                  ? () => {
+                                      onClose();
+                                      onGoToOemDetails();
+                                    }
+                                  : undefined
                               }
-                              aria-label={`Remove MAF item ${idx + 1}`}
-                              className="p-1.5 rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                            />
+                          </div>
+                          <select
+                            value={row.mafStatus}
+                            onChange={(e) =>
+                              setDraftMafItems((prev) =>
+                                prev.map((r, i) =>
+                                  i === idx ? { ...r, mafStatus: e.target.value as MafItemStatus } : r,
+                                ),
+                              )
+                            }
+                            className="sm:col-span-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                          >
+                            {MAF_STATUS_OPTIONS.map((st) => (
+                              <option key={st} value={st}>
+                                {st}
+                              </option>
+                            ))}
+                          </select>
+                          <div className="sm:col-span-1 flex justify-end">
+                            {draftMafItems.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setDraftMafItems((prev) => prev.filter((_, i) => i !== idx))
+                                }
+                                aria-label={`Remove MAF item ${idx + 1}`}
+                                className="p-1.5 rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </div>
                         </div>
+
+                        {(row.companyName || row.concernedPersonName || row.contactNo || row.mailId) && (
+                          <p className="text-[11px] text-slate-600 dark:text-slate-400 pl-0.5">
+                            <span className="font-medium text-blue-700 dark:text-blue-400">
+                              Auto-filled:
+                            </span>{' '}
+                            {[
+                              row.companyName,
+                              row.concernedPersonName,
+                              row.contactNo,
+                              row.mailId,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </p>
+                        )}
                       </div>
                     ))}
                   </div>

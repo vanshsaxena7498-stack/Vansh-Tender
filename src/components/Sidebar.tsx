@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import {
   BarChart3,
+  Building2,
   FileSpreadsheet,
+  Gavel,
   Landmark,
   LogOut,
   ScanSearch,
@@ -18,8 +20,10 @@ interface SidebarProps {
   firmProfile: FirmProfile;
   currentUser?: CrmUserSession | null;
   tenderCount: number;
+  oemCount?: number;
   mafCount?: number;
   emdCount: number;
+  bidRaCount?: number;
   mobileOpen: boolean;
   onCloseMobile: () => void;
   onLogout?: () => void;
@@ -29,8 +33,10 @@ const NAV_ITEMS: { key: TabKey; label: string; icon: typeof BarChart3 }[] = [
   { key: 'dashboard', label: 'Executive Dashboard', icon: BarChart3 },
   { key: 'bidsearch', label: 'Bid Search', icon: ScanSearch },
   { key: 'tenders', label: 'Daily Tender Data', icon: FileSpreadsheet },
+  { key: 'oems', label: 'OEM Details', icon: Building2 },
   { key: 'maf', label: 'MAF Status', icon: ShieldCheck },
   { key: 'emdbg', label: 'EMD & BG Tracker', icon: Landmark },
+  { key: 'bidra', label: 'BID/RA Status', icon: Gavel },
   { key: 'settings', label: 'Admin Settings', icon: Settings },
 ];
 
@@ -40,8 +46,10 @@ export function Sidebar({
   firmProfile,
   currentUser,
   tenderCount,
+  oemCount = 0,
   mafCount = 0,
   emdCount,
+  bidRaCount = 0,
   mobileOpen,
   onCloseMobile,
   onLogout,
@@ -87,11 +95,15 @@ export function Sidebar({
           const countLabel =
             item.key === 'tenders'
               ? tenderCount
-              : item.key === 'maf'
-                ? mafCount
-                : item.key === 'emdbg'
-                  ? emdCount
-                  : null;
+              : item.key === 'oems'
+                ? oemCount
+                : item.key === 'maf'
+                  ? mafCount
+                  : item.key === 'emdbg'
+                    ? emdCount
+                    : item.key === 'bidra'
+                      ? bidRaCount
+                      : null;
 
           return (
             <button

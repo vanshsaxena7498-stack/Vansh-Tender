@@ -22,6 +22,21 @@ export type TenderStage =
   | 'Cancelled / Retendered'
   | 'Tender Not Filled';
 
+export type TechnicalEvalStatus =
+  | 'Pending'
+  | 'Technically Qualified'
+  | 'Technically Disqualified / Rejected'
+  | 'Clarification Sought';
+
+export type FinancialRaStatus =
+  | 'Not Opened'
+  | 'Financial Opened'
+  | 'RA Scheduled / Live'
+  | 'RA Completed'
+  | 'L1 / Awarded'
+  | 'L2 / Runner-up'
+  | 'Not L1 / Lost';
+
 export interface ChecklistItem {
   id: string;
   label: string;
@@ -70,6 +85,13 @@ export interface Tender {
   stage: TenderStage;
   resultInfo: string;
   completionDate?: string;
+  technicalStatus?: TechnicalEvalStatus;
+  technicalOpeningDateTime?: string;
+  technicalRemarks?: string;
+  financialRaStatus?: FinancialRaStatus;
+  financialOpeningRaDateTime?: string;
+  raFinalValue?: number;
+  raFinancialRemarks?: string;
   checklist: ChecklistItem[];
   remarks: RemarkEntry[];
   attachments?: AttachmentItem[];
@@ -124,7 +146,19 @@ export interface UserPreferences {
   darkMode: boolean;
 }
 
-export type TabKey = 'dashboard' | 'bidsearch' | 'tenders' | 'maf' | 'emdbg' | 'settings';
+export type TabKey = 'dashboard' | 'bidsearch' | 'tenders' | 'oems' | 'maf' | 'emdbg' | 'bidra' | 'settings';
+
+export interface OemRecord {
+  id: string;
+  oemName: string;
+  companyName: string;
+  concernedPersonName: string;
+  email: string;
+  phone: string;
+  remarks: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface ExtractedBidDraft {
   tenderId: string;
@@ -249,6 +283,7 @@ export interface CrmBackupPayload {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers?: MafTrackerRecord[];
+  oemDetails?: OemRecord[];
 }
 
 export type CrmUserRole = 'admin' | 'secondary';

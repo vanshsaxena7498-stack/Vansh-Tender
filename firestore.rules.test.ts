@@ -81,7 +81,7 @@ function isValidTender(
   userId: string,
   tenderDocId: string,
 ): boolean {
-  const keys = [
+  const requiredKeys = [
     'ownerUid',
     'id',
     'tenderId',
@@ -116,7 +116,17 @@ function isValidTender(
     'createdAt',
     'updatedAt',
   ];
-  if (!hasExactKeys(data, keys, keys)) return false;
+  const allowedKeys = [
+    ...requiredKeys,
+    'technicalStatus',
+    'technicalOpeningDateTime',
+    'technicalRemarks',
+    'financialRaStatus',
+    'financialOpeningRaDateTime',
+    'raFinalValue',
+    'raFinancialRemarks',
+  ];
+  if (!hasExactKeys(data, requiredKeys, allowedKeys)) return false;
   return (
     isValidId(data.ownerUid) &&
     data.ownerUid === userId &&
@@ -150,6 +160,20 @@ function isValidTender(
     data.remarks.length <= 100 &&
     Array.isArray(data.attachments) &&
     data.attachments.length <= 10 &&
+    (data.technicalStatus === undefined ||
+      (typeof data.technicalStatus === 'string' && data.technicalStatus.length <= 80)) &&
+    (data.technicalOpeningDateTime === undefined ||
+      (typeof data.technicalOpeningDateTime === 'string' && data.technicalOpeningDateTime.length <= 32)) &&
+    (data.technicalRemarks === undefined ||
+      (typeof data.technicalRemarks === 'string' && data.technicalRemarks.length <= 1000)) &&
+    (data.financialRaStatus === undefined ||
+      (typeof data.financialRaStatus === 'string' && data.financialRaStatus.length <= 80)) &&
+    (data.financialOpeningRaDateTime === undefined ||
+      (typeof data.financialOpeningRaDateTime === 'string' && data.financialOpeningRaDateTime.length <= 32)) &&
+    (data.raFinalValue === undefined ||
+      (typeof data.raFinalValue === 'number' && data.raFinalValue >= 0)) &&
+    (data.raFinancialRemarks === undefined ||
+      (typeof data.raFinancialRemarks === 'string' && data.raFinancialRemarks.length <= 1000)) &&
     data.createdAt === SERVER_TIME &&
     data.updatedAt === SERVER_TIME
   );
@@ -248,7 +272,22 @@ test('Dirty Dozen adversarial payloads all evaluate to PERMISSION_DENIED', () =>
   // 3. Privilege Escalation into /admins/{uid}
   assert.equal(verifiedUser.token.email === 'vanshsaxena7498@gmail.com', false);
 
-  // 4. Shadow / Ghost Field Injection
+  // 4. Shadow / Ghost Field Injection (also verify optional BID/RA fields are valid while unknown keys are denied)
+  const validWithBidRa = {
+    ...makeBaseTender('u2', 't1'),
+    technicalStatus: 'Technically Qualified',
+    technicalOpeningDateTime: '2026-05-05T11:00',
+    technicalRemarks: 'Specs verified',
+    financialRaStatus: 'RA Scheduled / Live',
+    financialOpeningRaDateTime: '2026-05-10T15:00',
+    raFinalValue: 910000,
+    raFinancialRemarks: 'RA live on GeM',
+  };
+  assert.equal(isValidTender(validWithBidRa, verifiedUser, 'u2', 't1'), true);
+  assert.equal(
+    isValidTender({ ...validWithBidRa, raFinalValue: -100 }, verifiedUser, 'u2', 't1'),
+    false,
+  );
   const shadowTender = { ...makeBaseTender('u2', 't1'), isApprovedAdmin: true };
   assert.equal(isValidTender(shadowTender, verifiedUser, 'u2', 't1'), false);
 
@@ -678,6 +717,86 @@ test('Bootstrapped Admin can list/read sibling Admin UIDs & legacy collections r
     true,
   );
 });
+
+function isValidOemRecord(
+  data: Record<string, unknown>,
+  auth: AuthContext | null,
+  userId: string,
+  oemDocId: string,
+): boolean {
+  if (!isVerifiedUser(auth)) return false;
+  const keys = [
+    'ownerUid',
+    'id',
+    'oemName',
+    'companyName',
+    'concernedPersonName',
+    'email',
+    'phone',
+    'remarks',
+    'clientCreatedAt',
+    'clientUpdatedAt',
+    'createdAt',
+    'updatedAt',
+  ];
+  if (!hasExactKeys(data, keys, keys)) return false;
+  return (
+    isValidId(data.ownerUid) &&
+    data.ownerUid === userId &&
+    data.ownerUid === auth.uid &&
+    isValidId(data.id) &&
+    data.id === oemDocId &&
+    typeof data.oemName === 'string' &&
+    data.oemName.length >= 1 &&
+    data.oemName.length <= 150 &&
+    typeof data.companyName === 'string' &&
+    data.companyName.length <= 150 &&
+    typeof data.concernedPersonName === 'string' &&
+    data.concernedPersonName.length <= 120 &&
+    typeof data.email === 'string' &&
+    data.email.length <= 160 &&
+    typeof data.phone === 'string' &&
+    data.phone.length <= 40 &&
+    typeof data.remarks === 'string' &&
+    data.remarks.length <= 500 &&
+    typeof data.clientCreatedAt === 'string' &&
+    data.clientCreatedAt.length <= 40 &&
+    typeof data.clientUpdatedAt === 'string' &&
+    data.clientUpdatedAt.length <= 40 &&
+    data.createdAt === SERVER_TIME &&
+    data.updatedAt === SERVER_TIME
+  );
+}
+
+test('OemDetail Firestore rules enforce ownership, required oemName, length bounds, server timestamps, and reject shadow fields', () => {
+  const verifiedUser: AuthContext = {
+    uid: 'u2',
+    token: { email: 'user@example.com', email_verified: true },
+  };
+  const validOem: Record<string, unknown> = {
+    ownerUid: 'u2',
+    id: 'oem-nvs',
+    oemName: 'NVS',
+    companyName: 'Newtech',
+    concernedPersonName: 'Sandeep Tyagi',
+    email: 'sandeep.tyagi@nvsledwall.com',
+    phone: '+91 8800686947',
+    remarks: 'LED Video Wall OEM',
+    clientCreatedAt: '2026-11-20T10:00:00Z',
+    clientUpdatedAt: '2026-11-20T10:00:00Z',
+    createdAt: SERVER_TIME,
+    updatedAt: SERVER_TIME,
+  };
+
+  assert.equal(isValidOemRecord(validOem, verifiedUser, 'u2', 'oem-nvs'), true);
+  assert.equal(isValidOemRecord({ ...validOem, oemName: '' }, verifiedUser, 'u2', 'oem-nvs'), false);
+  assert.equal(isValidOemRecord({ ...validOem, oemName: 'A'.repeat(151) }, verifiedUser, 'u2', 'oem-nvs'), false);
+  assert.equal(isValidOemRecord({ ...validOem, shadowField: true }, verifiedUser, 'u2', 'oem-nvs'), false);
+  assert.equal(isValidOemRecord({ ...validOem, ownerUid: 'victim' }, verifiedUser, 'u2', 'oem-nvs'), false);
+  assert.equal(isValidOemRecord({ ...validOem, id: 'wrong-id' }, verifiedUser, 'u2', 'oem-nvs'), false);
+  assert.equal(isValidOemRecord({ ...validOem, createdAt: '2026-11-20T00:00:00Z' }, verifiedUser, 'u2', 'oem-nvs'), false);
+});
+
 
 
 

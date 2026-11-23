@@ -2,6 +2,7 @@ import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
+  Building2,
   Check,
   CheckCircle2,
   FileText,
@@ -10,8 +11,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import { COMMON_OEM_NAMES } from '../data/seedData';
-import type { MafItemStatus, MafLineItem, MafTrackerRecord, Tender } from '../types/crm';
+import type { MafItemStatus, MafLineItem, MafTrackerRecord, OemRecord, Tender } from '../types/crm';
 import {
   createMafItemId,
   findDailyTenderByCode,
@@ -24,11 +24,15 @@ import {
   validateMafItemDraft,
   validateMafUploadFile,
 } from '../utils/mafCalculations';
+import { buildMafContactPatchFromOem, findOemByName } from '../utils/oemDirectory';
+import { OemSelectControl } from './OemSelectControl';
 
 interface MafTrackerFormModalProps {
   initialTracker?: MafTrackerRecord | null;
   tenders: Tender[];
   existingTrackers: MafTrackerRecord[];
+  oemRecords: OemRecord[];
+  onGoToOemDetails: () => void;
   onClose: () => void;
   onSave: (tracker: MafTrackerRecord) => void;
   onUploadFile: (
@@ -78,6 +82,8 @@ export function MafTrackerFormModal({
   initialTracker,
   tenders,
   existingTrackers,
+  oemRecords,
+  onGoToOemDetails,
   onClose,
   onSave,
   onUploadFile,
@@ -252,8 +258,12 @@ export function MafTrackerFormModal({
       return;
     }
 
+    const allowedOemNames = oemRecords.map((o) => o.oemName);
     for (let i = 0; i < itemsMAF.length; i++) {
-      const rowErr = validateMafItemDraft(itemsMAF[i]);
+      const rowErr = validateMafItemDraft({
+        ...itemsMAF[i],
+        allowedOemNames,
+      });
       if (rowErr) {
         setErrorMsg(`Item #${i + 1}: ${rowErr}`);
         return;
@@ -587,15 +597,34 @@ export function MafTrackerFormModal({
                 </button>
               </div>
 
-              <datalist id="maf-form-oem-list">
-                {COMMON_OEM_NAMES.map((oem) => (
-                  <option key={oem} value={oem} />
-                ))}
-              </datalist>
+              {oemRecords.length === 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-800 dark:text-amber-300">
+                  <span className="inline-flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>
+                      No OEMs registered in <strong>OEM Details</strong> yet. Register your OEM contacts there so you can select them below.
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onGoToOemDetails();
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-amber-700 hover:bg-amber-800 text-white text-[11px] font-medium shrink-0"
+                  >
+                    <Building2 className="h-3 w-3" aria-hidden="true" />
+                    <span>Go to OEM Details</span>
+                  </button>
+                </div>
+              )}
 
               <div className="space-y-4">
                 {itemsMAF.map((item, idx) => {
                   const isUploading = uploadingItemId === item.itemId;
+                  const matchedItemOem = findOemByName(oemRecords, item.oemName);
+                  const hasUnlistedOem = Boolean(item.oemName.trim()) && !matchedItemOem;
+
                   return (
                     <div
                       key={item.itemId}
@@ -616,6 +645,15 @@ export function MafTrackerFormModal({
                           </button>
                         )}
                       </div>
+
+                      {hasUnlistedOem && (
+                        <div className="flex items-center gap-2 rounded-lg border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-300">
+                          <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                          <span>
+                            &ldquo;{item.oemName.trim()}&rdquo; is not in OEM Details. Please choose a registered OEM to auto-fill contact info.
+                          </span>
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                         <div className="lg:col-span-2">
@@ -651,68 +689,96 @@ export function MafTrackerFormModal({
                           <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
                             OEM Name {item.mafStatus !== 'Pending' ? '*' : ''}
                           </label>
-                          <input
-                            type="text"
-                            required={item.mafStatus !== 'Pending'}
-                            list="maf-form-oem-list"
+                          <OemSelectControl
+                            id={`maf-row-oem-${idx}`}
+                            compact
+                            oemRecords={oemRecords}
                             value={item.oemName}
-                            onChange={(e) => handleUpdateRow(idx, { oemName: e.target.value })}
-                            placeholder="e.g. CP Plus"
-                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            required={item.mafStatus !== 'Pending'}
+                            allowClear={item.mafStatus === 'Pending'}
+                            placeholder="Select OEM..."
+                            onSelectOem={(oem) => {
+                              if (oem) {
+                                handleUpdateRow(idx, buildMafContactPatchFromOem(oem));
+                              } else {
+                                handleUpdateRow(idx, {
+                                  oemName: '',
+                                  companyName: '',
+                                  concernedPersonName: '',
+                                  contactNo: '',
+                                  mailId: '',
+                                  oemContact: '',
+                                });
+                              }
+                            }}
+                            onGoToOemDetails={() => {
+                              onClose();
+                              onGoToOemDetails();
+                            }}
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            Company Name
+                          <label className="flex items-center justify-between text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            <span>Company Name</span>
+                            <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                              Auto-filled
+                            </span>
                           </label>
                           <input
                             type="text"
+                            readOnly
                             value={item.companyName ?? ''}
-                            onChange={(e) => handleUpdateRow(idx, { companyName: e.target.value })}
-                            placeholder="e.g. Partner / OEM Co."
-                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            placeholder="Auto-filled from OEM Details"
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            Concerned Person Name
+                          <label className="flex items-center justify-between text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            <span>Concerned Person Name</span>
+                            <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                              Auto-filled
+                            </span>
                           </label>
                           <input
                             type="text"
+                            readOnly
                             value={item.concernedPersonName ?? ''}
-                            onChange={(e) =>
-                              handleUpdateRow(idx, { concernedPersonName: e.target.value })
-                            }
-                            placeholder="e.g. Ravi Singh"
-                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            placeholder="Auto-filled from OEM Details"
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            Contact No.
+                          <label className="flex items-center justify-between text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            <span>Contact No.</span>
+                            <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                              Auto-filled
+                            </span>
                           </label>
                           <input
                             type="tel"
+                            readOnly
                             value={item.contactNo ?? ''}
-                            onChange={(e) => handleUpdateRow(idx, { contactNo: e.target.value })}
-                            placeholder="e.g. +91 98112 44019"
-                            className="font-mono-num w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            placeholder="Auto-filled from OEM Details"
+                            className="font-mono-num w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                            Mail ID
+                          <label className="flex items-center justify-between text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                            <span>Mail ID</span>
+                            <span className="text-[10px] font-normal text-blue-700 dark:text-blue-400">
+                              Auto-filled
+                            </span>
                           </label>
                           <input
                             type="email"
+                            readOnly
                             value={item.mailId ?? ''}
-                            onChange={(e) => handleUpdateRow(idx, { mailId: e.target.value })}
-                            placeholder="e.g. ravi.singh@oem.com"
-                            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                            placeholder="Auto-filled from OEM Details"
+                            className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/70 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-300 cursor-not-allowed focus:outline-none"
                           />
                         </div>
 

@@ -7,6 +7,7 @@ import type {
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
+  OemRecord,
   SecondaryUserSummary,
   Tender,
   UserPreferences,
@@ -75,6 +76,7 @@ export interface SecondaryWorkspaceSnapshot {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
+  oemRecords?: OemRecord[];
   emailSettings: EmailAlertSettings;
   emailLogs: EmailAlertLog[];
   sheetSettings: GoogleSheetSettings;
@@ -997,6 +999,7 @@ export function buildEmptySecondaryWorkspace(session: Pick<CrmUserSession, 'user
     tenders: [],
     emdRecords: [],
     mafTrackers: [],
+    oemRecords: [],
     emailSettings: {
       enabled: true,
       recipientName: session.username,

@@ -7,6 +7,7 @@ import type {
   GoogleSheetSettings,
   MafLineItem,
   MafTrackerRecord,
+  OemRecord,
   Tender,
   UserPreferences,
 } from '../types/crm';
@@ -23,6 +24,8 @@ export const CLOUD_LIMITS = {
   CLIENT_ISO_MAX: 40,
   RESULT_INFO_MAX: 1000,
   REMARKS_TEXT_MAX: 1000,
+  BIDRA_STATUS_MAX: 80,
+  BIDRA_REMARKS_MAX: 1000,
   OWNER_NAME_MAX: 100,
   RANK_MAX: 40,
   PROJECT_ID_MAX: 128,
@@ -188,6 +191,13 @@ export function buildCloudTenderPayload<TTime>(
     stage: tender.stage,
     resultInfo: clampStr(tender.resultInfo, CLOUD_LIMITS.RESULT_INFO_MAX),
     completionDate: clampStr(tender.completionDate, CLOUD_LIMITS.DATE_MAX),
+    technicalStatus: clampStr(tender.technicalStatus, CLOUD_LIMITS.BIDRA_STATUS_MAX),
+    technicalOpeningDateTime: clampStr(tender.technicalOpeningDateTime, CLOUD_LIMITS.DATE_MAX),
+    technicalRemarks: clampStr(tender.technicalRemarks, CLOUD_LIMITS.BIDRA_REMARKS_MAX),
+    financialRaStatus: clampStr(tender.financialRaStatus, CLOUD_LIMITS.BIDRA_STATUS_MAX),
+    financialOpeningRaDateTime: clampStr(tender.financialOpeningRaDateTime, CLOUD_LIMITS.DATE_MAX),
+    raFinalValue: clampNonNegativeNumber(tender.raFinalValue),
+    raFinancialRemarks: clampStr(tender.raFinancialRemarks, CLOUD_LIMITS.BIDRA_REMARKS_MAX),
     checklist: (tender.checklist ?? []).slice(0, CLOUD_LIMITS.CHECKLIST_MAX).map((item) => ({
       id: clampStr(item.id, 80),
       label: clampStr(item.label, 160),
@@ -354,6 +364,32 @@ export function buildCloudMafTrackerPayload<TTime>(
       .map(sanitizeMafLineItemForCloud),
     clientCreatedAt: clampStr(tracker.createdAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
     clientUpdatedAt: clampStr(tracker.updatedAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
+    createdAt: existingCreatedAt ?? serverTimeToken,
+    updatedAt: serverTimeToken,
+  };
+}
+
+export function buildCloudOemPayload<TTime>(
+  oem: OemRecord,
+  ownerUid: string,
+  serverTimeToken: TTime,
+  existingCreatedAt?: unknown,
+): Record<string, unknown> {
+  const safeId = sanitizeDocId(oem.id);
+  return {
+    ownerUid: sanitizeDocId(ownerUid),
+    id: safeId,
+    oemName: clampStr((oem.oemName || '').trim() || 'OEM', CLOUD_LIMITS.MAF_OEM_NAME_MAX),
+    companyName: clampStr((oem.companyName || '').trim(), CLOUD_LIMITS.MAF_OEM_NAME_MAX),
+    concernedPersonName: clampStr(
+      (oem.concernedPersonName || '').trim(),
+      CLOUD_LIMITS.MAF_PERSON_NAME_MAX,
+    ),
+    email: clampStr((oem.email || '').trim(), CLOUD_LIMITS.MAF_EMAIL_MAX),
+    phone: clampStr((oem.phone || '').trim(), CLOUD_LIMITS.MAF_PHONE_MAX),
+    remarks: clampStr((oem.remarks || '').trim(), CLOUD_LIMITS.MAF_REMARKS_MAX),
+    clientCreatedAt: clampStr(oem.createdAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
+    clientUpdatedAt: clampStr(oem.updatedAt, CLOUD_LIMITS.CLIENT_ISO_MAX),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
   };

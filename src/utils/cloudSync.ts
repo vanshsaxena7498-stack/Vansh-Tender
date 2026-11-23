@@ -38,6 +38,7 @@ import type {
   FirmProfile,
   GoogleSheetSettings,
   MafTrackerRecord,
+  OemRecord,
   SecondaryUserSummary,
   Tender,
   UserPreferences,
@@ -49,6 +50,7 @@ import {
   buildCloudEmailConfigPayload,
   buildCloudEmdPayload,
   buildCloudMafTrackerPayload,
+  buildCloudOemPayload,
   buildCloudPreferencesPayload,
   buildCloudProfilePayload,
   buildCloudSheetConfigPayload,
@@ -203,6 +205,34 @@ function docToTender(data: Record<string, unknown>, fallbackDocId = ''): Tender 
     stage: (data.stage as Tender['stage']) || 'Identified / Reviewing',
     resultInfo: String(data.resultInfo ?? ''),
     completionDate: String(data.completionDate ?? ''),
+    technicalStatus:
+      typeof data.technicalStatus === 'string' && data.technicalStatus
+        ? (data.technicalStatus as Tender['technicalStatus'])
+        : undefined,
+    technicalOpeningDateTime:
+      typeof data.technicalOpeningDateTime === 'string' && data.technicalOpeningDateTime
+        ? data.technicalOpeningDateTime
+        : undefined,
+    technicalRemarks:
+      typeof data.technicalRemarks === 'string' && data.technicalRemarks
+        ? data.technicalRemarks
+        : undefined,
+    financialRaStatus:
+      typeof data.financialRaStatus === 'string' && data.financialRaStatus
+        ? (data.financialRaStatus as Tender['financialRaStatus'])
+        : undefined,
+    financialOpeningRaDateTime:
+      typeof data.financialOpeningRaDateTime === 'string' && data.financialOpeningRaDateTime
+        ? data.financialOpeningRaDateTime
+        : undefined,
+    raFinalValue:
+      typeof data.raFinalValue === 'number' && Number.isFinite(data.raFinalValue) && data.raFinalValue > 0
+        ? data.raFinalValue
+        : undefined,
+    raFinancialRemarks:
+      typeof data.raFinancialRemarks === 'string' && data.raFinancialRemarks
+        ? data.raFinancialRemarks
+        : undefined,
     checklist: Array.isArray(data.checklist) ? (data.checklist as Tender['checklist']) : [],
     remarks: Array.isArray(data.remarks) ? (data.remarks as Tender['remarks']) : [],
     attachments: Array.isArray(data.attachments)
@@ -263,6 +293,22 @@ function docToMafTracker(data: Record<string, unknown>, fallbackDocId = ''): Maf
         mafRequestedDate: getMafRequestedDate(item),
       };
     }),
+    createdAt: normalizeAdminFirestoreTimestamp(data.clientCreatedAt ?? data.createdAt, nowIso),
+    updatedAt: normalizeAdminFirestoreTimestamp(data.clientUpdatedAt ?? data.updatedAt, nowIso),
+  };
+}
+
+function docToOemRecord(data: Record<string, unknown>, fallbackDocId = ''): OemRecord {
+  const nowIso = new Date().toISOString();
+  const resolvedId = String(data.id || fallbackDocId || '');
+  return {
+    id: resolvedId,
+    oemName: String(data.oemName ?? ''),
+    companyName: String(data.companyName ?? ''),
+    concernedPersonName: String(data.concernedPersonName ?? ''),
+    email: String(data.email ?? ''),
+    phone: String(data.phone ?? ''),
+    remarks: String(data.remarks ?? ''),
     createdAt: normalizeAdminFirestoreTimestamp(data.clientCreatedAt ?? data.createdAt, nowIso),
     updatedAt: normalizeAdminFirestoreTimestamp(data.clientUpdatedAt ?? data.updatedAt, nowIso),
   };
@@ -910,6 +956,53 @@ export async function deleteMafTrackerFromCloud(
   }
 }
 
+export async function syncOemRecordToCloud(
+  user: User,
+  oem: OemRecord,
+  workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
+): Promise<void> {
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  const safeId = sanitizeDocId(oem.id);
+  const path = `${prefix}/oemDetails/${safeId}`;
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
+  try {
+    const snap = await getDoc(ref);
+    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const payload = buildCloudOemPayload(
+      { ...oem, id: safeId },
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    await setDoc(ref, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function deleteOemRecordFromCloud(
+  user: User,
+  oemId: string,
+  workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
+): Promise<void> {
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  const safeId = sanitizeDocId(oemId);
+  const path = `${prefix}/oemDetails/${safeId}`;
+  const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
+  try {
+    const snap = await getDoc(ref);
+    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+      throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
+    }
+    await deleteDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 export async function fetchAttachmentFileDataUrl(
   uid: string,
   attachmentId: string,
@@ -942,6 +1035,7 @@ export async function fetchAllFromCloud(
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
+  oemRecords: OemRecord[];
   attachmentFiles: Map<string, string>;
 }> {
   const { ctx, scopedTenant, prefix } = resolveScope(uid, workspaceTenantId, target);
@@ -953,6 +1047,7 @@ export async function fetchAllFromCloud(
   const tendersPath = `${prefix}/tenders`;
   const emdPath = `${prefix}/emdRecords`;
   const mafPath = `${prefix}/maf_tracker`;
+  const oemPath = `${prefix}/oemDetails`;
   const filesPath = `${prefix}/attachmentFiles`;
 
   let profile: FirmProfile | null = null;
@@ -963,6 +1058,7 @@ export async function fetchAllFromCloud(
   let tenders: Tender[] = [];
   let emdRecords: EmdBgRecord[] = [];
   let mafTrackers: MafTrackerRecord[] = [];
+  let oemRecords: OemRecord[] = [];
   const attachmentFiles = new Map<string, string>();
 
   try {
@@ -1014,6 +1110,19 @@ export async function fetchAllFromCloud(
     mafTrackers = mSnap.docs.map((d) => docToMafTracker(d.data()));
   } catch (error) {
     handleFirestoreError(error, OperationType.LIST, mafPath);
+  }
+
+  try {
+    const oQuery = query(
+      getScopedCollection(ctx, uid, scopedTenant, 'oemDetails'),
+      where('ownerUid', '==', uid),
+    );
+    const oSnap = await getDocs(oQuery);
+    oemRecords = oSnap.docs
+      .map((d) => docToOemRecord(d.data(), d.id))
+      .filter((item) => item.oemName.trim().length > 0);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, oemPath);
   }
 
   try {
@@ -1076,6 +1185,7 @@ export async function fetchAllFromCloud(
     tenders,
     emdRecords,
     mafTrackers,
+    oemRecords,
     attachmentFiles,
   };
 }
@@ -1094,6 +1204,7 @@ export interface CloudWorkspaceDataset {
   tenders: Tender[];
   emdRecords: EmdBgRecord[];
   mafTrackers: MafTrackerRecord[];
+  oemRecords: OemRecord[];
   attachmentFiles: Map<string, string>;
 }
 
@@ -1107,6 +1218,7 @@ export function createEmptyCloudDataset(): CloudWorkspaceDataset {
     tenders: [],
     emdRecords: [],
     mafTrackers: [],
+    oemRecords: [],
     attachmentFiles: new Map<string, string>(),
   };
 }
@@ -1178,6 +1290,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
       | 'tenders'
       | 'emdRecords'
       | 'maf_tracker'
+      | 'oemDetails'
       | 'attachmentFiles'
       | 'emailAlerts'
       | 'profile'
@@ -1205,6 +1318,11 @@ export async function fetchAdminCloudWorkspaceWithFallback(
         const item = docToMafTracker(raw, d.id);
         if (item.id && (item.tenderId || item.itemsMAF.length > 0)) {
           supplemental.mafTrackers = mergeAdminRecordsById(supplemental.mafTrackers, [item]);
+        }
+      } else if (kind === 'oemDetails') {
+        const item = docToOemRecord(raw, d.id);
+        if (item.id && item.oemName.trim().length > 0) {
+          supplemental.oemRecords = mergeAdminRecordsById(supplemental.oemRecords, [item]);
         }
       } else if (kind === 'attachmentFiles') {
         if (typeof raw.dataUrl === 'string' && raw.dataUrl.length > 0) {
@@ -1274,6 +1392,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
         eSnap,
         eLegacySnap,
         mSnap,
+        oSnap,
         fSnap,
         eaSnap,
       ] = await Promise.all([
@@ -1281,6 +1400,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
         safeGetDocs(collection(targetDb, 'users', candidateUid, 'emdRecords')),
         safeGetDocs(collection(targetDb, 'users', candidateUid, 'emd_bg_tracker')),
         safeGetDocs(collection(targetDb, 'users', candidateUid, 'maf_tracker')),
+        safeGetDocs(collection(targetDb, 'users', candidateUid, 'oemDetails')),
         safeGetDocs(collection(targetDb, 'users', candidateUid, 'attachmentFiles')),
         safeGetDocs(collection(targetDb, 'users', candidateUid, 'emailAlerts')),
       ]);
@@ -1289,6 +1409,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
       if (eSnap) absorbCollectionDocs(eSnap.docs, 'emdRecords', candidateUid);
       if (eLegacySnap) absorbCollectionDocs(eLegacySnap.docs, 'emdRecords', candidateUid);
       if (mSnap) absorbCollectionDocs(mSnap.docs, 'maf_tracker', candidateUid);
+      if (oSnap) absorbCollectionDocs(oSnap.docs, 'oemDetails', candidateUid);
       if (fSnap) absorbCollectionDocs(fSnap.docs, 'attachmentFiles', candidateUid);
       if (eaSnap) absorbCollectionDocs(eaSnap.docs, 'emailAlerts', candidateUid);
     }
@@ -1299,6 +1420,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
       rootEmd,
       rootEmdLegacy,
       rootMaf,
+      rootOems,
       rootFiles,
       rootEmailAlerts,
       rootProfile,
@@ -1310,6 +1432,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
       safeGetDocs(collection(targetDb, 'emdRecords')),
       safeGetDocs(collection(targetDb, 'emd_bg_tracker')),
       safeGetDocs(collection(targetDb, 'maf_tracker')),
+      safeGetDocs(collection(targetDb, 'oemDetails')),
       safeGetDocs(collection(targetDb, 'attachmentFiles')),
       safeGetDocs(collection(targetDb, 'emailAlerts')),
       safeGetDocs(collection(targetDb, 'profile')),
@@ -1322,6 +1445,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
     if (rootEmd) absorbCollectionDocs(rootEmd.docs, 'emdRecords');
     if (rootEmdLegacy) absorbCollectionDocs(rootEmdLegacy.docs, 'emdRecords');
     if (rootMaf) absorbCollectionDocs(rootMaf.docs, 'maf_tracker');
+    if (rootOems) absorbCollectionDocs(rootOems.docs, 'oemDetails');
     if (rootFiles) absorbCollectionDocs(rootFiles.docs, 'attachmentFiles');
     if (rootEmailAlerts) absorbCollectionDocs(rootEmailAlerts.docs, 'emailAlerts');
     if (rootProfile) absorbCollectionDocs(rootProfile.docs, 'profile');
@@ -1341,6 +1465,7 @@ export async function fetchAdminCloudWorkspaceWithFallback(
     tenders: mergeAdminRecordsById(primary.tenders, supplemental.tenders),
     emdRecords: mergeAdminRecordsById(primary.emdRecords, supplemental.emdRecords),
     mafTrackers: mergeAdminRecordsById(primary.mafTrackers, supplemental.mafTrackers),
+    oemRecords: mergeAdminRecordsById(primary.oemRecords, supplemental.oemRecords),
     attachmentFiles: mergeAdminAttachmentMaps(
       primary.attachmentFiles,
       supplemental.attachmentFiles,
@@ -1359,6 +1484,7 @@ export async function backupAllToCloud(
   mafTrackers: MafTrackerRecord[] = [],
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
+  oemRecords: OemRecord[] = [],
 ): Promise<void> {
   const { ctx } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
@@ -1376,6 +1502,10 @@ export async function backupAllToCloud(
   for (const tracker of mafTrackers) {
     await syncMafTrackerToCloud(user, tracker, workspaceTenantId, ctx);
   }
+
+  for (const oem of oemRecords) {
+    await syncOemRecordToCloud(user, oem, workspaceTenantId, ctx);
+  }
 }
 
 export async function replaceCloudDataset(
@@ -1387,6 +1517,7 @@ export async function replaceCloudDataset(
   mafTrackers: MafTrackerRecord[] = [],
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
+  oemRecords: OemRecord[] = [],
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
@@ -1394,6 +1525,7 @@ export async function replaceCloudDataset(
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
   const nextMafIds = new Set(mafTrackers.map((m) => sanitizeDocId(m.id)));
+  const nextOemIds = new Set(oemRecords.map((o) => sanitizeDocId(o.id)));
   const nextAttachmentIds = new Set<string>();
 
   for (const t of tenders) {
@@ -1428,6 +1560,12 @@ export async function replaceCloudDataset(
     }
   }
 
+  for (const oldOem of existing.oemRecords) {
+    if (!nextOemIds.has(sanitizeDocId(oldOem.id))) {
+      await deleteOemRecordFromCloud(user, oldOem.id, workspaceTenantId, ctx);
+    }
+  }
+
   for (const oldAttId of existing.attachmentFiles.keys()) {
     if (!nextAttachmentIds.has(sanitizeDocId(oldAttId))) {
       const safeId = sanitizeDocId(oldAttId);
@@ -1449,6 +1587,7 @@ export async function replaceCloudDataset(
     mafTrackers,
     workspaceTenantId,
     ctx,
+    oemRecords,
   );
 }
 
@@ -1463,6 +1602,7 @@ export function subscribeToUserCloudData(
     onTenders: (tenders: Tender[]) => void;
     onEmdRecords: (records: EmdBgRecord[]) => void;
     onMafTrackers: (trackers: MafTrackerRecord[]) => void;
+    onOemRecords?: (oems: OemRecord[]) => void;
     onAttachmentFiles: (fileMap: Map<string, string>) => void;
     onError: (err: Error) => void;
   },
@@ -1478,6 +1618,7 @@ export function subscribeToUserCloudData(
   const tendersPath = `${prefix}/tenders`;
   const emdPath = `${prefix}/emdRecords`;
   const mafPath = `${prefix}/maf_tracker`;
+  const oemPath = `${prefix}/oemDetails`;
   const filesPath = `${prefix}/attachmentFiles`;
 
   const unsubProfile = onSnapshot(
@@ -1548,6 +1689,25 @@ export function subscribeToUserCloudData(
     (error) => {
       try {
         handleFirestoreError(error, OperationType.LIST, mafPath);
+      } catch (wrapped) {
+        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
+  const unsubOems = onSnapshot(
+    query(getScopedCollection(ctx, uid, scopedTenant, 'oemDetails'), where('ownerUid', '==', uid)),
+    (snap) => {
+      if (callbacks.onOemRecords) {
+        const list = snap.docs
+          .map((d) => docToOemRecord(d.data(), d.id))
+          .filter((item) => item.oemName.trim().length > 0);
+        callbacks.onOemRecords(list);
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, oemPath);
       } catch (wrapped) {
         callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
       }
@@ -1638,6 +1798,7 @@ export function subscribeToUserCloudData(
     unsubTenders();
     unsubEmd();
     unsubMaf();
+    unsubOems();
     unsubFiles();
   };
 }
