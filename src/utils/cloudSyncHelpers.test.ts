@@ -542,6 +542,105 @@ test('buildCloudOemPayload validates all 12 blueprint fields and enforces field 
   assert.equal(payload.updatedAt, TOKEN);
 });
 
+test('pickValidExistingCreatedAt keeps Firestore Timestamp objects and drops legacy string/number timestamps', async () => {
+  const { pickValidExistingCreatedAt, isFirestoreTimestampObject } = await import(
+    './cloudSyncHelpers'
+  );
+
+  const sdkTimestamp = { toDate: () => new Date('2026-11-01T00:00:00Z'), seconds: 1793491200, nanoseconds: 0 };
+  const serializedTimestamp = { seconds: 1793491200, nanoseconds: 0 };
+
+  assert.equal(isFirestoreTimestampObject(sdkTimestamp), true);
+  assert.equal(isFirestoreTimestampObject(serializedTimestamp), true);
+  assert.equal(pickValidExistingCreatedAt(sdkTimestamp), sdkTimestamp);
+  assert.equal(pickValidExistingCreatedAt(serializedTimestamp), serializedTimestamp);
+
+  assert.equal(pickValidExistingCreatedAt('2026-11-01T00:00:00.000Z'), undefined);
+  assert.equal(pickValidExistingCreatedAt(1793491200000), undefined);
+  assert.equal(pickValidExistingCreatedAt(null), undefined);
+  assert.equal(pickValidExistingCreatedAt(undefined), undefined);
+});
+
+test('cloud builders normalize legacy enums, guard blank strings, and clamp multibyte UTF-8 text within byte budgets', async () => {
+  const {
+    buildCloudEmailConfigPayload,
+    buildCloudTenderPayload,
+    buildCloudEmdPayload,
+    utf8ByteLength,
+  } = await import('./cloudSyncHelpers');
+
+  // Multibyte Rupee symbol (3 UTF-8 bytes each) repeated 150 times = 450 UTF-8 bytes
+  const multibyteTitle = '₹'.repeat(150);
+  const tenderPayload = buildCloudTenderPayload(
+    {
+      id: 'legacy-1',
+      tenderId: '   ',
+      portal: 'GeM Portal' as Tender['portal'],
+      department: '   ',
+      location: '≤ 5 km zone',
+      category: 'LED',
+      title: multibyteTitle,
+      publishDate: '2026-11-01',
+      submissionDueDate: '   ',
+      estimatedValue: -500,
+      quotedValue: NaN,
+      emdStatus: 'MSME Exempted' as Tender['emdStatus'],
+      emdAmount: 0,
+      stage: 'Awarded' as Tender['stage'],
+      resultInfo: '',
+      checklist: [],
+      remarks: [],
+      createdAt: '',
+      updatedAt: '',
+    },
+    'uid-1',
+    TOKEN,
+  );
+
+  assert.equal(tenderPayload.portal, 'GeM');
+  assert.equal(tenderPayload.department, 'Department');
+  assert.equal(tenderPayload.tenderId, 'legacy-1');
+  assert.equal(tenderPayload.emdStatus, 'Exempted - MSME/Startup');
+  assert.equal(tenderPayload.stage, 'L1 / Won');
+  assert.equal(tenderPayload.estimatedValue, 0);
+  assert.equal(tenderPayload.quotedValue, 0);
+  assert.ok(String(tenderPayload.submissionDueDate).length >= 8);
+  assert.ok(utf8ByteLength(String(tenderPayload.title)) <= CLOUD_LIMITS.TITLE_MAX);
+
+  const emdPayload = buildCloudEmdPayload(
+    {
+      id: 'emd-blank',
+      tenderId: '  ',
+      department: '  ',
+      instrumentType: 'BG Guarantee' as EmdBgRecord['instrumentType'],
+      referenceNo: ' ',
+      bankName: '  ',
+      amount: -10,
+      issueDate: '',
+      expiryDate: '',
+      claimEndDate: '',
+      status: 'Released' as EmdBgRecord['status'],
+      remarks: '',
+    },
+    'uid-1',
+    TOKEN,
+  );
+  assert.equal(emdPayload.instrumentType, 'Bank Guarantee (PBG / Bid BG)');
+  assert.equal(emdPayload.status, 'Refunded / Released');
+  assert.equal(emdPayload.department, 'Department');
+  assert.equal(emdPayload.bankName, 'Bank');
+  assert.equal(emdPayload.amount, 0);
+
+  const emailCfgPayload = buildCloudEmailConfigPayload(
+    { enabled: true, recipientName: '   ', recipientEmail: ' a@b ' },
+    'uid-1',
+    TOKEN,
+  );
+  assert.equal(emailCfgPayload.recipientName, 'Alert Recipient');
+  assert.equal(emailCfgPayload.recipientEmail, 'alerts@example.com');
+});
+
+
 
 
 

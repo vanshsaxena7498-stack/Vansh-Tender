@@ -149,6 +149,14 @@ import {
   type ExtractedSpecItem,
 } from './utils/mafAutoGenerate';
 import { findMatchingDailyTender } from './utils/mafCalculations';
+import {
+  clearPerTabCrmSession,
+  getRemainingCrmSessionMs,
+  isCrmSessionExpired,
+  loadValidPerTabCrmSession,
+  savePerTabCrmSession,
+  updatePerTabActiveTab,
+} from './utils/sessionStorageAuth';
 import { estimateCloudStorageUsage } from './utils/storageUsage';
 
 interface ToastNotice {
@@ -165,11 +173,17 @@ function formatCloudErrorMessage(
   const raw = err instanceof Error ? err.message : String(err);
   let parsedErrorText = raw;
   let parsedOp = '';
+  let parsedPath = '';
   if (raw.startsWith('{')) {
     try {
-      const parsed = JSON.parse(raw) as { error?: string; operationType?: string };
+      const parsed = JSON.parse(raw) as {
+        error?: string;
+        operationType?: string;
+        path?: string;
+      };
       if (typeof parsed.error === 'string') parsedErrorText = parsed.error;
       if (typeof parsed.operationType === 'string') parsedOp = parsed.operationType;
+      if (typeof parsed.path === 'string') parsedPath = parsed.path;
     } catch {
       // Keep raw string
     }
@@ -214,7 +228,8 @@ function formatCloudErrorMessage(
     parsedErrorText.includes('permission-denied') ||
     parsedErrorText.includes('Missing or insufficient permissions')
   ) {
-    return `Cloud sync permission denied${parsedOp ? ` during ${parsedOp}` : ''}. Please sign out and sign in again with a verified Google account.`;
+    const pathHint = parsedPath ? ` (${parsedPath})` : '';
+    return `Cloud sync permission denied${parsedOp ? ` during ${parsedOp}` : ''}${pathHint}. Please sign out and sign in again with a verified Google account.`;
   }
   if (parsedErrorText.includes('failed-precondition')) {
     return 'Firestore database index or precondition is missing. Please retry sync in a moment.';
@@ -223,31 +238,89 @@ function formatCloudErrorMessage(
 }
 
 export default function App() {
-  const [tenders, setTenders] = useState<Tender[]>(SEED_TENDERS);
-  const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(SEED_EMD_RECORDS);
-  const [mafTrackers, setMafTrackers] = useState<MafTrackerRecord[]>(SEED_MAF_TRACKERS);
-  const [oemRecords, setOemRecords] = useState<OemRecord[]>(SEED_OEM_DETAILS);
-  const [firmProfile, setFirmProfile] = useState<FirmProfile>(DEFAULT_FIRM_PROFILE);
-  const [adminPin, setAdminPin] = useState<string>('1234');
-  const [darkMode, setDarkMode] = useState<boolean>(false);
-  const [emailSettings, setEmailSettings] = useState<EmailAlertSettings>(
-    DEFAULT_EMAIL_ALERT_SETTINGS,
+  const initialTabBoot = useMemo(() => {
+    const loaded = loadValidPerTabCrmSession();
+    if (loaded.status !== 'valid') {
+      return {
+        valid: null,
+        expiredSession: loaded.status === 'expired' ? loaded.expiredSession : null,
+        secondarySnapshot: null as SecondaryWorkspaceSnapshot | null,
+        byocConfig: null as ByocFirebaseConfig | null,
+      };
+    }
+
+    const { session } = loaded.data;
+    let secondarySnapshot: SecondaryWorkspaceSnapshot | null = null;
+    let initialByoc: ByocFirebaseConfig | null = null;
+    if (session.role === 'secondary') {
+      secondarySnapshot =
+        loadSecondaryWorkspaceSnapshot(session.userId) ?? buildEmptySecondaryWorkspace(session);
+      initialByoc =
+        (session.byocConfig && validateByocFirebaseConfig(session.byocConfig).valid
+          ? session.byocConfig
+          : null) || loadByocConfig(session.userId);
+    }
+    return {
+      valid: loaded.data,
+      expiredSession: null as CrmUserSession | null,
+      secondarySnapshot,
+      byocConfig: initialByoc,
+    };
+  }, []);
+
+  const initialSecSnap = initialTabBoot.secondarySnapshot;
+  const initialSheetCfg = initialSecSnap?.sheetSettings ?? DEFAULT_GOOGLE_SHEET_SETTINGS;
+
+  const [tenders, setTenders] = useState<Tender[]>(
+    initialSecSnap ? initialSecSnap.tenders : SEED_TENDERS,
   );
-  const [emailLogs, setEmailLogs] = useState<EmailAlertLog[]>([]);
+  const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(
+    initialSecSnap ? initialSecSnap.emdRecords : SEED_EMD_RECORDS,
+  );
+  const [mafTrackers, setMafTrackers] = useState<MafTrackerRecord[]>(
+    initialSecSnap ? initialSecSnap.mafTrackers : SEED_MAF_TRACKERS,
+  );
+  const [oemRecords, setOemRecords] = useState<OemRecord[]>(
+    initialSecSnap ? (initialSecSnap.oemRecords ?? []) : SEED_OEM_DETAILS,
+  );
+  const [firmProfile, setFirmProfile] = useState<FirmProfile>(
+    initialSecSnap ? initialSecSnap.firmProfile : DEFAULT_FIRM_PROFILE,
+  );
+  const [adminPin, setAdminPin] = useState<string>(
+    initialSecSnap ? initialSecSnap.preferences.adminPin : '1234',
+  );
+  const [darkMode, setDarkMode] = useState<boolean>(
+    initialSecSnap ? initialSecSnap.preferences.darkMode : false,
+  );
+  const [emailSettings, setEmailSettings] = useState<EmailAlertSettings>(
+    initialSecSnap ? initialSecSnap.emailSettings : DEFAULT_EMAIL_ALERT_SETTINGS,
+  );
+  const [emailLogs, setEmailLogs] = useState<EmailAlertLog[]>(
+    initialSecSnap ? initialSecSnap.emailLogs : [],
+  );
   const [emailGatewayInfo, setEmailGatewayInfo] = useState<{
     automatedConfigured: boolean;
     provider: string;
   }>({ automatedConfigured: false, provider: 'none' });
-  const [sheetSettings, setSheetSettings] = useState<GoogleSheetSettings>(
-    DEFAULT_GOOGLE_SHEET_SETTINGS,
+  const [sheetSettings, setSheetSettings] = useState<GoogleSheetSettings>(initialSheetCfg);
+  const [sheetSyncStatus, setSheetSyncStatus] = useState<SheetSyncStatus>(
+    initialSheetCfg.webhookUrl ? (initialSheetCfg.lastSyncedAt ? 'synced' : 'idle') : 'unconfigured',
   );
-  const [sheetSyncStatus, setSheetSyncStatus] = useState<SheetSyncStatus>('unconfigured');
   const [sheetSyncError, setSheetSyncError] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [currentUser, setCurrentUser] = useState<CrmUserSession | null>(null);
-  const [adminSessionToken, setAdminSessionToken] = useState('');
+  const [activeTab, setActiveTab] = useState<TabKey>(
+    initialTabBoot.valid?.activeTab ?? 'dashboard',
+  );
+  const [isAuthenticated, setIsAuthenticated] = useState(Boolean(initialTabBoot.valid));
+  const [currentUser, setCurrentUser] = useState<CrmUserSession | null>(
+    initialTabBoot.valid?.session ?? null,
+  );
+  const [adminSessionToken, setAdminSessionToken] = useState(
+    initialTabBoot.valid?.adminSessionToken ?? '',
+  );
+  const [sessionLoginAtMs, setSessionLoginAtMs] = useState<number | null>(
+    initialTabBoot.valid?.loginAtMs ?? null,
+  );
   const [secondaryUsers, setSecondaryUsers] = useState<SecondaryUserSummary[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -257,15 +330,29 @@ export default function App() {
   // Firebase Firestore State (Central Admin + Isolated BYOC Secondary)
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [byocConfig, setByocConfig] = useState<ByocFirebaseConfig | null>(null);
+  const [byocConfig, setByocConfig] = useState<ByocFirebaseConfig | null>(
+    initialTabBoot.byocConfig,
+  );
   const [byocConnection, setByocConnection] = useState<ByocConnectionState>({
-    status: 'pending',
-    message: 'Save your personal Firebase config to enable isolated BYOC cloud sync.',
+    status: initialTabBoot.byocConfig ? 'auth_required' : 'pending',
+    message: initialTabBoot.byocConfig
+      ? `BYOC config loaded for "${initialTabBoot.byocConfig.projectId}". Click "Connect Google Account" in Settings if prompted.`
+      : 'Save your personal Firebase config to enable isolated BYOC cloud sync.',
+    ...(initialTabBoot.byocConfig
+      ? {
+          projectId: initialTabBoot.byocConfig.projectId,
+          databaseId: initialTabBoot.byocConfig.firestoreDatabaseId || '(default)',
+        }
+      : {}),
   });
   const [byocContextState, setByocContextState] = useState<ByocCloudContext | null>(null);
   const [byocAuthUser, setByocAuthUser] = useState<User | null>(null);
   const [byocAuthReady, setByocAuthReady] = useState(false);
-  const [disabledNotice, setDisabledNotice] = useState<string | null>(null);
+  const [disabledNotice, setDisabledNotice] = useState<string | null>(
+    initialTabBoot.expiredSession
+      ? 'Your 15-minute CRM session has expired. Please sign in again.'
+      : null,
+  );
   const [togglingSecondaryUserId, setTogglingSecondaryUserId] = useState<string | null>(null);
 
   const [cloudSyncing, setCloudSyncing] = useState(false);
@@ -327,8 +414,33 @@ export default function App() {
   const localWorkspaceClearedRef = useRef<boolean>(false);
   const adminOfflineSnapshotRef = useRef<SecondaryWorkspaceSnapshot | null>(null);
   const adminSupplementalRef = useRef<CloudWorkspaceDataset>(createEmptyCloudDataset());
-  const activeRoleRef = useRef<'admin' | 'secondary' | null>(null);
-  const activeCrmUserIdRef = useRef<string | null>(null);
+  const activeRoleRef = useRef<'admin' | 'secondary' | null>(
+    initialTabBoot.valid?.session.role ?? null,
+  );
+  const activeCrmUserIdRef = useRef<string | null>(
+    initialTabBoot.valid?.session.userId ?? null,
+  );
+  const activeCloudSyncCountRef = useRef<number>(0);
+  const cloudWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  const beginCloudSync = () => {
+    activeCloudSyncCountRef.current += 1;
+    setCloudSyncing(true);
+  };
+
+  const endCloudSync = () => {
+    activeCloudSyncCountRef.current = Math.max(0, activeCloudSyncCountRef.current - 1);
+    setCloudSyncing(activeCloudSyncCountRef.current > 0);
+  };
+
+  const enqueueCloudOperation = <T,>(operation: () => Promise<T>): Promise<T> => {
+    const next = cloudWriteQueueRef.current.then(operation, operation);
+    cloudWriteQueueRef.current = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
 
   const stateRef = useRef({
     tenders,
@@ -413,16 +525,84 @@ export default function App() {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
-  // Require fresh login if browser restores page from bfcache (tab reopen/back-forward cache)
+  // Notify backend once if a restored tab session already passed its 15-minute ceiling
   useEffect(() => {
-    const handlePageShow = (event: PageTransitionEvent) => {
-      if (event.persisted) {
-        setIsAuthenticated(false);
+    if (!initialTabBoot.expiredSession) return;
+    void fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: initialTabBoot.expiredSession.userId,
+        identifier: initialTabBoot.expiredSession.username,
+      }),
+    }).catch(() => {});
+  }, [initialTabBoot.expiredSession]);
+
+  // Persist active tab across page refreshes within the same tab without extending loginAtMs
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    updatePerTabActiveTab(activeTab);
+  }, [isAuthenticated, activeTab]);
+
+  // Validate per-tab session when browser restores from bfcache or reloads
+  useEffect(() => {
+    const handlePageShow = () => {
+      const check = loadValidPerTabCrmSession();
+      if (check.status !== 'valid') {
+        if (stateRef.current.currentUser) {
+          handleLogout(
+            check.status === 'expired'
+              ? 'Your 15-minute CRM session has expired. Please sign in again.'
+              : undefined,
+          );
+        } else {
+          setIsAuthenticated(false);
+          setSessionLoginAtMs(null);
+        }
       }
     };
     window.addEventListener('pageshow', handlePageShow);
     return () => window.removeEventListener('pageshow', handlePageShow);
   }, []);
+
+  // Enforce strict 15-minute max session duration from initial login timestamp
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser || sessionLoginAtMs === null) return;
+
+    const enforceTimeout = () => {
+      if (isCrmSessionExpired(sessionLoginAtMs, Date.now())) {
+        handleLogout('Your 15-minute CRM session has expired. Please sign in again.');
+        return true;
+      }
+      return false;
+    };
+
+    if (enforceTimeout()) return;
+
+    const remainingMs = getRemainingCrmSessionMs(sessionLoginAtMs, Date.now());
+    const exactTimer = window.setTimeout(() => {
+      enforceTimeout();
+    }, remainingMs + 50);
+
+    const pollTimer = window.setInterval(() => {
+      enforceTimeout();
+    }, 5_000);
+
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        enforceTimeout();
+      }
+    };
+
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+    return () => {
+      window.clearTimeout(exactTimer);
+      window.clearInterval(pollTimer);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, [isAuthenticated, currentUser?.userId, sessionLoginAtMs]);
 
   const showToast = (type: 'ok' | 'err', msg: string) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -585,67 +765,72 @@ export default function App() {
       }
 
       localWorkspaceClearedRef.current = false;
-      setCloudSyncing(true);
+      let didBeginSync = false;
+      beginCloudSync();
+      didBeginSync = true;
       try {
-        await ensureUserRootDocument(activeCloudUser, activeTenantId, currentUser, targetRef);
-        if (cancelled) return;
-
-        let cloud: CloudWorkspaceDataset;
-        if (currentUser.role === 'admin') {
-          const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(activeCloudUser);
+        await enqueueCloudOperation(async () => {
+          await ensureUserRootDocument(activeCloudUser, activeTenantId, currentUser, targetRef);
           if (cancelled) return;
-          adminSupplementalRef.current = adminWorkspace.supplemental;
-          cloud = adminWorkspace.merged;
-        } else {
-          adminSupplementalRef.current = createEmptyCloudDataset();
-          cloud = await fetchAllFromCloud(cloudUid, activeTenantId, targetRef);
-          if (cancelled) return;
-        }
 
-        attachmentFilesRef.current = cloud.attachmentFiles;
-
-        const cloudIsEmpty =
-          !cloud.profile &&
-          !cloud.preferences &&
-          cloud.tenders.length === 0 &&
-          cloud.emdRecords.length === 0 &&
-          cloud.mafTrackers.length === 0 &&
-          cloud.oemRecords.length === 0;
-
-        if (cloudIsEmpty) {
-          const {
-            firmProfile: curProfile,
-            tenders: curTenders,
-            emdRecords: curEmd,
-            mafTrackers: curMaf,
-            oemRecords: curOems,
-            adminPin: curPin,
-            darkMode: curDark,
-            emailSettings: curEmailSettings,
-            sheetSettings: curSheetSettings,
-          } = stateRef.current;
-          const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
-          await backupAllToCloud(
-            activeCloudUser,
-            curProfile,
-            prefs,
-            curTenders,
-            curEmd,
-            curMaf,
-            activeTenantId,
-            targetRef,
-            curOems,
-          );
-          await syncEmailConfigToCloud(activeCloudUser, curEmailSettings, activeTenantId, targetRef);
-          await syncSheetConfigToCloud(activeCloudUser, curSheetSettings, activeTenantId, targetRef);
-          if (!cancelled) {
-            markSyncedNow();
-            setCloudFeedback({
-              type: 'ok',
-              msg: `Connected as ${activeCloudUser.email} on "${targetRef.projectId}". All data is stored in your isolated Firebase workspace.`,
-            });
+          let cloud: CloudWorkspaceDataset;
+          if (currentUser.role === 'admin') {
+            const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(activeCloudUser);
+            if (cancelled) return;
+            adminSupplementalRef.current = adminWorkspace.supplemental;
+            cloud = adminWorkspace.merged;
+          } else {
+            adminSupplementalRef.current = createEmptyCloudDataset();
+            cloud = await fetchAllFromCloud(cloudUid, activeTenantId, targetRef);
+            if (cancelled) return;
           }
-        } else {
+
+          attachmentFilesRef.current = cloud.attachmentFiles;
+
+          const cloudIsEmpty =
+            !cloud.profile &&
+            !cloud.preferences &&
+            cloud.tenders.length === 0 &&
+            cloud.emdRecords.length === 0 &&
+            cloud.mafTrackers.length === 0 &&
+            cloud.oemRecords.length === 0;
+
+          if (cloudIsEmpty) {
+            const {
+              firmProfile: curProfile,
+              tenders: curTenders,
+              emdRecords: curEmd,
+              mafTrackers: curMaf,
+              oemRecords: curOems,
+              adminPin: curPin,
+              darkMode: curDark,
+              emailSettings: curEmailSettings,
+              sheetSettings: curSheetSettings,
+            } = stateRef.current;
+            const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
+            await backupAllToCloud(
+              activeCloudUser,
+              curProfile,
+              prefs,
+              curTenders,
+              curEmd,
+              curMaf,
+              activeTenantId,
+              targetRef,
+              curOems,
+            );
+            await syncEmailConfigToCloud(activeCloudUser, curEmailSettings, activeTenantId, targetRef);
+            await syncSheetConfigToCloud(activeCloudUser, curSheetSettings, activeTenantId, targetRef);
+            if (!cancelled) {
+              markSyncedNow();
+              setCloudFeedback({
+                type: 'ok',
+                msg: `Connected as ${activeCloudUser.email} on "${targetRef.projectId}". All data is stored in your isolated Firebase workspace.`,
+              });
+            }
+            return;
+          }
+
           if (cloud.profile) {
             setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
           }
@@ -685,7 +870,8 @@ export default function App() {
           }
           markSyncedNow();
           setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
-        }
+        });
+        if (cancelled) return;
 
         if (cancelled) return;
 
@@ -791,8 +977,8 @@ export default function App() {
           });
         }
       } finally {
-        if (!cancelled) {
-          setCloudSyncing(false);
+        if (didBeginSync) {
+          endCloudSync();
         }
       }
     };
@@ -821,9 +1007,13 @@ export default function App() {
     const user = stateRef.current.activeCloudUser;
     const target = stateRef.current.activeCloudTarget;
     if (!user || !target) return;
-    setCloudSyncing(true);
+    beginCloudSync();
     try {
-      await task(user, target);
+      await enqueueCloudOperation(async () => {
+        const latestUser = stateRef.current.activeCloudUser || user;
+        const latestTarget = stateRef.current.activeCloudTarget || target;
+        await task(latestUser, latestTarget);
+      });
       markSyncedNow();
       if (successMessage) {
         setCloudFeedback({ type: 'ok', msg: successMessage });
@@ -836,7 +1026,7 @@ export default function App() {
         msg: formatCloudErrorMessage(err, target.projectId, target.databaseId),
       });
     } finally {
-      setCloudSyncing(false);
+      endCloudSync();
     }
   };
 
@@ -854,7 +1044,7 @@ export default function App() {
         });
         return;
       }
-      setCloudSyncing(true);
+      beginCloudSync();
       try {
         const { ctx } = await signInWithByocGoogle(session.userId, check.normalized);
         setByocContextState(ctx);
@@ -874,23 +1064,23 @@ export default function App() {
           ),
         });
       } finally {
-        setCloudSyncing(false);
+        endCloudSync();
       }
       return;
     }
 
-    setCloudSyncing(true);
+    beginCloudSync();
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
       setCloudFeedback({ type: 'err', msg: formatCloudErrorMessage(err) });
     } finally {
-      setCloudSyncing(false);
+      endCloudSync();
     }
   };
 
   const handleDisconnectCloud = async () => {
-    setCloudSyncing(true);
+    beginCloudSync();
     const session = stateRef.current.currentUser;
     const target = stateRef.current.activeCloudTarget;
     try {
@@ -910,7 +1100,7 @@ export default function App() {
         msg: formatCloudErrorMessage(err, target?.projectId, target?.databaseId),
       });
     } finally {
-      setCloudSyncing(false);
+      endCloudSync();
     }
   };
 
@@ -1448,7 +1638,9 @@ export default function App() {
 
     setEmailLogs((prev) => mergeEmailLogs([logEntry], prev));
     if (curUser && curTarget) {
-      void syncEmailAlertLogToCloud(curUser, logEntry, tenantId, curTarget).catch(() => {
+      void enqueueCloudOperation(() =>
+        syncEmailAlertLogToCloud(curUser, logEntry, tenantId, curTarget),
+      ).catch(() => {
         // Handled cleanly via subsequent cloud sync
       });
     }
@@ -1847,11 +2039,10 @@ export default function App() {
 
       if (stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
         const activeTenant = stateRef.current.workspaceTenantId;
-        void syncSheetConfigToCloud(
-          stateRef.current.activeCloudUser,
-          updatedCfg,
-          activeTenant,
-          stateRef.current.activeCloudTarget,
+        const latestUser = stateRef.current.activeCloudUser;
+        const latestTarget = stateRef.current.activeCloudTarget;
+        void enqueueCloudOperation(() =>
+          syncSheetConfigToCloud(latestUser, updatedCfg, activeTenant, latestTarget),
         ).catch(() => {
           // Non-fatal: already updated in-memory
         });
@@ -2168,9 +2359,13 @@ export default function App() {
     const curUser = stateRef.current.activeCloudUser;
     const curTarget = stateRef.current.activeCloudTarget;
     if (!curUser || !curTarget) return;
-    setCloudSyncing(true);
+    beginCloudSync();
     try {
-      await cloudOp(curUser, curTarget);
+      await enqueueCloudOperation(() => {
+        const latestUser = stateRef.current.activeCloudUser || curUser;
+        const latestTarget = stateRef.current.activeCloudTarget || curTarget;
+        return cloudOp(latestUser, latestTarget);
+      });
       markSyncedNow();
       setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
     } catch (err) {
@@ -2179,7 +2374,7 @@ export default function App() {
       showToast('err', formatted);
       setCloudFeedback({ type: 'err', msg: formatted });
     } finally {
-      setCloudSyncing(false);
+      endCloudSync();
     }
   };
 
@@ -2663,8 +2858,19 @@ export default function App() {
       setAdminSessionToken(serverMeta?.adminSessionToken || '');
     }
 
+    const resolvedAdminToken =
+      session.role === 'admin' ? serverMeta?.adminSessionToken || '' : '';
+    const loginAtMs = Date.now();
+    savePerTabCrmSession({
+      session,
+      adminSessionToken: resolvedAdminToken,
+      loginAtMs,
+      activeTab: 'dashboard',
+    });
+
     activeRoleRef.current = session.role;
     activeCrmUserIdRef.current = session.userId;
+    setSessionLoginAtMs(loginAtMs);
     setCurrentUser(session);
     setIsAuthenticated(true);
     window.scrollTo({ top: 0, left: 0 });
@@ -2672,6 +2878,7 @@ export default function App() {
 
   const handleLogout = (forceDisabledMessage?: string) => {
     const exitingSession = stateRef.current.currentUser;
+    clearPerTabCrmSession();
     if (exitingSession) {
       void fetch('/api/auth/logout', {
         method: 'POST',
@@ -2694,6 +2901,12 @@ export default function App() {
     emailRetryStateRef.current.clear();
     mafExtractionSignatureRef.current.clear();
     mafExtractionInFlightRef.current.clear();
+    activeRoleRef.current = null;
+    activeCrmUserIdRef.current = null;
+    activeCloudSyncCountRef.current = 0;
+    setCloudSyncing(false);
+    setSessionLoginAtMs(null);
+    setCurrentUser(null);
     setByocConfig(null);
     setByocContextState(null);
     setByocAuthUser(null);

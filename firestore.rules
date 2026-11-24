@@ -868,13 +868,14 @@ service cloud.firestore {
       allow update: if isVerifiedUser() &&
         isValidId(userId) &&
         isValidUserAccount(incoming(), userId) &&
-        (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-        (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+        (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+        (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
         incoming().updatedAt == request.time &&
         (
           (
             isOwner(userId) &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['ownerUid', 'email', 'createdAt', 'updatedAt'])
+            incoming().diff(existing()).addedKeys().hasOnly(['ownerUid', 'email', 'createdAt', 'updatedAt']) &&
+            incoming().diff(existing()).changedKeys().hasOnly(['ownerUid', 'email', 'createdAt', 'updatedAt'])
           ) ||
           isAdmin()
         );
@@ -907,13 +908,23 @@ service cloud.firestore {
           isValidId(profileId) &&
           profileId == 'firm' &&
           isValidFirmProfile(incoming(), userId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'firmName',
+                'gstin',
+                'udyamNumber',
+                'adminName',
+                'adminPhotoUrl',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
                 'ownerUid',
                 'firmName',
                 'gstin',
@@ -961,15 +972,24 @@ service cloud.firestore {
           isValidId(settingId) &&
           settingId == 'preferences' &&
           isValidUserPreferences(incoming(), userId) &&
-          incoming().ownerUid == existing().ownerUid &&
-          incoming().createdAt == existing().createdAt &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
                 'adminPin',
                 'darkMode',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
+                'ownerUid',
+                'adminPin',
+                'darkMode',
+                'createdAt',
                 'updatedAt'
               ])
             ) ||
@@ -1008,18 +1028,31 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(attachmentId) &&
           isValidAttachmentFile(incoming(), userId, attachmentId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('id' in existing()) || incoming().id == existing().id) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('id' in existing()) || !(existing().id is string) || existing().id != attachmentId || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'id',
                 'fileName',
                 'fileType',
                 'fileSize',
                 'dataUrl',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'fileName',
+                'fileType',
+                'fileSize',
+                'dataUrl',
+                'createdAt',
                 'updatedAt'
               ])
             ) ||
@@ -1058,65 +1091,98 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(tenderDocId) &&
           isValidTender(incoming(), userId, tenderDocId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('id' in existing()) || incoming().id == existing().id) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('id' in existing()) || !(existing().id is string) || existing().id != tenderDocId || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              !isTerminalTenderStage(existing().stage) &&
-              (
-                incoming().diff(existing()).affectedKeys().hasOnly([
-                  'checklist',
-                  'remarks',
-                  'attachments',
-                  'clientUpdatedAt',
-                  'updatedAt'
-                ]) ||
-                incoming().diff(existing()).affectedKeys().hasOnly([
-                  'ownerUid',
-                  'id',
-                  'tenderId',
-                  'portal',
-                  'clientName',
-                  'department',
-                  'locationDepartment',
-                  'location',
-                  'category',
-                  'title',
-                  'publishDate',
-                  'submissionDueDate',
-                  'preBidDate',
-                  'technicalOpeningDate',
-                  'financialOpeningDate',
-                  'estimatedValue',
-                  'quotedValue',
-                  'l1BidderName',
-                  'l1QuotedValue',
-                  'ourPositionRank',
-                  'assignedOwner',
-                  'emdStatus',
-                  'emdAmount',
-                  'stage',
-                  'resultInfo',
-                  'completionDate',
-                  'technicalStatus',
-                  'technicalOpeningDateTime',
-                  'technicalRemarks',
-                  'financialRaStatus',
-                  'financialOpeningRaDateTime',
-                  'raFinalValue',
-                  'raFinancialRemarks',
-                  'checklist',
-                  'remarks',
-                  'attachments',
-                  'clientCreatedAt',
-                  'clientUpdatedAt',
-                  'createdAt',
-                  'updatedAt'
-                ])
-              )
+              (!('stage' in existing()) || !(existing().stage is string) || !isTerminalTenderStage(existing().stage)) &&
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'tenderId',
+                'portal',
+                'clientName',
+                'department',
+                'locationDepartment',
+                'location',
+                'category',
+                'title',
+                'publishDate',
+                'submissionDueDate',
+                'preBidDate',
+                'technicalOpeningDate',
+                'financialOpeningDate',
+                'estimatedValue',
+                'quotedValue',
+                'l1BidderName',
+                'l1QuotedValue',
+                'ourPositionRank',
+                'assignedOwner',
+                'emdStatus',
+                'emdAmount',
+                'stage',
+                'resultInfo',
+                'completionDate',
+                'technicalStatus',
+                'technicalOpeningDateTime',
+                'technicalRemarks',
+                'financialRaStatus',
+                'financialOpeningRaDateTime',
+                'raFinalValue',
+                'raFinancialRemarks',
+                'checklist',
+                'remarks',
+                'attachments',
+                'clientCreatedAt',
+                'clientUpdatedAt',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'tenderId',
+                'portal',
+                'clientName',
+                'department',
+                'locationDepartment',
+                'location',
+                'category',
+                'title',
+                'publishDate',
+                'submissionDueDate',
+                'preBidDate',
+                'technicalOpeningDate',
+                'financialOpeningDate',
+                'estimatedValue',
+                'quotedValue',
+                'l1BidderName',
+                'l1QuotedValue',
+                'ourPositionRank',
+                'assignedOwner',
+                'emdStatus',
+                'emdAmount',
+                'stage',
+                'resultInfo',
+                'completionDate',
+                'technicalStatus',
+                'technicalOpeningDateTime',
+                'technicalRemarks',
+                'financialRaStatus',
+                'financialOpeningRaDateTime',
+                'raFinalValue',
+                'raFinancialRemarks',
+                'checklist',
+                'remarks',
+                'attachments',
+                'clientCreatedAt',
+                'clientUpdatedAt',
+                'createdAt',
+                'updatedAt'
+              ])
             ) ||
             isAdmin()
           ) &&
@@ -1153,44 +1219,56 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(emdDocId) &&
           isValidEmdRecord(incoming(), userId, emdDocId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('id' in existing()) || incoming().id == existing().id) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('id' in existing()) || !(existing().id is string) || existing().id != emdDocId || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              !isTerminalFinancialStatus(existing().status) &&
-              (
-                incoming().diff(existing()).affectedKeys().hasOnly([
-                  'status',
-                  'refundDate',
-                  'refundRef',
-                  'remarks',
-                  'updatedAt'
-                ]) ||
-                incoming().diff(existing()).affectedKeys().hasOnly([
-                  'ownerUid',
-                  'id',
-                  'tenderRefId',
-                  'tenderId',
-                  'department',
-                  'instrumentType',
-                  'referenceNo',
-                  'bankName',
-                  'amount',
-                  'issueDate',
-                  'expiryDate',
-                  'claimEndDate',
-                  'status',
-                  'refundDate',
-                  'refundRef',
-                  'remarks',
-                  'attachments',
-                  'createdAt',
-                  'updatedAt'
-                ])
-              )
+              (!('status' in existing()) || !(existing().status is string) || !isTerminalFinancialStatus(existing().status)) &&
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'tenderRefId',
+                'tenderId',
+                'department',
+                'instrumentType',
+                'referenceNo',
+                'bankName',
+                'amount',
+                'issueDate',
+                'expiryDate',
+                'claimEndDate',
+                'status',
+                'refundDate',
+                'refundRef',
+                'remarks',
+                'attachments',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'tenderRefId',
+                'tenderId',
+                'department',
+                'instrumentType',
+                'referenceNo',
+                'bankName',
+                'amount',
+                'issueDate',
+                'expiryDate',
+                'claimEndDate',
+                'status',
+                'refundDate',
+                'refundRef',
+                'remarks',
+                'attachments',
+                'createdAt',
+                'updatedAt'
+              ])
             ) ||
             isAdmin()
           ) &&
@@ -1233,14 +1311,28 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(mafDocId) &&
           isValidMafTracker(incoming(), userId, mafDocId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('id' in existing()) || incoming().id == existing().id) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('id' in existing()) || !(existing().id is string) || existing().id != mafDocId || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'tenderRefId',
+                'tenderId',
+                'tenderTitle',
+                'department',
+                'tenderDueDate',
+                'itemsMAF',
+                'clientCreatedAt',
+                'clientUpdatedAt',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
                 'ownerUid',
                 'id',
                 'tenderRefId',
@@ -1290,14 +1382,28 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(oemDocId) &&
           isValidOemRecord(incoming(), userId, oemDocId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('id' in existing()) || incoming().id == existing().id) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('id' in existing()) || !(existing().id is string) || existing().id != oemDocId || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'oemName',
+                'companyName',
+                'concernedPersonName',
+                'email',
+                'phone',
+                'remarks',
+                'clientCreatedAt',
+                'clientUpdatedAt',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
                 'ownerUid',
                 'id',
                 'oemName',
@@ -1349,13 +1455,21 @@ service cloud.firestore {
           isValidId(configId) &&
           configId == 'default' &&
           isValidEmailConfig(incoming(), userId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'enabled',
+                'recipientName',
+                'recipientEmail',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
                 'ownerUid',
                 'enabled',
                 'recipientName',
@@ -1399,16 +1513,47 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(alertId) &&
           isValidEmailAlertLog(incoming(), userId, alertId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('id' in existing()) || incoming().id == existing().id) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('id' in existing()) || !(existing().id is string) || existing().id != alertId || incoming().id == existing().id) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'slotKey',
+                'tenderRefId',
+                'tenderId',
+                'slot',
+                'recipientName',
+                'recipientEmail',
+                'dueDateIso',
                 'status',
                 'provider',
+                'subject',
+                'message',
+                'clientCreatedAt',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
+                'ownerUid',
+                'id',
+                'slotKey',
+                'tenderRefId',
+                'tenderId',
+                'slot',
+                'recipientName',
+                'recipientEmail',
+                'dueDateIso',
+                'status',
+                'provider',
+                'subject',
+                'message',
+                'clientCreatedAt',
+                'createdAt',
                 'updatedAt'
               ])
             ) ||
@@ -1449,13 +1594,22 @@ service cloud.firestore {
           isValidId(configId) &&
           configId == 'default' &&
           isValidSheetConfig(incoming(), userId) &&
-          (!('ownerUid' in existing()) || incoming().ownerUid == existing().ownerUid) &&
-          (!('createdAt' in existing()) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly([
+              incoming().diff(existing()).addedKeys().hasOnly([
+                'ownerUid',
+                'enabled',
+                'webhookUrl',
+                'sheetName',
+                'lastSyncedAt',
+                'createdAt',
+                'updatedAt'
+              ]) &&
+              incoming().diff(existing()).changedKeys().hasOnly([
                 'ownerUid',
                 'enabled',
                 'webhookUrl',
@@ -1496,14 +1650,15 @@ service cloud.firestore {
           isValidId(userId) &&
           isValidId(tenantId) &&
           isValidWorkspaceRoot(incoming(), userId, tenantId) &&
-          incoming().ownerUid == existing().ownerUid &&
-          incoming().tenantId == existing().tenantId &&
-          incoming().createdAt == existing().createdAt &&
+          (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+          (!('tenantId' in existing()) || !(existing().tenantId is string) || existing().tenantId != tenantId || incoming().tenantId == existing().tenantId) &&
+          (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
           incoming().updatedAt == request.time &&
           (
             (
               isOwner(userId) &&
-              incoming().diff(existing()).affectedKeys().hasOnly(['username', 'email', 'updatedAt'])
+              incoming().diff(existing()).addedKeys().hasOnly(['ownerUid', 'tenantId', 'username', 'email', 'createdAt', 'updatedAt']) &&
+              incoming().diff(existing()).changedKeys().hasOnly(['ownerUid', 'tenantId', 'username', 'email', 'createdAt', 'updatedAt'])
             ) ||
             isAdmin()
           ) &&
@@ -1540,18 +1695,30 @@ service cloud.firestore {
             isValidId(profileId) &&
             profileId == 'firm' &&
             isValidFirmProfile(incoming(), userId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
                   'firmName',
                   'gstin',
                   'udyamNumber',
                   'adminName',
                   'adminPhotoUrl',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'firmName',
+                  'gstin',
+                  'udyamNumber',
+                  'adminName',
+                  'adminPhotoUrl',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1592,15 +1759,24 @@ service cloud.firestore {
             isValidId(settingId) &&
             settingId == 'preferences' &&
             isValidUserPreferences(incoming(), userId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
                   'adminPin',
                   'darkMode',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'adminPin',
+                  'darkMode',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1639,18 +1815,31 @@ service cloud.firestore {
             isValidId(tenantId) &&
             isValidId(attachmentId) &&
             isValidAttachmentFile(incoming(), userId, attachmentId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().id == existing().id &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('id' in existing()) || !(existing().id is string) || existing().id != attachmentId || incoming().id == existing().id) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'fileName',
                   'fileType',
                   'fileSize',
                   'dataUrl',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'fileName',
+                  'fileType',
+                  'fileSize',
+                  'dataUrl',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1689,15 +1878,17 @@ service cloud.firestore {
             isValidId(tenantId) &&
             isValidId(tenderDocId) &&
             isValidTender(incoming(), userId, tenderDocId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().id == existing().id &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('id' in existing()) || !(existing().id is string) || existing().id != tenderDocId || incoming().id == existing().id) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                !isTerminalTenderStage(existing().stage) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                (!('stage' in existing()) || !(existing().stage is string) || !isTerminalTenderStage(existing().stage)) &&
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'tenderId',
                   'portal',
                   'clientName',
@@ -1732,7 +1923,51 @@ service cloud.firestore {
                   'checklist',
                   'remarks',
                   'attachments',
+                  'clientCreatedAt',
                   'clientUpdatedAt',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'tenderId',
+                  'portal',
+                  'clientName',
+                  'department',
+                  'locationDepartment',
+                  'location',
+                  'category',
+                  'title',
+                  'publishDate',
+                  'submissionDueDate',
+                  'preBidDate',
+                  'technicalOpeningDate',
+                  'financialOpeningDate',
+                  'estimatedValue',
+                  'quotedValue',
+                  'l1BidderName',
+                  'l1QuotedValue',
+                  'ourPositionRank',
+                  'assignedOwner',
+                  'emdStatus',
+                  'emdAmount',
+                  'stage',
+                  'resultInfo',
+                  'completionDate',
+                  'technicalStatus',
+                  'technicalOpeningDateTime',
+                  'technicalRemarks',
+                  'financialRaStatus',
+                  'financialOpeningRaDateTime',
+                  'raFinalValue',
+                  'raFinancialRemarks',
+                  'checklist',
+                  'remarks',
+                  'attachments',
+                  'clientCreatedAt',
+                  'clientUpdatedAt',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1771,15 +2006,17 @@ service cloud.firestore {
             isValidId(tenantId) &&
             isValidId(emdDocId) &&
             isValidEmdRecord(incoming(), userId, emdDocId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().id == existing().id &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('id' in existing()) || !(existing().id is string) || existing().id != emdDocId || incoming().id == existing().id) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                !isTerminalFinancialStatus(existing().status) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                (!('status' in existing()) || !(existing().status is string) || !isTerminalFinancialStatus(existing().status)) &&
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'tenderRefId',
                   'tenderId',
                   'department',
@@ -1795,6 +2032,28 @@ service cloud.firestore {
                   'refundRef',
                   'remarks',
                   'attachments',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'tenderRefId',
+                  'tenderId',
+                  'department',
+                  'instrumentType',
+                  'referenceNo',
+                  'bankName',
+                  'amount',
+                  'issueDate',
+                  'expiryDate',
+                  'claimEndDate',
+                  'status',
+                  'refundDate',
+                  'refundRef',
+                  'remarks',
+                  'attachments',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1833,21 +2092,39 @@ service cloud.firestore {
             isValidId(tenantId) &&
             isValidId(mafDocId) &&
             isValidMafTracker(incoming(), userId, mafDocId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().id == existing().id &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('id' in existing()) || !(existing().id is string) || existing().id != mafDocId || incoming().id == existing().id) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'tenderRefId',
                   'tenderId',
                   'tenderTitle',
                   'department',
                   'tenderDueDate',
                   'itemsMAF',
+                  'clientCreatedAt',
                   'clientUpdatedAt',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'tenderRefId',
+                  'tenderId',
+                  'tenderTitle',
+                  'department',
+                  'tenderDueDate',
+                  'itemsMAF',
+                  'clientCreatedAt',
+                  'clientUpdatedAt',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1886,21 +2163,39 @@ service cloud.firestore {
             isValidId(tenantId) &&
             isValidId(oemDocId) &&
             isValidOemRecord(incoming(), userId, oemDocId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().id == existing().id &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('id' in existing()) || !(existing().id is string) || existing().id != oemDocId || incoming().id == existing().id) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
                   'oemName',
                   'companyName',
                   'concernedPersonName',
                   'email',
                   'phone',
                   'remarks',
+                  'clientCreatedAt',
                   'clientUpdatedAt',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'oemName',
+                  'companyName',
+                  'concernedPersonName',
+                  'email',
+                  'phone',
+                  'remarks',
+                  'clientCreatedAt',
+                  'clientUpdatedAt',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1941,16 +2236,26 @@ service cloud.firestore {
             isValidId(configId) &&
             configId == 'default' &&
             isValidEmailConfig(incoming(), userId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
                   'enabled',
                   'recipientName',
                   'recipientEmail',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'enabled',
+                  'recipientName',
+                  'recipientEmail',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -1989,16 +2294,47 @@ service cloud.firestore {
             isValidId(tenantId) &&
             isValidId(alertId) &&
             isValidEmailAlertLog(incoming(), userId, alertId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().id == existing().id &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('id' in existing()) || !(existing().id is string) || existing().id != alertId || incoming().id == existing().id) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'slotKey',
+                  'tenderRefId',
+                  'tenderId',
+                  'slot',
+                  'recipientName',
+                  'recipientEmail',
+                  'dueDateIso',
                   'status',
                   'provider',
+                  'subject',
+                  'message',
+                  'clientCreatedAt',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'id',
+                  'slotKey',
+                  'tenderRefId',
+                  'tenderId',
+                  'slot',
+                  'recipientName',
+                  'recipientEmail',
+                  'dueDateIso',
+                  'status',
+                  'provider',
+                  'subject',
+                  'message',
+                  'clientCreatedAt',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -2039,17 +2375,28 @@ service cloud.firestore {
             isValidId(configId) &&
             configId == 'default' &&
             isValidSheetConfig(incoming(), userId) &&
-            incoming().ownerUid == existing().ownerUid &&
-            incoming().createdAt == existing().createdAt &&
+            (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+            (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
             incoming().updatedAt == request.time &&
             (
               (
                 isOwner(userId) &&
-                incoming().diff(existing()).affectedKeys().hasOnly([
+                incoming().diff(existing()).addedKeys().hasOnly([
+                  'ownerUid',
                   'enabled',
                   'webhookUrl',
                   'sheetName',
                   'lastSyncedAt',
+                  'createdAt',
+                  'updatedAt'
+                ]) &&
+                incoming().diff(existing()).changedKeys().hasOnly([
+                  'ownerUid',
+                  'enabled',
+                  'webhookUrl',
+                  'sheetName',
+                  'lastSyncedAt',
+                  'createdAt',
                   'updatedAt'
                 ])
               ) ||
@@ -2081,14 +2428,14 @@ service cloud.firestore {
       allow update: if isVerifiedUser() &&
         isValidId(secondaryUserId) &&
         isValidSecondaryUserRecord(incoming(), secondaryUserId) &&
-        incoming().ownerUid == existing().ownerUid &&
-        incoming().userId == existing().userId &&
-        incoming().createdAt == existing().createdAt &&
+        (!('ownerUid' in existing()) || !(existing().ownerUid is string) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin()) &&
+        (!('userId' in existing()) || !(existing().userId is string) || existing().userId != secondaryUserId || incoming().userId == existing().userId) &&
+        (!('createdAt' in existing()) || !(existing().createdAt is timestamp) ? incoming().createdAt == request.time : incoming().createdAt == existing().createdAt) &&
         incoming().updatedAt == request.time &&
         (
           (
             existing().ownerUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
+            incoming().diff(existing()).addedKeys().hasOnly([
               'username',
               'email',
               'isActive',
@@ -2097,6 +2444,19 @@ service cloud.firestore {
               'lastLogoutAt',
               'byocProjectId',
               'clientLastLoginAt',
+              'createdAt',
+              'updatedAt'
+            ]) &&
+            incoming().diff(existing()).changedKeys().hasOnly([
+              'username',
+              'email',
+              'isActive',
+              'presenceStatus',
+              'lastHeartbeatAt',
+              'lastLogoutAt',
+              'byocProjectId',
+              'clientLastLoginAt',
+              'createdAt',
               'updatedAt'
             ])
           ) ||

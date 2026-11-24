@@ -1289,15 +1289,15 @@ export function SettingsTab({
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-500 dark:text-slate-400">Tab Close / Reopen Policy</span>
+              <span className="text-slate-500 dark:text-slate-400">Session Timeout &amp; Tab Policy</span>
               <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-                Login Required Every Session
+                15 Min Limit · Tab Close Logout
               </span>
             </div>
             <p className="text-slate-600 dark:text-slate-400 leading-relaxed pt-1">
               {currentUser?.role === 'secondary'
-                ? 'Your secondary CRM workspace is completely isolated from the Primary Admin tenders, files, emails, and Google Sheet.'
-                : 'Session access is kept strictly in memory (zero browser storage). Closing the CRM tab or clicking Log Out immediately requires signing in again on the login screen.'}
+                ? 'Your secondary CRM workspace is isolated from Primary Admin data. Page refreshes stay signed in for up to 15 minutes, while closing the tab or exceeding 15 minutes logs out automatically.'
+                : 'Page refreshes stay signed in within the current tab for up to 15 minutes. After 15 minutes of login time, closing the tab, or clicking Log Out, you will be signed out automatically.'}
             </p>
           </div>
         </div>

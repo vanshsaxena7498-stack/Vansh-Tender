@@ -797,6 +797,111 @@ test('OemDetail Firestore rules enforce ownership, required oemName, length boun
   assert.equal(isValidOemRecord({ ...validOem, createdAt: '2026-11-20T00:00:00Z' }, verifiedUser, 'u2', 'oem-nvs'), false);
 });
 
+test('Firestore update rules allow safe repair of legacy non-Timestamp createdAt, missing ownerUid, and removal of deprecated keys while blocking cross-owner hijacks', () => {
+  const canUpdateLegacyDoc = (params: {
+    userId: string;
+    authUid: string;
+    isAdmin: boolean;
+    existing: Record<string, unknown>;
+    incoming: Record<string, unknown>;
+    allowedWriteKeys: string[];
+  }): boolean => {
+    const { userId, authUid, isAdmin, existing, incoming, allowedWriteKeys } = params;
+    const ownerOk =
+      !('ownerUid' in existing) ||
+      typeof existing.ownerUid !== 'string' ||
+      existing.ownerUid === '' ||
+      incoming.ownerUid === existing.ownerUid ||
+      isAdmin;
+    const existingCreatedAtIsTimestamp = existing.createdAt === SERVER_TIME;
+    const createdAtOk = !('createdAt' in existing) || !existingCreatedAtIsTimestamp
+      ? incoming.createdAt === SERVER_TIME
+      : incoming.createdAt === existing.createdAt;
+    const addedKeys = Object.keys(incoming).filter((k) => !(k in existing));
+    const changedKeys = Object.keys(incoming).filter(
+      (k) => k in existing && incoming[k] !== existing[k],
+    );
+    const diffOk =
+      (authUid === userId &&
+        addedKeys.every((k) => allowedWriteKeys.includes(k)) &&
+        changedKeys.every((k) => allowedWriteKeys.includes(k))) ||
+      isAdmin;
+    return ownerOk && createdAtOk && diffOk;
+  };
+
+  // Legacy tender doc with ISO string createdAt, missing ownerUid, and deprecated keys
+  assert.equal(
+    canUpdateLegacyDoc({
+      userId: 'u2',
+      authUid: 'u2',
+      isAdmin: false,
+      existing: {
+        id: 't1',
+        createdAt: '2026-01-01T00:00:00Z',
+        lastUpdatedAt: '2026-02-01T00:00:00Z',
+        tenderNo: 'LEGACY-1',
+        title: 'Old Title',
+      },
+      incoming: {
+        ownerUid: 'u2',
+        id: 't1',
+        title: 'Clean Title',
+        createdAt: SERVER_TIME,
+        updatedAt: SERVER_TIME,
+      },
+      allowedWriteKeys: ['ownerUid', 'id', 'title', 'createdAt', 'updatedAt'],
+    }),
+    true,
+  );
+
+  // Valid Timestamp createdAt must remain immutable on subsequent updates
+  assert.equal(
+    canUpdateLegacyDoc({
+      userId: 'u2',
+      authUid: 'u2',
+      isAdmin: false,
+      existing: {
+        ownerUid: 'u2',
+        id: 't1',
+        title: 'Old Title',
+        createdAt: SERVER_TIME,
+      },
+      incoming: {
+        ownerUid: 'u2',
+        id: 't1',
+        title: 'Clean Title',
+        createdAt: 'forged',
+        updatedAt: SERVER_TIME,
+      },
+      allowedWriteKeys: ['ownerUid', 'id', 'title', 'createdAt', 'updatedAt'],
+    }),
+    false,
+  );
+
+  // Non-admin still cannot overwrite a document owned by another UID
+  assert.equal(
+    canUpdateLegacyDoc({
+      userId: 'u2',
+      authUid: 'u2',
+      isAdmin: false,
+      existing: {
+        ownerUid: 'victimUid',
+        id: 't1',
+        createdAt: SERVER_TIME,
+      },
+      incoming: {
+        ownerUid: 'u2',
+        id: 't1',
+        createdAt: SERVER_TIME,
+        updatedAt: SERVER_TIME,
+      },
+      allowedWriteKeys: ['ownerUid', 'id', 'createdAt', 'updatedAt'],
+    }),
+    false,
+  );
+});
+
+
 
 
 

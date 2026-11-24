@@ -50,15 +50,191 @@ export const CLOUD_LIMITS = {
   MAF_REMARKS_MAX: 500,
 } as const;
 
-function clampStr(val: string | undefined | null, maxLen: number, fallback = ''): string {
+const textEncoder = new TextEncoder();
+
+export function utf8ByteLength(str: string): number {
+  return textEncoder.encode(str).length;
+}
+
+function clampStr(val: string | undefined | null, maxBytes: number, fallback = ''): string {
   const normalized = typeof val === 'string' ? val : fallback;
-  return normalized.slice(0, maxLen);
+  if (maxBytes <= 0 || normalized.length === 0) return '';
+  if (utf8ByteLength(normalized) <= maxBytes) return normalized;
+
+  // Fast trim by UTF-8 byte budget without splitting surrogate pairs
+  let byteCount = 0;
+  let endIndex = 0;
+  for (const ch of normalized) {
+    const chBytes = utf8ByteLength(ch);
+    if (byteCount + chBytes > maxBytes) break;
+    byteCount += chBytes;
+    endIndex += ch.length;
+  }
+  return normalized.slice(0, endIndex);
 }
 
 function clampNonNegativeNumber(val: unknown): number {
   const num = typeof val === 'number' && Number.isFinite(val) ? val : Number(val);
   if (!Number.isFinite(num) || num < 0) return 0;
   return num;
+}
+
+export function isFirestoreTimestampObject(val: unknown): boolean {
+  if (!val || typeof val !== 'object') return false;
+  const candidate = val as { toDate?: unknown; seconds?: unknown; nanoseconds?: unknown };
+  if (typeof candidate.toDate === 'function') return true;
+  return (
+    typeof candidate.seconds === 'number' &&
+    Number.isFinite(candidate.seconds) &&
+    typeof candidate.nanoseconds === 'number' &&
+    Number.isFinite(candidate.nanoseconds)
+  );
+}
+
+export function pickValidExistingCreatedAt(val: unknown): unknown {
+  return isFirestoreTimestampObject(val) ? val : undefined;
+}
+
+const VALID_PORTALS: ReadonlySet<Tender['portal']> = new Set([
+  'GeM',
+  'CPPP / eProcure',
+  'State Portal',
+  'PSU / Direct',
+  'Private',
+]);
+
+export function normalizePortalForCloud(raw: unknown): Tender['portal'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as Tender['portal'];
+    if (VALID_PORTALS.has(trimmed)) return trimmed;
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('gem')) return 'GeM';
+    if (lower.includes('cppp') || lower.includes('eprocure')) return 'CPPP / eProcure';
+    if (lower.includes('state')) return 'State Portal';
+    if (lower.includes('psu') || lower.includes('direct')) return 'PSU / Direct';
+    if (lower.includes('private')) return 'Private';
+  }
+  return 'GeM';
+}
+
+const VALID_EMD_STATUSES: ReadonlySet<Tender['emdStatus']> = new Set([
+  'Exempted - MSME/Startup',
+  'EMD Paid',
+  'BG Submitted',
+  'No EMD',
+]);
+
+export function normalizeEmdStatusForCloud(raw: unknown): Tender['emdStatus'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as Tender['emdStatus'];
+    if (VALID_EMD_STATUSES.has(trimmed)) return trimmed;
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('exempt') || lower.includes('msme') || lower.includes('startup')) {
+      return 'Exempted - MSME/Startup';
+    }
+    if (lower.includes('bg')) return 'BG Submitted';
+    if (lower.includes('paid')) return 'EMD Paid';
+    if (lower.includes('no') || lower.includes('nil') || lower.includes('na')) return 'No EMD';
+  }
+  return 'No EMD';
+}
+
+const VALID_TENDER_STAGES: ReadonlySet<Tender['stage']> = new Set([
+  'Identified / Reviewing',
+  'Doc Preparation',
+  'Submitted',
+  'Technical Eval',
+  'Financial / BOQ Eval',
+  'L1 / Won',
+  'Lost (L2/L3)',
+  'Cancelled / Retendered',
+  'Tender Not Filled',
+]);
+
+export function normalizeTenderStageForCloud(raw: unknown): Tender['stage'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as Tender['stage'];
+    if (VALID_TENDER_STAGES.has(trimmed)) return trimmed;
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('l1') || lower.includes('won') || lower.includes('awarded')) return 'L1 / Won';
+    if (lower.includes('lost') || lower.includes('l2') || lower.includes('l3')) return 'Lost (L2/L3)';
+    if (lower.includes('cancel') || lower.includes('retender')) return 'Cancelled / Retendered';
+    if (lower.includes('not filled') || lower.includes('dropped') || lower.includes('skip')) {
+      return 'Tender Not Filled';
+    }
+    if (lower.includes('financial') || lower.includes('boq')) return 'Financial / BOQ Eval';
+    if (lower.includes('technical')) return 'Technical Eval';
+    if (lower.includes('submit')) return 'Submitted';
+    if (lower.includes('prep')) return 'Doc Preparation';
+  }
+  return 'Identified / Reviewing';
+}
+
+const VALID_INSTRUMENT_TYPES: ReadonlySet<EmdBgRecord['instrumentType']> = new Set([
+  'Online / NEFT / RTGS',
+  'Demand Draft (DD)',
+  'Bank Guarantee (PBG / Bid BG)',
+  'FDR / TDR',
+  'e-PBG',
+]);
+
+export function normalizeInstrumentTypeForCloud(raw: unknown): EmdBgRecord['instrumentType'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as EmdBgRecord['instrumentType'];
+    if (VALID_INSTRUMENT_TYPES.has(trimmed)) return trimmed;
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('e-pbg') || lower.includes('epbg')) return 'e-PBG';
+    if (lower.includes('fdr') || lower.includes('tdr')) return 'FDR / TDR';
+    if (lower.includes('bg') || lower.includes('guarantee')) return 'Bank Guarantee (PBG / Bid BG)';
+    if (lower.includes('dd') || lower.includes('demand draft')) return 'Demand Draft (DD)';
+  }
+  return 'Online / NEFT / RTGS';
+}
+
+const VALID_FINANCIAL_STATUSES: ReadonlySet<EmdBgRecord['status']> = new Set([
+  'Active / Locked',
+  'Extension Requested',
+  'Refund / Release Applied',
+  'Refunded / Released',
+  'Forfeited',
+]);
+
+export function normalizeFinancialStatusForCloud(raw: unknown): EmdBgRecord['status'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as EmdBgRecord['status'];
+    if (VALID_FINANCIAL_STATUSES.has(trimmed)) return trimmed;
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('forfeit')) return 'Forfeited';
+    if (lower.includes('refunded') || lower.includes('released')) return 'Refunded / Released';
+    if (lower.includes('applied')) return 'Refund / Release Applied';
+    if (lower.includes('extension')) return 'Extension Requested';
+  }
+  return 'Active / Locked';
+}
+
+const VALID_EMAIL_SLOTS: ReadonlySet<EmailAlertLog['slot']> = new Set([
+  'slot_11am',
+  'slot_4pm',
+  'manual',
+  'test',
+]);
+
+export function normalizeEmailSlotForCloud(raw: unknown): EmailAlertLog['slot'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as EmailAlertLog['slot'];
+    if (VALID_EMAIL_SLOTS.has(trimmed)) return trimmed;
+  }
+  return 'manual';
+}
+
+const VALID_EMAIL_STATUSES: ReadonlySet<EmailAlertLog['status']> = new Set(['sent', 'failed']);
+
+export function normalizeEmailStatusForCloud(raw: unknown): EmailAlertLog['status'] {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim() as EmailAlertLog['status'];
+    if (VALID_EMAIL_STATUSES.has(trimmed)) return trimmed;
+  }
+  return 'failed';
 }
 
 export function sanitizeDocId(rawId: string): string {
@@ -71,7 +247,7 @@ export function sanitizeDocId(rawId: string): string {
 export function sanitizePhotoForCloud(photoUrl: string | undefined): string {
   if (!photoUrl || typeof photoUrl !== 'string') return '';
   const trimmed = photoUrl.trim();
-  if (trimmed.length > CLOUD_LIMITS.PHOTO_URL_MAX) return '';
+  if (utf8ByteLength(trimmed) > CLOUD_LIMITS.PHOTO_URL_MAX) return '';
   if (
     isSafeHttpUrl(trimmed) ||
     /^data:image\/(?:png|jpeg|jpg|webp|gif);base64,[a-zA-Z0-9+/=]+$/i.test(trimmed)
@@ -103,15 +279,17 @@ export function buildCloudAttachmentFilePayload<TTime>(
   serverTimeToken: TTime,
   existingCreatedAt?: unknown,
 ): Record<string, unknown> | null {
-  if (!att.dataUrl || att.dataUrl.length > CLOUD_LIMITS.ATTACHMENT_DATA_URL_MAX) {
+  if (!att.dataUrl || utf8ByteLength(att.dataUrl) > CLOUD_LIMITS.ATTACHMENT_DATA_URL_MAX) {
     return null;
   }
   const safeId = sanitizeDocId(att.id);
+  const safeFileName = clampStr((att.fileName || '').trim() || 'attachment', 200);
+  const safeFileType = clampStr((att.fileType || '').trim() || 'application/octet-stream', 120);
   return {
     ownerUid: sanitizeDocId(ownerUid),
     id: safeId,
-    fileName: clampStr(att.fileName.trim() || 'attachment', 200),
-    fileType: clampStr(att.fileType.trim() || 'application/octet-stream', 120),
+    fileName: safeFileName || 'attachment',
+    fileType: safeFileType || 'application/octet-stream',
     fileSize: clampNonNegativeNumber(att.fileSize),
     dataUrl: att.dataUrl,
     createdAt: existingCreatedAt ?? serverTimeToken,
@@ -141,12 +319,14 @@ export function buildCloudProfilePayload<TTime>(
   serverTimeToken: TTime,
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
+  const firmName = clampStr((profile.firmName || '').trim() || 'Corporate Tender Desk', CLOUD_LIMITS.FIRM_NAME_MAX);
+  const adminName = clampStr((profile.adminName || '').trim() || 'Tender Desk User', CLOUD_LIMITS.ADMIN_NAME_MAX);
   return {
     ownerUid: sanitizeDocId(ownerUid),
-    firmName: clampStr(profile.firmName.trim() || 'Corporate Tender Desk', CLOUD_LIMITS.FIRM_NAME_MAX),
+    firmName: firmName || 'Corporate Tender Desk',
     gstin: clampStr(profile.gstin, CLOUD_LIMITS.GSTIN_MAX),
     udyamNumber: clampStr(profile.udyamNumber, CLOUD_LIMITS.UDYAM_MAX),
-    adminName: clampStr(profile.adminName.trim() || 'Tender Desk User', CLOUD_LIMITS.ADMIN_NAME_MAX),
+    adminName: adminName || 'Tender Desk User',
     adminPhotoUrl: sanitizePhotoForCloud(profile.adminPhotoUrl),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
@@ -160,23 +340,27 @@ export function buildCloudTenderPayload<TTime>(
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
   const safeId = sanitizeDocId(tender.id);
-  const dept = clampStr(tender.department.trim() || 'Department', CLOUD_LIMITS.DEPARTMENT_MAX);
+  const dept = clampStr((tender.department || '').trim() || 'Department', CLOUD_LIMITS.DEPARTMENT_MAX) || 'Department';
+  const safeTenderId = clampStr((tender.tenderId || '').trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX) || safeId;
+  const safeTitle = clampStr((tender.title || '').trim() || 'Untitled Tender', CLOUD_LIMITS.TITLE_MAX) || 'Untitled Tender';
+  const safeDue =
+    clampStr(
+      (tender.submissionDueDate || '').trim() || new Date().toISOString().slice(0, 16),
+      CLOUD_LIMITS.DATE_MAX,
+    ) || new Date().toISOString().slice(0, 16);
   return {
     ownerUid: sanitizeDocId(ownerUid),
     id: safeId,
-    tenderId: clampStr(tender.tenderId.trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX),
-    portal: tender.portal,
-    clientName: clampStr((tender.clientName ?? '').trim() || dept, CLOUD_LIMITS.DEPARTMENT_MAX),
+    tenderId: safeTenderId,
+    portal: normalizePortalForCloud(tender.portal),
+    clientName: clampStr((tender.clientName ?? '').trim() || dept, CLOUD_LIMITS.DEPARTMENT_MAX) || dept,
     department: dept,
     locationDepartment: clampStr((tender.locationDepartment ?? '').trim() || dept, CLOUD_LIMITS.DEPARTMENT_MAX),
     location: clampStr(tender.location, CLOUD_LIMITS.LOCATION_MAX),
     category: clampStr(tender.category, CLOUD_LIMITS.CATEGORY_MAX),
-    title: clampStr(tender.title.trim() || 'Untitled Tender', CLOUD_LIMITS.TITLE_MAX),
+    title: safeTitle,
     publishDate: clampStr(tender.publishDate, CLOUD_LIMITS.DATE_MAX),
-    submissionDueDate: clampStr(
-      tender.submissionDueDate.trim() || new Date().toISOString().slice(0, 16),
-      CLOUD_LIMITS.DATE_MAX,
-    ),
+    submissionDueDate: safeDue,
     preBidDate: clampStr(tender.preBidDate, CLOUD_LIMITS.DATE_MAX),
     technicalOpeningDate: clampStr(tender.technicalOpeningDate, CLOUD_LIMITS.DATE_MAX),
     financialOpeningDate: clampStr(tender.financialOpeningDate, CLOUD_LIMITS.DATE_MAX),
@@ -186,9 +370,9 @@ export function buildCloudTenderPayload<TTime>(
     l1QuotedValue: clampNonNegativeNumber(tender.l1QuotedValue),
     ourPositionRank: clampStr(tender.ourPositionRank, CLOUD_LIMITS.RANK_MAX),
     assignedOwner: clampStr(tender.assignedOwner, CLOUD_LIMITS.OWNER_NAME_MAX),
-    emdStatus: tender.emdStatus,
+    emdStatus: normalizeEmdStatusForCloud(tender.emdStatus),
     emdAmount: clampNonNegativeNumber(tender.emdAmount),
-    stage: tender.stage,
+    stage: normalizeTenderStageForCloud(tender.stage),
     resultInfo: clampStr(tender.resultInfo, CLOUD_LIMITS.RESULT_INFO_MAX),
     completionDate: clampStr(tender.completionDate, CLOUD_LIMITS.DATE_MAX),
     technicalStatus: clampStr(tender.technicalStatus, CLOUD_LIMITS.BIDRA_STATUS_MAX),
@@ -225,20 +409,24 @@ export function buildCloudEmdPayload<TTime>(
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
   const safeId = sanitizeDocId(record.id);
+  const safeTenderId = clampStr((record.tenderId || '').trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX) || safeId;
+  const safeDept = clampStr((record.department || '').trim() || 'Department', CLOUD_LIMITS.DEPARTMENT_MAX) || 'Department';
+  const safeRef = clampStr((record.referenceNo || '').trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX) || safeId;
+  const safeBank = clampStr((record.bankName || '').trim() || 'Bank', 150) || 'Bank';
   return {
     ownerUid: sanitizeDocId(ownerUid),
     id: safeId,
     tenderRefId: clampStr(record.tenderRefId, CLOUD_LIMITS.ID_MAX),
-    tenderId: clampStr(record.tenderId.trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX),
-    department: clampStr(record.department.trim() || 'Department', CLOUD_LIMITS.DEPARTMENT_MAX),
-    instrumentType: record.instrumentType,
-    referenceNo: clampStr(record.referenceNo.trim() || safeId, CLOUD_LIMITS.TENDER_ID_MAX),
-    bankName: clampStr(record.bankName.trim() || 'Bank', 150),
+    tenderId: safeTenderId,
+    department: safeDept,
+    instrumentType: normalizeInstrumentTypeForCloud(record.instrumentType),
+    referenceNo: safeRef,
+    bankName: safeBank,
     amount: clampNonNegativeNumber(record.amount),
     issueDate: clampStr(record.issueDate, CLOUD_LIMITS.DATE_MAX),
     expiryDate: clampStr(record.expiryDate, CLOUD_LIMITS.DATE_MAX),
     claimEndDate: clampStr(record.claimEndDate, CLOUD_LIMITS.DATE_MAX),
-    status: record.status,
+    status: normalizeFinancialStatusForCloud(record.status),
     refundDate: clampStr(record.refundDate, CLOUD_LIMITS.DATE_MAX),
     refundRef: clampStr(record.refundRef, 120),
     remarks: clampStr(record.remarks, CLOUD_LIMITS.REMARKS_TEXT_MAX),
@@ -433,11 +621,15 @@ export function buildCloudEmailConfigPayload<TTime>(
   serverTimeToken: TTime,
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
+  const safeName = clampStr((config.recipientName || '').trim() || 'Alert Recipient', 100) || 'Alert Recipient';
+  const trimmedEmail = (config.recipientEmail || '').trim();
+  const validLenEmail = trimmedEmail.length >= 5 ? trimmedEmail : 'alerts@example.com';
+  const safeEmail = clampStr(validLenEmail, 160);
   return {
     ownerUid: sanitizeDocId(ownerUid),
     enabled: Boolean(config.enabled),
-    recipientName: clampStr(config.recipientName.trim() || 'Alert Recipient', 100),
-    recipientEmail: clampStr(config.recipientEmail.trim() || 'alerts@example.com', 160),
+    recipientName: safeName,
+    recipientEmail: utf8ByteLength(safeEmail) >= 5 ? safeEmail : 'alerts@example.com',
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
   };
@@ -450,21 +642,23 @@ export function buildCloudEmailAlertLogPayload<TTime>(
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
   const safeId = sanitizeDocId(log.id);
+  const safeSlotKey = clampStr((log.slotKey || '').trim() || safeId, 150) || safeId;
+  const safeTenderId = clampStr((log.tenderId || '').trim() || safeId, 120) || safeId;
   return {
     ownerUid: sanitizeDocId(ownerUid),
     id: safeId,
-    slotKey: clampStr(log.slotKey || safeId, 150),
+    slotKey: safeSlotKey,
     tenderRefId: clampStr(log.tenderRefId, 128),
-    tenderId: clampStr(log.tenderId || safeId, 120),
-    slot: log.slot,
-    recipientName: clampStr(log.recipientName || 'Alert Recipient', 100),
-    recipientEmail: clampStr(log.recipientEmail || 'alerts@example.com', 160),
+    tenderId: safeTenderId,
+    slot: normalizeEmailSlotForCloud(log.slot),
+    recipientName: clampStr((log.recipientName || '').trim() || 'Alert Recipient', 100),
+    recipientEmail: clampStr((log.recipientEmail || '').trim() || 'alerts@example.com', 160),
     dueDateIso: clampStr(log.dueDateIso, 40),
-    status: log.status,
-    provider: clampStr(log.provider || 'smtp', 40),
-    subject: clampStr(log.subject || 'Tender Alert Notification', 240),
+    status: normalizeEmailStatusForCloud(log.status),
+    provider: clampStr((log.provider || '').trim() || 'smtp', 40),
+    subject: clampStr((log.subject || '').trim() || 'Tender Alert Notification', 240),
     message: clampStr(log.message, 4000),
-    clientCreatedAt: clampStr(log.createdAt || new Date().toISOString(), 40),
+    clientCreatedAt: clampStr((log.createdAt || '').trim() || new Date().toISOString(), 40),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,
   };
@@ -478,11 +672,13 @@ export function buildCloudSheetConfigPayload<TTime>(
 ): Record<string, unknown> {
   const rawUrl = (config.webhookUrl || '').trim();
   const safeUrl = rawUrl.startsWith('https://') ? clampStr(rawUrl, 500) : '';
+  const safeSheetName =
+    clampStr((config.sheetName || '').trim() || 'MIS Monthly Report', 120) || 'MIS Monthly Report';
   return {
     ownerUid: sanitizeDocId(ownerUid),
     enabled: Boolean(config.enabled),
     webhookUrl: safeUrl,
-    sheetName: clampStr((config.sheetName || '').trim() || 'MIS Monthly Report', 120),
+    sheetName: safeSheetName,
     lastSyncedAt: clampStr(config.lastSyncedAt, 40),
     createdAt: existingCreatedAt ?? serverTimeToken,
     updatedAt: serverTimeToken,

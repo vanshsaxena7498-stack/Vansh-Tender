@@ -57,10 +57,12 @@ import {
   buildCloudTenderPayload,
   buildSecondaryUserCloudPayload,
   buildWorkspaceRootPayload,
+  isFirestoreTimestampObject,
   isLegacyDocExcludedFromAdmin,
   mergeAdminAttachmentMaps,
   mergeAdminRecordsById,
   normalizeAdminFirestoreTimestamp,
+  pickValidExistingCreatedAt,
   sanitizeDocId,
 } from './cloudSyncHelpers.ts';
 import {
@@ -114,6 +116,29 @@ const syncedAttachmentKeys = new Set<string>();
 export function clearCloudSessionCache(): void {
   ensuredWorkspaceKeys.clear();
   syncedAttachmentKeys.clear();
+}
+
+const USER_ROOT_ALLOWED_KEYS = new Set(['ownerUid', 'email', 'createdAt', 'updatedAt']);
+const WORKSPACE_ROOT_ALLOWED_KEYS = new Set([
+  'ownerUid',
+  'tenantId',
+  'username',
+  'email',
+  'createdAt',
+  'updatedAt',
+]);
+
+async function runInBatches<T>(
+  items: readonly T[],
+  batchSize: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const size = Math.max(1, batchSize);
+  for (let i = 0; i < items.length; i += size) {
+    const chunk = items.slice(i, i + size);
+    await Promise.all(chunk.map((item) => worker(item)));
+  }
 }
 
 const TERMINAL_FINANCIAL_STATUS = new Set<EmdBgRecord['status']>([
@@ -393,16 +418,18 @@ export async function ensureUserRootDocument(
       });
     } else {
       const data = snap.data();
+      const hasUnexpectedKeys = Object.keys(data).some((k) => !USER_ROOT_ALLOWED_KEYS.has(k));
+      const validCreatedAt = pickValidExistingCreatedAt(data.createdAt);
       const needsRepair =
         data.ownerUid !== user.uid ||
         data.email !== safeEmail ||
-        data.createdAt === undefined ||
-        data.createdAt === null;
+        !validCreatedAt ||
+        hasUnexpectedKeys;
       if (needsRepair) {
         await setDoc(userRef, {
           ownerUid: user.uid,
           email: safeEmail,
-          createdAt: data.createdAt ?? now,
+          createdAt: validCreatedAt ?? now,
           updatedAt: now,
         });
       }
@@ -411,7 +438,9 @@ export async function ensureUserRootDocument(
     if (scopedTenant) {
       const wsRef = doc(ctx.db, 'users', user.uid, 'workspaces', scopedTenant);
       const wsSnap = await getDoc(wsRef);
-      const existingCreatedAt = wsSnap.exists() ? wsSnap.data().createdAt : undefined;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        wsSnap.exists() ? wsSnap.data().createdAt : undefined,
+      );
       const wsPayload = buildWorkspaceRootPayload(
         {
           ownerUid: user.uid,
@@ -426,7 +455,15 @@ export async function ensureUserRootDocument(
         await setDoc(wsRef, wsPayload);
       } else {
         const wsData = wsSnap.data();
-        if (wsData.ownerUid !== user.uid || wsData.tenantId !== scopedTenant || !wsData.createdAt) {
+        const hasUnexpectedWsKeys = Object.keys(wsData).some(
+          (k) => !WORKSPACE_ROOT_ALLOWED_KEYS.has(k),
+        );
+        if (
+          wsData.ownerUid !== user.uid ||
+          wsData.tenantId !== scopedTenant ||
+          !isFirestoreTimestampObject(wsData.createdAt) ||
+          hasUnexpectedWsKeys
+        ) {
           await setDoc(wsRef, wsPayload);
         }
       }
@@ -454,9 +491,9 @@ export async function syncSecondaryUserToCloud(
       // Update canonical doc always; only update alias docs that already exist
       if (safeId !== primarySafeId && !snap.exists()) continue;
       const existingData = snap.exists() ? snap.data() : null;
-      const existingCreatedAt = existingData?.createdAt;
+      const existingCreatedAt = pickValidExistingCreatedAt(existingData?.createdAt);
       const ownerUid =
-        existingData && typeof existingData.ownerUid === 'string'
+        existingData && typeof existingData.ownerUid === 'string' && existingData.ownerUid.trim()
           ? existingData.ownerUid
           : user.uid;
       const payload = buildSecondaryUserCloudPayload(
@@ -544,7 +581,9 @@ export async function syncPreferencesToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences');
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudPreferencesPayload(
       prefs,
       user.uid,
@@ -569,7 +608,9 @@ export async function syncProfileToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm');
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt);
     await setDoc(ref, payload);
   } catch (error) {
@@ -589,7 +630,9 @@ export async function syncEmailConfigToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default');
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudEmailConfigPayload(
       config,
       user.uid,
@@ -614,7 +657,9 @@ export async function syncSheetConfigToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default');
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudSheetConfigPayload(
       config,
       user.uid,
@@ -640,7 +685,9 @@ export async function syncEmailAlertLogToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailAlerts', safeId);
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudEmailAlertLogPayload(
       { ...log, id: safeId },
       user.uid,
@@ -677,12 +724,12 @@ export async function syncAttachmentFilesToCloud(
         existingData.ownerUid === user.uid &&
         existingData.fileSize === att.fileSize &&
         existingData.fileName === (att.fileName.trim() || 'attachment') &&
-        existingData.createdAt
+        isFirestoreTimestampObject(existingData.createdAt)
       ) {
         syncedAttachmentKeys.add(cacheKey);
         continue;
       }
-      const existingCreatedAt = existingData?.createdAt;
+      const existingCreatedAt = pickValidExistingCreatedAt(existingData?.createdAt);
       const payload = buildCloudAttachmentFilePayload(
         att,
         user.uid,
@@ -799,7 +846,9 @@ export async function syncTenderToCloud(
         return;
       }
     }
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudTenderPayload(
       { ...tender, id: safeId },
       user.uid,
@@ -824,7 +873,13 @@ export async function deleteTenderFromCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId);
   try {
     const snap = await getDoc(ref);
-    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
+    if (
+      snap.exists() &&
+      typeof docOwner === 'string' &&
+      docOwner.trim().length > 0 &&
+      docOwner !== user.uid
+    ) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
@@ -854,7 +909,9 @@ export async function syncEmdRecordToCloud(
         return;
       }
     }
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudEmdPayload(
       { ...record, id: safeId },
       user.uid,
@@ -879,7 +936,13 @@ export async function deleteEmdRecordFromCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId);
   try {
     const snap = await getDoc(ref);
-    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
+    if (
+      snap.exists() &&
+      typeof docOwner === 'string' &&
+      docOwner.trim().length > 0 &&
+      docOwner !== user.uid
+    ) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
@@ -922,7 +985,9 @@ export async function syncMafTrackerToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudMafTrackerPayload(
       { ...tracker, id: safeId },
       user.uid,
@@ -947,7 +1012,13 @@ export async function deleteMafTrackerFromCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
   try {
     const snap = await getDoc(ref);
-    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
+    if (
+      snap.exists() &&
+      typeof docOwner === 'string' &&
+      docOwner.trim().length > 0 &&
+      docOwner !== user.uid
+    ) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
@@ -969,7 +1040,9 @@ export async function syncOemRecordToCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
   try {
     const snap = await getDoc(ref);
-    const existingCreatedAt = snap.exists() ? snap.data().createdAt : undefined;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      snap.exists() ? snap.data().createdAt : undefined,
+    );
     const payload = buildCloudOemPayload(
       { ...oem, id: safeId },
       user.uid,
@@ -994,7 +1067,13 @@ export async function deleteOemRecordFromCloud(
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
   try {
     const snap = await getDoc(ref);
-    if (snap.exists() && snap.data().ownerUid !== user.uid) {
+    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
+    if (
+      snap.exists() &&
+      typeof docOwner === 'string' &&
+      docOwner.trim().length > 0 &&
+      docOwner !== user.uid
+    ) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
@@ -1488,24 +1567,23 @@ export async function backupAllToCloud(
 ): Promise<void> {
   const { ctx } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-  await syncProfileToCloud(user, profile, workspaceTenantId, ctx);
-  await syncPreferencesToCloud(user, preferences, workspaceTenantId, ctx);
+  await Promise.all([
+    syncProfileToCloud(user, profile, workspaceTenantId, ctx),
+    syncPreferencesToCloud(user, preferences, workspaceTenantId, ctx),
+  ]);
 
-  for (const tender of tenders) {
-    await syncTenderToCloud(user, tender, workspaceTenantId, ctx);
-  }
-
-  for (const record of emdRecords) {
-    await syncEmdRecordToCloud(user, record, workspaceTenantId, ctx);
-  }
-
-  for (const tracker of mafTrackers) {
-    await syncMafTrackerToCloud(user, tracker, workspaceTenantId, ctx);
-  }
-
-  for (const oem of oemRecords) {
-    await syncOemRecordToCloud(user, oem, workspaceTenantId, ctx);
-  }
+  await runInBatches(tenders, 6, (tender) =>
+    syncTenderToCloud(user, tender, workspaceTenantId, ctx),
+  );
+  await runInBatches(emdRecords, 6, (record) =>
+    syncEmdRecordToCloud(user, record, workspaceTenantId, ctx),
+  );
+  await runInBatches(mafTrackers, 6, (tracker) =>
+    syncMafTrackerToCloud(user, tracker, workspaceTenantId, ctx),
+  );
+  await runInBatches(oemRecords, 6, (oem) =>
+    syncOemRecordToCloud(user, oem, workspaceTenantId, ctx),
+  );
 }
 
 export async function replaceCloudDataset(
@@ -1542,41 +1620,43 @@ export async function replaceCloudDataset(
     }
   }
 
-  for (const oldTender of existing.tenders) {
-    if (!nextTenderIds.has(sanitizeDocId(oldTender.id))) {
-      await deleteTenderFromCloud(user, oldTender.id, workspaceTenantId, ctx);
-    }
-  }
+  const obsoleteTenders = existing.tenders.filter(
+    (oldTender) => !nextTenderIds.has(sanitizeDocId(oldTender.id)),
+  );
+  const obsoleteEmd = existing.emdRecords.filter(
+    (oldEmd) => !nextEmdIds.has(sanitizeDocId(oldEmd.id)),
+  );
+  const obsoleteMaf = existing.mafTrackers.filter(
+    (oldMaf) => !nextMafIds.has(sanitizeDocId(oldMaf.id)),
+  );
+  const obsoleteOems = existing.oemRecords.filter(
+    (oldOem) => !nextOemIds.has(sanitizeDocId(oldOem.id)),
+  );
+  const obsoleteAttIds = Array.from(existing.attachmentFiles.keys()).filter(
+    (oldAttId) => !nextAttachmentIds.has(sanitizeDocId(oldAttId)),
+  );
 
-  for (const oldEmd of existing.emdRecords) {
-    if (!nextEmdIds.has(sanitizeDocId(oldEmd.id))) {
-      await deleteEmdRecordFromCloud(user, oldEmd.id, workspaceTenantId, ctx);
+  await runInBatches(obsoleteTenders, 6, (oldTender) =>
+    deleteTenderFromCloud(user, oldTender.id, workspaceTenantId, ctx),
+  );
+  await runInBatches(obsoleteEmd, 6, (oldEmd) =>
+    deleteEmdRecordFromCloud(user, oldEmd.id, workspaceTenantId, ctx),
+  );
+  await runInBatches(obsoleteMaf, 6, (oldMaf) =>
+    deleteMafTrackerFromCloud(user, oldMaf.id, workspaceTenantId, ctx),
+  );
+  await runInBatches(obsoleteOems, 6, (oldOem) =>
+    deleteOemRecordFromCloud(user, oldOem.id, workspaceTenantId, ctx),
+  );
+  await runInBatches(obsoleteAttIds, 6, async (oldAttId) => {
+    const safeId = sanitizeDocId(oldAttId);
+    const path = `${prefix}/attachmentFiles/${safeId}`;
+    try {
+      await deleteDoc(getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
     }
-  }
-
-  for (const oldMaf of existing.mafTrackers) {
-    if (!nextMafIds.has(sanitizeDocId(oldMaf.id))) {
-      await deleteMafTrackerFromCloud(user, oldMaf.id, workspaceTenantId, ctx);
-    }
-  }
-
-  for (const oldOem of existing.oemRecords) {
-    if (!nextOemIds.has(sanitizeDocId(oldOem.id))) {
-      await deleteOemRecordFromCloud(user, oldOem.id, workspaceTenantId, ctx);
-    }
-  }
-
-  for (const oldAttId of existing.attachmentFiles.keys()) {
-    if (!nextAttachmentIds.has(sanitizeDocId(oldAttId))) {
-      const safeId = sanitizeDocId(oldAttId);
-      const path = `${prefix}/attachmentFiles/${safeId}`;
-      try {
-        await deleteDoc(getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId));
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, path);
-      }
-    }
-  }
+  });
 
   await backupAllToCloud(
     user,
