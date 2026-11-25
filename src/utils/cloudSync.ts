@@ -4,6 +4,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   getDocsFromCache,
   onSnapshot,
@@ -179,9 +180,19 @@ function rememberDocMetadata(
   docPath: string,
   data: Record<string, unknown> | null | undefined,
   kind?: 'tender' | 'emd',
+  opts?: { fromPendingWrite?: boolean; fromCache?: boolean },
 ): void {
   const key = buildDocCacheKey(ctx, docPath);
+  const isUnverifiedSnapshot = Boolean(opts?.fromPendingWrite || opts?.fromCache);
+
   if (!data) {
+    // Never overwrite known metadata or assume server absence from cache/pending snapshots
+    if (isUnverifiedSnapshot) {
+      if (!isFirestoreTimestampObject(cloudCreatedAtCache.get(key))) {
+        cloudCreatedAtCache.delete(key);
+      }
+      return;
+    }
     cloudCreatedAtCache.set(key, null);
     cloudOwnerUidCache.delete(key);
     cloudTerminalTenderCache.delete(key);
@@ -190,7 +201,16 @@ function rememberDocMetadata(
   }
 
   const validCreated = pickValidExistingCreatedAt(data.createdAt);
-  cloudCreatedAtCache.set(key, validCreated ?? null);
+  if (validCreated) {
+    cloudCreatedAtCache.set(key, validCreated);
+  } else if (isUnverifiedSnapshot) {
+    // Pending writes using serverTimestamp() have createdAt === null locally; preserve any valid cached timestamp or leave uncached so next write checks server
+    if (!isFirestoreTimestampObject(cloudCreatedAtCache.get(key))) {
+      cloudCreatedAtCache.delete(key);
+    }
+  } else {
+    cloudCreatedAtCache.set(key, null);
+  }
 
   if (typeof data.ownerUid === 'string' && data.ownerUid.trim()) {
     cloudOwnerUidCache.set(key, data.ownerUid.trim());
@@ -210,6 +230,45 @@ function rememberDocMetadata(
     } else {
       cloudTerminalEmdCache.delete(key);
     }
+  }
+}
+
+function isOfflineOrUnavailableError(err: unknown): boolean {
+  const code =
+    err && typeof err === 'object' && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '').toLowerCase()
+      : '';
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  return (
+    code.includes('unavailable') ||
+    msg.includes('unavailable') ||
+    msg.includes('offline') ||
+    msg.includes('failed to get document because the client is offline') ||
+    msg.includes('network')
+  );
+}
+
+function isPermissionDeniedError(err: unknown): boolean {
+  const code =
+    err && typeof err === 'object' && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '').toLowerCase()
+      : '';
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  return (
+    code.includes('permission-denied') ||
+    msg.includes('permission-denied') ||
+    msg.includes('missing or insufficient permissions')
+  );
+}
+
+async function readDocPreferServer(docRef: ReturnType<typeof doc>) {
+  try {
+    return await getDocFromServer(docRef);
+  } catch (err) {
+    if (isOfflineOrUnavailableError(err)) {
+      return await getDoc(docRef);
+    }
+    throw err;
   }
 }
 
@@ -487,8 +546,9 @@ function docToEmailAlertLog(data: Record<string, unknown>, fallbackDocId = ''): 
 }
 
 /**
- * Ensures doc `createdAt` metadata & terminal guards are known before a batch commit.
- * Skips Firestore reads completely for documents already cached from snapshots/fetches.
+ * Ensures doc `createdAt` metadata & terminal guards are known from server before a write.
+ * Skips Firestore reads only for documents already known to have a valid Firestore Timestamp
+ * (unless `forceServer` is explicitly requested).
  */
 async function primeDocMetadataForPaths(
   ctx: CloudTargetContext,
@@ -497,16 +557,39 @@ async function primeDocMetadataForPaths(
     path: string;
     kind?: 'tender' | 'emd';
   }>,
+  options?: { forceServer?: boolean },
 ): Promise<void> {
-  const uncached = entries.filter((e) => !cloudCreatedAtCache.has(buildDocCacheKey(ctx, e.path)));
-  if (uncached.length === 0) return;
+  const forceServer = Boolean(options?.forceServer);
+  const seenPaths = new Set<string>();
+  const toFetch = entries.filter((e) => {
+    if (seenPaths.has(e.path)) return false;
+    seenPaths.add(e.path);
+    const key = buildDocCacheKey(ctx, e.path);
+    if (forceServer) {
+      cloudCreatedAtCache.delete(key);
+      return true;
+    }
+    return !isFirestoreTimestampObject(cloudCreatedAtCache.get(key));
+  });
+  if (toFetch.length === 0) return;
 
-  await runInBatches(uncached, 10, async (entry) => {
+  await runInBatches(toFetch, 10, async (entry) => {
     try {
-      const snap = await getDoc(entry.docRef);
-      rememberDocMetadata(ctx, entry.path, snap.exists() ? snap.data() : null, entry.kind);
+      const snap = await readDocPreferServer(entry.docRef);
+      rememberDocMetadata(ctx, entry.path, snap.exists() ? snap.data() : null, entry.kind, {
+        fromPendingWrite: snap.metadata.hasPendingWrites,
+        fromCache: snap.metadata.fromCache,
+      });
     } catch {
-      // Leave uncached if read failed transiently; caller handles error cleanly on write
+      try {
+        const snap = await getDoc(entry.docRef);
+        rememberDocMetadata(ctx, entry.path, snap.exists() ? snap.data() : null, entry.kind, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
+      } catch {
+        // Leave uncached if read failed transiently; caller handles error cleanly on write
+      }
     }
   });
 }
@@ -517,6 +600,7 @@ interface BatchWriteOp {
   path: string;
   data?: Record<string, unknown>;
   approxBytes?: number;
+  usedServerCreatedAt?: boolean;
 }
 
 /**
@@ -526,7 +610,7 @@ interface BatchWriteOp {
 async function commitWriteBatchOps(
   ctx: CloudTargetContext,
   ops: readonly BatchWriteOp[],
-  options?: { maxOpsPerBatch?: number; maxBytesPerBatch?: number },
+  options?: { maxOpsPerBatch?: number; maxBytesPerBatch?: number; suppressErrorWrap?: boolean },
 ): Promise<void> {
   if (ops.length === 0) return;
   const maxOps = options?.maxOpsPerBatch ?? 400;
@@ -570,9 +654,15 @@ async function commitWriteBatchOps(
       for (const op of chunk) {
         if (op.type === 'delete') {
           rememberDocMetadata(ctx, op.path, null);
+        } else if (op.type === 'set' && op.usedServerCreatedAt) {
+          // Force next write to read the assigned server Timestamp instead of keeping null cached
+          cloudCreatedAtCache.delete(buildDocCacheKey(ctx, op.path));
         }
       }
     } catch (error) {
+      if (options?.suppressErrorWrap) {
+        throw error;
+      }
       const firstOp = chunk[0];
       handleFirestoreError(
         error,
@@ -625,11 +715,17 @@ async function queryCollectionDeltaOrFull(
       const deltaSnap = await getDocs(deltaQuery);
       const byId = new Map<string, QueryDocumentSnapshot>();
       for (const d of cachedDocs) {
-        rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind);
+        rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind, {
+          fromCache: true,
+          fromPendingWrite: d.metadata.hasPendingWrites,
+        });
         byId.set(d.id, d);
       }
       for (const d of deltaSnap.docs) {
-        rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind);
+        rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind, {
+          fromCache: d.metadata.fromCache,
+          fromPendingWrite: d.metadata.hasPendingWrites,
+        });
         byId.set(d.id, d);
       }
       return Array.from(byId.values());
@@ -642,7 +738,10 @@ async function queryCollectionDeltaOrFull(
 
   const fullSnap = await getDocs(baseQuery);
   for (const d of fullSnap.docs) {
-    rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind);
+    rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind, {
+      fromCache: d.metadata.fromCache,
+      fromPendingWrite: d.metadata.hasPendingWrites,
+    });
   }
   return fullSnap.docs;
 }
@@ -652,16 +751,20 @@ export async function ensureUserRootDocument(
   workspaceTenantId?: string | null,
   sessionMeta?: Pick<CrmUserSession, 'username' | 'email'> | null,
   target?: CloudTargetContext | null,
+  options?: { forceServerCheck?: boolean },
 ): Promise<void> {
   const { ctx, scopedTenant } = resolveScope(user.uid, workspaceTenantId, target);
   const cacheKey = `${ctx.projectId}::${ctx.databaseId || '(default)'}::${user.uid}::${scopedTenant || 'root'}`;
+  if (options?.forceServerCheck) {
+    ensuredWorkspaceKeys.delete(cacheKey);
+  }
   if (ensuredWorkspaceKeys.has(cacheKey)) return;
 
   const userPath = `users/${user.uid}`;
   const userRef = doc(ctx.db, 'users', user.uid);
   const safeEmail = (user.email ?? '').slice(0, 200);
   try {
-    const snap = await getDoc(userRef);
+    const snap = await readDocPreferServer(userRef);
     const now = serverTimestamp();
     if (!snap.exists()) {
       await setDoc(userRef, {
@@ -691,7 +794,7 @@ export async function ensureUserRootDocument(
 
     if (scopedTenant) {
       const wsRef = doc(ctx.db, 'users', user.uid, 'workspaces', scopedTenant);
-      const wsSnap = await getDoc(wsRef);
+      const wsSnap = await readDocPreferServer(wsRef);
       const existingCreatedAt = pickValidExistingCreatedAt(
         wsSnap.exists() ? wsSnap.data().createdAt : undefined,
       );
@@ -727,6 +830,48 @@ export async function ensureUserRootDocument(
   } catch (error) {
     ensuredWorkspaceKeys.delete(cacheKey);
     handleFirestoreError(error, OperationType.WRITE, userPath);
+  }
+}
+
+async function setDocWithPermissionRecovery(params: {
+  user: User;
+  ctx: CloudTargetContext;
+  workspaceTenantId?: string | null;
+  docRef: ReturnType<typeof doc>;
+  path: string;
+  kind?: 'tender' | 'emd';
+  buildPayload: (existingCreatedAt: unknown) => Record<string, unknown>;
+}): Promise<void> {
+  const { user, ctx, workspaceTenantId, docRef, path, kind, buildPayload } = params;
+  const cacheKey = buildDocCacheKey(ctx, path);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  await primeDocMetadataForPaths(ctx, [{ docRef, path, kind }]);
+
+  const writeAttempt = async () => {
+    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(cacheKey));
+    const payload = buildPayload(existingCreatedAt);
+    await setDoc(docRef, payload);
+    if (!existingCreatedAt) {
+      cloudCreatedAtCache.delete(cacheKey);
+    }
+  };
+
+  try {
+    await writeAttempt();
+  } catch (err) {
+    if (!isPermissionDeniedError(err)) {
+      handleFirestoreError(err, OperationType.WRITE, path);
+    }
+    try {
+      await user.getIdToken(true).catch(() => '');
+      await ensureUserRootDocument(user, workspaceTenantId, null, ctx, {
+        forceServerCheck: true,
+      });
+      await primeDocMetadataForPaths(ctx, [{ docRef, path, kind }], { forceServer: true });
+      await writeAttempt();
+    } catch (retryErr) {
+      handleFirestoreError(retryErr, OperationType.WRITE, path);
+    }
   }
 }
 
@@ -830,23 +975,17 @@ export async function syncPreferencesToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/settings/preferences`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences');
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
-    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
-    const payload = buildCloudPreferencesPayload(
-      prefs,
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudPreferencesPayload(prefs, user.uid, serverTimestamp(), existingCreatedAt),
+  });
 }
 
 export async function syncProfileToCloud(
@@ -856,18 +995,17 @@ export async function syncProfileToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/profile/firm`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm');
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
-    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
-    const payload = buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt);
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt),
+  });
 }
 
 export async function syncEmailConfigToCloud(
@@ -877,23 +1015,17 @@ export async function syncEmailConfigToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/emailConfig/default`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default');
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
-    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
-    const payload = buildCloudEmailConfigPayload(
-      config,
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudEmailConfigPayload(config, user.uid, serverTimestamp(), existingCreatedAt),
+  });
 }
 
 export async function syncSheetConfigToCloud(
@@ -903,23 +1035,17 @@ export async function syncSheetConfigToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const path = `${prefix}/sheetConfig/default`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default');
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
-    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
-    const payload = buildCloudSheetConfigPayload(
-      config,
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudSheetConfigPayload(config, user.uid, serverTimestamp(), existingCreatedAt),
+  });
 }
 
 export async function syncEmailAlertLogToCloud(
@@ -929,24 +1055,23 @@ export async function syncEmailAlertLogToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const safeId = sanitizeDocId(log.id);
   const path = `${prefix}/emailAlerts/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailAlerts', safeId);
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
-    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
-    const payload = buildCloudEmailAlertLogPayload(
-      { ...log, id: safeId },
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudEmailAlertLogPayload(
+        { ...log, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+  });
 }
 
 /**
@@ -986,43 +1111,67 @@ export async function syncAttachmentFilesToCloud(
 
   if (candidates.length === 0) return;
 
+  const primeEntries = candidates.map((c) => ({
+    docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', c.safeId),
+    path: c.path,
+  }));
+
+  const buildAttOps = (nextSignatures: Record<string, string>): BatchWriteOp[] => {
+    const ops: BatchWriteOp[] = [];
+    for (const c of candidates) {
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, c.path)),
+      );
+      const payload = buildCloudAttachmentFilePayload(
+        c.att,
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      );
+      if (!payload) continue;
+      const approxBytes = utf8ByteLength(String(payload.dataUrl || '')) + 1024;
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', c.safeId),
+        path: c.path,
+        data: payload,
+        approxBytes,
+        usedServerCreatedAt: !existingCreatedAt,
+      });
+      nextSignatures[c.safeId] = c.sig;
+    }
+    return ops;
+  };
+
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-  await primeDocMetadataForPaths(
-    ctx,
-    candidates.map((c) => ({
-      docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', c.safeId),
-      path: c.path,
-    })),
-  );
+  await primeDocMetadataForPaths(ctx, primeEntries);
 
-  const batchOps: BatchWriteOp[] = [];
   const nextSignatures = { ...manifest.signatures.attachments };
-  for (const c of candidates) {
-    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, c.path));
-    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
-    const payload = buildCloudAttachmentFilePayload(
-      c.att,
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    if (!payload) continue;
-    const approxBytes = utf8ByteLength(String(payload.dataUrl || '')) + 1024;
-    batchOps.push({
-      type: 'set',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', c.safeId),
-      path: c.path,
-      data: payload,
-      approxBytes,
-    });
-    nextSignatures[c.safeId] = c.sig;
-  }
-
+  const batchOps = buildAttOps(nextSignatures);
   if (batchOps.length === 0) return;
-  await commitWriteBatchOps(ctx, batchOps, {
-    maxOpsPerBatch: 8,
-    maxBytesPerBatch: 3_500_000,
-  });
+
+  try {
+    await commitWriteBatchOps(ctx, batchOps, {
+      maxOpsPerBatch: 8,
+      maxBytesPerBatch: 3_500_000,
+      suppressErrorWrap: true,
+    });
+  } catch (err) {
+    if (!isPermissionDeniedError(err)) {
+      const firstOp = batchOps[0];
+      handleFirestoreError(err, OperationType.WRITE, firstOp?.path ?? null);
+    }
+    await user.getIdToken(true).catch(() => '');
+    await ensureUserRootDocument(user, workspaceTenantId, null, ctx, { forceServerCheck: true });
+    await primeDocMetadataForPaths(ctx, primeEntries, { forceServer: true });
+    const retrySignatures = { ...manifest.signatures.attachments };
+    const retryOps = buildAttOps(retrySignatures);
+    await commitWriteBatchOps(ctx, retryOps, {
+      maxOpsPerBatch: 8,
+      maxBytesPerBatch: 3_500_000,
+    });
+    Object.assign(nextSignatures, retrySignatures);
+  }
 
   for (const c of candidates) {
     syncedAttachmentKeys.add(c.cacheKey);
@@ -1115,29 +1264,29 @@ export async function syncTenderToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-
   const safeId = sanitizeDocId(tender.id);
   const path = `${prefix}/tenders/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId);
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path, kind: 'tender' }]);
-    const docKey = buildDocCacheKey(ctx, path);
-    if (cloudTerminalTenderCache.has(docKey) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
-      return;
-    }
-    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
-    const payload = buildCloudTenderPayload(
-      { ...tender, id: safeId },
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-    await syncAttachmentFilesToCloud(user, tender.attachments, workspaceTenantId, ctx);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
+  const docKey = buildDocCacheKey(ctx, path);
+  if (cloudTerminalTenderCache.has(docKey) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
+    return;
   }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    kind: 'tender',
+    buildPayload: (existingCreatedAt) =>
+      buildCloudTenderPayload(
+        { ...tender, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+  });
+  await syncAttachmentFilesToCloud(user, tender.attachments, workspaceTenantId, ctx);
 }
 
 export async function deleteTenderFromCloud(
@@ -1170,29 +1319,29 @@ export async function syncEmdRecordToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-
   const safeId = sanitizeDocId(record.id);
   const path = `${prefix}/emdRecords/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId);
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path, kind: 'emd' }]);
-    const docKey = buildDocCacheKey(ctx, path);
-    if (cloudTerminalEmdCache.has(docKey) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
-      return;
-    }
-    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
-    const payload = buildCloudEmdPayload(
-      { ...record, id: safeId },
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-    await syncAttachmentFilesToCloud(user, record.attachments, workspaceTenantId, ctx);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
+  const docKey = buildDocCacheKey(ctx, path);
+  if (cloudTerminalEmdCache.has(docKey) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
+    return;
   }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    kind: 'emd',
+    buildPayload: (existingCreatedAt) =>
+      buildCloudEmdPayload(
+        { ...record, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+  });
+  await syncAttachmentFilesToCloud(user, record.attachments, workspaceTenantId, ctx);
 }
 
 export async function deleteEmdRecordFromCloud(
@@ -1225,30 +1374,26 @@ export async function syncMafTrackerToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-
   const safeId = sanitizeDocId(tracker.id);
   const path = `${prefix}/maf_tracker/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-    );
-    const payload = buildCloudMafTrackerPayload(
-      { ...tracker, id: safeId },
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-
-    const inlineMafAttachments = collectDirtyAttachmentsFromEntities({ mafTrackers: [tracker] });
-    if (inlineMafAttachments.length > 0) {
-      await syncAttachmentFilesToCloud(user, inlineMafAttachments, workspaceTenantId, ctx);
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudMafTrackerPayload(
+        { ...tracker, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+  });
+  const inlineMafAttachments = collectDirtyAttachmentsFromEntities({ mafTrackers: [tracker] });
+  if (inlineMafAttachments.length > 0) {
+    await syncAttachmentFilesToCloud(user, inlineMafAttachments, workspaceTenantId, ctx);
   }
 }
 
@@ -1282,25 +1427,23 @@ export async function syncOemRecordToCloud(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
   const safeId = sanitizeDocId(oem.id);
   const path = `${prefix}/oemDetails/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
-  try {
-    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-    );
-    const payload = buildCloudOemPayload(
-      { ...oem, id: safeId },
-      user.uid,
-      serverTimestamp(),
-      existingCreatedAt,
-    );
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await setDocWithPermissionRecovery({
+    user,
+    ctx,
+    workspaceTenantId,
+    docRef: ref,
+    path,
+    buildPayload: (existingCreatedAt) =>
+      buildCloudOemPayload(
+        { ...oem, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+  });
 }
 
 export async function deleteOemRecordFromCloud(
@@ -1434,34 +1577,58 @@ export async function fetchAllFromCloud(
 
   let profile: FirmProfile | null = null;
   if (profileSnap.exists()) {
-    rememberDocMetadata(ctx, profilePath, profileSnap.data());
+    rememberDocMetadata(ctx, profilePath, profileSnap.data(), undefined, {
+      fromPendingWrite: profileSnap.metadata.hasPendingWrites,
+      fromCache: profileSnap.metadata.fromCache,
+    });
     profile = docToProfile(profileSnap.data());
   } else {
-    rememberDocMetadata(ctx, profilePath, null);
+    rememberDocMetadata(ctx, profilePath, null, undefined, {
+      fromPendingWrite: profileSnap.metadata.hasPendingWrites,
+      fromCache: profileSnap.metadata.fromCache,
+    });
   }
 
   let preferences: UserPreferences | null = null;
   if (prefsSnap.exists()) {
-    rememberDocMetadata(ctx, prefsPath, prefsSnap.data());
+    rememberDocMetadata(ctx, prefsPath, prefsSnap.data(), undefined, {
+      fromPendingWrite: prefsSnap.metadata.hasPendingWrites,
+      fromCache: prefsSnap.metadata.fromCache,
+    });
     preferences = docToPreferences(prefsSnap.data());
   } else {
-    rememberDocMetadata(ctx, prefsPath, null);
+    rememberDocMetadata(ctx, prefsPath, null, undefined, {
+      fromPendingWrite: prefsSnap.metadata.hasPendingWrites,
+      fromCache: prefsSnap.metadata.fromCache,
+    });
   }
 
   let emailConfig: EmailAlertSettings | null = null;
   if (emailConfigSnap.exists()) {
-    rememberDocMetadata(ctx, emailConfigPath, emailConfigSnap.data());
+    rememberDocMetadata(ctx, emailConfigPath, emailConfigSnap.data(), undefined, {
+      fromPendingWrite: emailConfigSnap.metadata.hasPendingWrites,
+      fromCache: emailConfigSnap.metadata.fromCache,
+    });
     emailConfig = docToEmailConfig(emailConfigSnap.data());
   } else {
-    rememberDocMetadata(ctx, emailConfigPath, null);
+    rememberDocMetadata(ctx, emailConfigPath, null, undefined, {
+      fromPendingWrite: emailConfigSnap.metadata.hasPendingWrites,
+      fromCache: emailConfigSnap.metadata.fromCache,
+    });
   }
 
   let sheetConfig: GoogleSheetSettings | null = null;
   if (sheetConfigSnap.exists()) {
-    rememberDocMetadata(ctx, sheetConfigPath, sheetConfigSnap.data());
+    rememberDocMetadata(ctx, sheetConfigPath, sheetConfigSnap.data(), undefined, {
+      fromPendingWrite: sheetConfigSnap.metadata.hasPendingWrites,
+      fromCache: sheetConfigSnap.metadata.fromCache,
+    });
     sheetConfig = docToSheetConfig(sheetConfigSnap.data());
   } else {
-    rememberDocMetadata(ctx, sheetConfigPath, null);
+    rememberDocMetadata(ctx, sheetConfigPath, null, undefined, {
+      fromPendingWrite: sheetConfigSnap.metadata.hasPendingWrites,
+      fromCache: sheetConfigSnap.metadata.fromCache,
+    });
   }
 
   const tenders = tenderDocs.map((d) => docToTender(d.data(), d.id));
@@ -2054,235 +2221,299 @@ export async function syncDeltaBatchToCloud(params: {
     }
   }
 
+  const buildDeltaOpsFromCache = () => {
+    const ops: BatchWriteOp[] = [];
+    const upsertedTenders: Tender[] = [];
+    const upsertedEmd: EmdBgRecord[] = [];
+    const upsertedMaf: MafTrackerRecord[] = [];
+    const nextManifest = loadDeltaSyncManifest(scope);
+    const isAdminUser = isBootstrappedAdminUser(user);
+
+    // Singletons
+    for (const singleton of dirty.singletons) {
+      if (singleton === 'profile') {
+        const path = `${prefix}/profile/firm`;
+        const existingCreatedAt = pickValidExistingCreatedAt(
+          cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+        );
+        ops.push({
+          type: 'set',
+          ref: getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm'),
+          path,
+          data: buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt),
+          usedServerCreatedAt: !existingCreatedAt,
+        });
+        nextManifest.signatures.singletons.profile = signatureForProfile(profile);
+      } else if (singleton === 'preferences') {
+        const path = `${prefix}/settings/preferences`;
+        const existingCreatedAt = pickValidExistingCreatedAt(
+          cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+        );
+        ops.push({
+          type: 'set',
+          ref: getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences'),
+          path,
+          data: buildCloudPreferencesPayload(
+            preferences,
+            user.uid,
+            serverTimestamp(),
+            existingCreatedAt,
+          ),
+          usedServerCreatedAt: !existingCreatedAt,
+        });
+        nextManifest.signatures.singletons.preferences = signatureForPreferences(preferences);
+      } else if (singleton === 'emailConfig' && emailConfig) {
+        const path = `${prefix}/emailConfig/default`;
+        const existingCreatedAt = pickValidExistingCreatedAt(
+          cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+        );
+        ops.push({
+          type: 'set',
+          ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default'),
+          path,
+          data: buildCloudEmailConfigPayload(
+            emailConfig,
+            user.uid,
+            serverTimestamp(),
+            existingCreatedAt,
+          ),
+          usedServerCreatedAt: !existingCreatedAt,
+        });
+        nextManifest.signatures.singletons.emailConfig = signatureForEmailConfig(emailConfig);
+      } else if (singleton === 'sheetConfig' && sheetConfig) {
+        const path = `${prefix}/sheetConfig/default`;
+        const existingCreatedAt = pickValidExistingCreatedAt(
+          cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+        );
+        ops.push({
+          type: 'set',
+          ref: getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default'),
+          path,
+          data: buildCloudSheetConfigPayload(
+            sheetConfig,
+            user.uid,
+            serverTimestamp(),
+            existingCreatedAt,
+          ),
+          usedServerCreatedAt: !existingCreatedAt,
+        });
+        nextManifest.signatures.singletons.sheetConfig = signatureForSheetConfig(sheetConfig);
+      }
+    }
+
+    // Tenders upserts + deletes
+    for (const id of dirty.tenders.upserts) {
+      const safeId = sanitizeDocId(id);
+      const tender = tenderById.get(safeId);
+      if (!tender) continue;
+      const path = `${prefix}/tenders/${safeId}`;
+      const docKey = buildDocCacheKey(ctx, path);
+      if (cloudTerminalTenderCache.has(docKey) && !isAdminUser && !ctx.isByoc) {
+        continue;
+      }
+      const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
+        path,
+        data: buildCloudTenderPayload(
+          { ...tender, id: safeId },
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+        usedServerCreatedAt: !existingCreatedAt,
+      });
+      nextManifest.signatures.tenders[safeId] = signatureForTender(tender);
+      upsertedTenders.push(tender);
+    }
+    for (const id of dirty.tenders.deletes) {
+      const safeId = sanitizeDocId(id);
+      const path = `${prefix}/tenders/${safeId}`;
+      const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+      if (docOwner && docOwner !== user.uid) continue;
+      ops.push({
+        type: 'delete',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
+        path,
+      });
+      delete nextManifest.signatures.tenders[safeId];
+    }
+
+    // EMD/BG upserts + deletes
+    for (const id of dirty.emdRecords.upserts) {
+      const safeId = sanitizeDocId(id);
+      const record = emdById.get(safeId);
+      if (!record) continue;
+      const path = `${prefix}/emdRecords/${safeId}`;
+      const docKey = buildDocCacheKey(ctx, path);
+      if (cloudTerminalEmdCache.has(docKey) && !isAdminUser && !ctx.isByoc) {
+        continue;
+      }
+      const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
+        path,
+        data: buildCloudEmdPayload(
+          { ...record, id: safeId },
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+        usedServerCreatedAt: !existingCreatedAt,
+      });
+      nextManifest.signatures.emdRecords[safeId] = signatureForEmd(record);
+      upsertedEmd.push(record);
+    }
+    for (const id of dirty.emdRecords.deletes) {
+      const safeId = sanitizeDocId(id);
+      const path = `${prefix}/emdRecords/${safeId}`;
+      const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+      if (docOwner && docOwner !== user.uid) continue;
+      ops.push({
+        type: 'delete',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
+        path,
+      });
+      delete nextManifest.signatures.emdRecords[safeId];
+    }
+
+    // MAF upserts + deletes
+    for (const id of dirty.mafTrackers.upserts) {
+      const safeId = sanitizeDocId(id);
+      const tracker = mafById.get(safeId);
+      if (!tracker) continue;
+      const path = `${prefix}/maf_tracker/${safeId}`;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+      );
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
+        path,
+        data: buildCloudMafTrackerPayload(
+          { ...tracker, id: safeId },
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+        usedServerCreatedAt: !existingCreatedAt,
+      });
+      nextManifest.signatures.mafTrackers[safeId] = signatureForMaf(tracker);
+      upsertedMaf.push(tracker);
+    }
+    for (const id of dirty.mafTrackers.deletes) {
+      const safeId = sanitizeDocId(id);
+      const path = `${prefix}/maf_tracker/${safeId}`;
+      const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+      if (docOwner && docOwner !== user.uid) continue;
+      ops.push({
+        type: 'delete',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
+        path,
+      });
+      delete nextManifest.signatures.mafTrackers[safeId];
+    }
+
+    // OEM upserts + deletes
+    for (const id of dirty.oemRecords.upserts) {
+      const safeId = sanitizeDocId(id);
+      const oem = oemById.get(safeId);
+      if (!oem) continue;
+      const path = `${prefix}/oemDetails/${safeId}`;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+      );
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
+        path,
+        data: buildCloudOemPayload(
+          { ...oem, id: safeId },
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+        usedServerCreatedAt: !existingCreatedAt,
+      });
+      nextManifest.signatures.oemRecords[safeId] = signatureForOem(oem);
+    }
+    for (const id of dirty.oemRecords.deletes) {
+      const safeId = sanitizeDocId(id);
+      const path = `${prefix}/oemDetails/${safeId}`;
+      const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+      if (docOwner && docOwner !== user.uid) continue;
+      ops.push({
+        type: 'delete',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
+        path,
+      });
+      delete nextManifest.signatures.oemRecords[safeId];
+    }
+
+    return { ops, upsertedTenders, upsertedEmd, upsertedMaf, nextManifest };
+  };
+
   await primeDocMetadataForPaths(ctx, metadataPrimeEntries);
+  let built = buildDeltaOpsFromCache();
 
-  const ops: BatchWriteOp[] = [];
-  const upsertedTenders: Tender[] = [];
-  const upsertedEmd: EmdBgRecord[] = [];
-  const upsertedMaf: MafTrackerRecord[] = [];
-  const isAdminUser = isBootstrappedAdminUser(user);
+  try {
+    await commitWriteBatchOps(ctx, built.ops, { suppressErrorWrap: true });
+  } catch (err) {
+    if (!isPermissionDeniedError(err)) {
+      const firstOp = built.ops[0];
+      handleFirestoreError(
+        err,
+        firstOp?.type === 'delete' ? OperationType.DELETE : OperationType.WRITE,
+        firstOp?.path ?? null,
+      );
+    }
+    // Recover from stale parent user doc or stale createdAt cache by refreshing server metadata & retrying once
+    await user.getIdToken(true).catch(() => '');
+    await ensureUserRootDocument(user, workspaceTenantId, null, ctx, { forceServerCheck: true });
+    await primeDocMetadataForPaths(ctx, metadataPrimeEntries, { forceServer: true });
+    built = buildDeltaOpsFromCache();
 
-  // Singletons
-  for (const singleton of dirty.singletons) {
-    if (singleton === 'profile') {
-      const path = `${prefix}/profile/firm`;
-      const existingCreatedAt = pickValidExistingCreatedAt(
-        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-      );
-      ops.push({
-        type: 'set',
-        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm'),
-        path,
-        data: buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt),
-      });
-      manifest.signatures.singletons.profile = signatureForProfile(profile);
-    } else if (singleton === 'preferences') {
-      const path = `${prefix}/settings/preferences`;
-      const existingCreatedAt = pickValidExistingCreatedAt(
-        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-      );
-      ops.push({
-        type: 'set',
-        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences'),
-        path,
-        data: buildCloudPreferencesPayload(
-          preferences,
-          user.uid,
-          serverTimestamp(),
-          existingCreatedAt,
-        ),
-      });
-      manifest.signatures.singletons.preferences = signatureForPreferences(preferences);
-    } else if (singleton === 'emailConfig' && emailConfig) {
-      const path = `${prefix}/emailConfig/default`;
-      const existingCreatedAt = pickValidExistingCreatedAt(
-        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-      );
-      ops.push({
-        type: 'set',
-        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default'),
-        path,
-        data: buildCloudEmailConfigPayload(
-          emailConfig,
-          user.uid,
-          serverTimestamp(),
-          existingCreatedAt,
-        ),
-      });
-      manifest.signatures.singletons.emailConfig = signatureForEmailConfig(emailConfig);
-    } else if (singleton === 'sheetConfig' && sheetConfig) {
-      const path = `${prefix}/sheetConfig/default`;
-      const existingCreatedAt = pickValidExistingCreatedAt(
-        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-      );
-      ops.push({
-        type: 'set',
-        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default'),
-        path,
-        data: buildCloudSheetConfigPayload(
-          sheetConfig,
-          user.uid,
-          serverTimestamp(),
-          existingCreatedAt,
-        ),
-      });
-      manifest.signatures.singletons.sheetConfig = signatureForSheetConfig(sheetConfig);
+    try {
+      await commitWriteBatchOps(ctx, built.ops, { suppressErrorWrap: true });
+    } catch (retryErr) {
+      if (built.ops.length > 1 && isPermissionDeniedError(retryErr)) {
+        // Isolate valid ops from any single unpermitted doc so unrelated edits still save cleanly
+        let firstFailure: unknown = null;
+        let firstFailedOp: BatchWriteOp | null = null;
+        for (const singleOp of built.ops) {
+          try {
+            await commitWriteBatchOps(ctx, [singleOp], { suppressErrorWrap: true });
+          } catch (singleErr) {
+            if (!firstFailure) {
+              firstFailure = singleErr;
+              firstFailedOp = singleOp;
+            }
+          }
+        }
+        if (firstFailure) {
+          handleFirestoreError(
+            firstFailure,
+            firstFailedOp?.type === 'delete' ? OperationType.DELETE : OperationType.WRITE,
+            firstFailedOp?.path ?? null,
+          );
+        }
+      } else {
+        const firstOp = built.ops[0];
+        handleFirestoreError(
+          retryErr,
+          firstOp?.type === 'delete' ? OperationType.DELETE : OperationType.WRITE,
+          firstOp?.path ?? null,
+        );
+      }
     }
   }
-
-  // Tenders upserts + deletes
-  for (const id of dirty.tenders.upserts) {
-    const safeId = sanitizeDocId(id);
-    const tender = tenderById.get(safeId);
-    if (!tender) continue;
-    const path = `${prefix}/tenders/${safeId}`;
-    const docKey = buildDocCacheKey(ctx, path);
-    if (cloudTerminalTenderCache.has(docKey) && !isAdminUser && !ctx.isByoc) {
-      continue;
-    }
-    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
-    ops.push({
-      type: 'set',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
-      path,
-      data: buildCloudTenderPayload(
-        { ...tender, id: safeId },
-        user.uid,
-        serverTimestamp(),
-        existingCreatedAt,
-      ),
-    });
-    manifest.signatures.tenders[safeId] = signatureForTender(tender);
-    upsertedTenders.push(tender);
-  }
-  for (const id of dirty.tenders.deletes) {
-    const safeId = sanitizeDocId(id);
-    const path = `${prefix}/tenders/${safeId}`;
-    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
-    if (docOwner && docOwner !== user.uid) continue;
-    ops.push({
-      type: 'delete',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
-      path,
-    });
-    delete manifest.signatures.tenders[safeId];
-  }
-
-  // EMD/BG upserts + deletes
-  for (const id of dirty.emdRecords.upserts) {
-    const safeId = sanitizeDocId(id);
-    const record = emdById.get(safeId);
-    if (!record) continue;
-    const path = `${prefix}/emdRecords/${safeId}`;
-    const docKey = buildDocCacheKey(ctx, path);
-    if (cloudTerminalEmdCache.has(docKey) && !isAdminUser && !ctx.isByoc) {
-      continue;
-    }
-    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
-    ops.push({
-      type: 'set',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
-      path,
-      data: buildCloudEmdPayload(
-        { ...record, id: safeId },
-        user.uid,
-        serverTimestamp(),
-        existingCreatedAt,
-      ),
-    });
-    manifest.signatures.emdRecords[safeId] = signatureForEmd(record);
-    upsertedEmd.push(record);
-  }
-  for (const id of dirty.emdRecords.deletes) {
-    const safeId = sanitizeDocId(id);
-    const path = `${prefix}/emdRecords/${safeId}`;
-    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
-    if (docOwner && docOwner !== user.uid) continue;
-    ops.push({
-      type: 'delete',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
-      path,
-    });
-    delete manifest.signatures.emdRecords[safeId];
-  }
-
-  // MAF upserts + deletes
-  for (const id of dirty.mafTrackers.upserts) {
-    const safeId = sanitizeDocId(id);
-    const tracker = mafById.get(safeId);
-    if (!tracker) continue;
-    const path = `${prefix}/maf_tracker/${safeId}`;
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-    );
-    ops.push({
-      type: 'set',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
-      path,
-      data: buildCloudMafTrackerPayload(
-        { ...tracker, id: safeId },
-        user.uid,
-        serverTimestamp(),
-        existingCreatedAt,
-      ),
-    });
-    manifest.signatures.mafTrackers[safeId] = signatureForMaf(tracker);
-    upsertedMaf.push(tracker);
-  }
-  for (const id of dirty.mafTrackers.deletes) {
-    const safeId = sanitizeDocId(id);
-    const path = `${prefix}/maf_tracker/${safeId}`;
-    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
-    if (docOwner && docOwner !== user.uid) continue;
-    ops.push({
-      type: 'delete',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
-      path,
-    });
-    delete manifest.signatures.mafTrackers[safeId];
-  }
-
-  // OEM upserts + deletes
-  for (const id of dirty.oemRecords.upserts) {
-    const safeId = sanitizeDocId(id);
-    const oem = oemById.get(safeId);
-    if (!oem) continue;
-    const path = `${prefix}/oemDetails/${safeId}`;
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
-    );
-    ops.push({
-      type: 'set',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
-      path,
-      data: buildCloudOemPayload(
-        { ...oem, id: safeId },
-        user.uid,
-        serverTimestamp(),
-        existingCreatedAt,
-      ),
-    });
-    manifest.signatures.oemRecords[safeId] = signatureForOem(oem);
-  }
-  for (const id of dirty.oemRecords.deletes) {
-    const safeId = sanitizeDocId(id);
-    const path = `${prefix}/oemDetails/${safeId}`;
-    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
-    if (docOwner && docOwner !== user.uid) continue;
-    ops.push({
-      type: 'delete',
-      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
-      path,
-    });
-    delete manifest.signatures.oemRecords[safeId];
-  }
-
-  await commitWriteBatchOps(ctx, ops);
 
   const dirtyAttachments = collectDirtyAttachmentsFromEntities({
-    tenders: upsertedTenders,
-    emdRecords: upsertedEmd,
-    mafTrackers: upsertedMaf,
+    tenders: built.upsertedTenders,
+    emdRecords: built.upsertedEmd,
+    mafTrackers: built.upsertedMaf,
   });
 
   if (!deferAttachmentsToBackground && dirtyAttachments.length > 0) {
@@ -2290,12 +2521,12 @@ export async function syncDeltaBatchToCloud(params: {
   }
 
   const nowMs = Date.now();
-  manifest.lastSyncedAtMs = nowMs;
-  manifest.lastSyncedIso = new Date(nowMs).toISOString();
-  saveDeltaSyncManifest(manifest);
+  built.nextManifest.lastSyncedAtMs = nowMs;
+  built.nextManifest.lastSyncedIso = new Date(nowMs).toISOString();
+  saveDeltaSyncManifest(built.nextManifest);
 
   return {
-    syncedOps: ops.length,
+    syncedOps: built.ops.length,
     deferredAttachments: deferAttachmentsToBackground ? dirtyAttachments : [],
   };
 }
@@ -2624,10 +2855,16 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'profile', 'firm'),
     (snap) => {
       if (snap.exists()) {
-        rememberDocMetadata(ctx, profilePath, snap.data());
+        rememberDocMetadata(ctx, profilePath, snap.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
         callbacks.onProfile(docToProfile(snap.data()));
       } else {
-        rememberDocMetadata(ctx, profilePath, null);
+        rememberDocMetadata(ctx, profilePath, null, undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
       }
     },
     (error) => {
@@ -2643,10 +2880,16 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'settings', 'preferences'),
     (snap) => {
       if (snap.exists()) {
-        rememberDocMetadata(ctx, prefsPath, snap.data());
+        rememberDocMetadata(ctx, prefsPath, snap.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
         callbacks.onPreferences(docToPreferences(snap.data()));
       } else {
-        rememberDocMetadata(ctx, prefsPath, null);
+        rememberDocMetadata(ctx, prefsPath, null, undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
       }
     },
     (error) => {
@@ -2662,7 +2905,10 @@ export function subscribeToUserCloudData(
     query(getScopedCollection(ctx, uid, scopedTenant, 'tenders'), where('ownerUid', '==', uid)),
     (snap) => {
       for (const d of snap.docs) {
-        rememberDocMetadata(ctx, `${tendersPath}/${d.id}`, d.data(), 'tender');
+        rememberDocMetadata(ctx, `${tendersPath}/${d.id}`, d.data(), 'tender', {
+          fromPendingWrite: snap.metadata.hasPendingWrites || d.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache || d.metadata.fromCache,
+        });
       }
       callbacks.onTenders(snap.docs.map((d) => docToTender(d.data(), d.id)));
     },
@@ -2679,7 +2925,10 @@ export function subscribeToUserCloudData(
     query(getScopedCollection(ctx, uid, scopedTenant, 'emdRecords'), where('ownerUid', '==', uid)),
     (snap) => {
       for (const d of snap.docs) {
-        rememberDocMetadata(ctx, `${emdPath}/${d.id}`, d.data(), 'emd');
+        rememberDocMetadata(ctx, `${emdPath}/${d.id}`, d.data(), 'emd', {
+          fromPendingWrite: snap.metadata.hasPendingWrites || d.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache || d.metadata.fromCache,
+        });
       }
       callbacks.onEmdRecords(snap.docs.map((d) => docToEmdRecord(d.data(), d.id)));
     },
@@ -2696,7 +2945,10 @@ export function subscribeToUserCloudData(
     query(getScopedCollection(ctx, uid, scopedTenant, 'maf_tracker'), where('ownerUid', '==', uid)),
     (snap) => {
       for (const d of snap.docs) {
-        rememberDocMetadata(ctx, `${mafPath}/${d.id}`, d.data());
+        rememberDocMetadata(ctx, `${mafPath}/${d.id}`, d.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites || d.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache || d.metadata.fromCache,
+        });
       }
       callbacks.onMafTrackers(snap.docs.map((d) => docToMafTracker(d.data(), d.id)));
     },
@@ -2713,7 +2965,10 @@ export function subscribeToUserCloudData(
     query(getScopedCollection(ctx, uid, scopedTenant, 'oemDetails'), where('ownerUid', '==', uid)),
     (snap) => {
       for (const d of snap.docs) {
-        rememberDocMetadata(ctx, `${oemPath}/${d.id}`, d.data());
+        rememberDocMetadata(ctx, `${oemPath}/${d.id}`, d.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites || d.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache || d.metadata.fromCache,
+        });
       }
       if (callbacks.onOemRecords) {
         const list = snap.docs
@@ -2743,7 +2998,10 @@ export function subscribeToUserCloudData(
           (snap) => {
             const map = new Map<string, string>();
             for (const d of snap.docs) {
-              rememberDocMetadata(ctx, `${filesPath}/${d.id}`, d.data());
+              rememberDocMetadata(ctx, `${filesPath}/${d.id}`, d.data(), undefined, {
+                fromPendingWrite: snap.metadata.hasPendingWrites || d.metadata.hasPendingWrites,
+                fromCache: snap.metadata.fromCache || d.metadata.fromCache,
+              });
               const data = d.data();
               if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
                 map.set(String(data.id ?? d.id), data.dataUrl);
@@ -2765,7 +3023,10 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'emailConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onEmailConfig) {
-        rememberDocMetadata(ctx, emailConfigPath, snap.data());
+        rememberDocMetadata(ctx, emailConfigPath, snap.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
         callbacks.onEmailConfig(docToEmailConfig(snap.data()));
       }
     },
@@ -2782,7 +3043,10 @@ export function subscribeToUserCloudData(
     query(getScopedCollection(ctx, uid, scopedTenant, 'emailAlerts'), where('ownerUid', '==', uid)),
     (snap) => {
       for (const d of snap.docs) {
-        rememberDocMetadata(ctx, `${emailAlertsPath}/${d.id}`, d.data());
+        rememberDocMetadata(ctx, `${emailAlertsPath}/${d.id}`, d.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites || d.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache || d.metadata.fromCache,
+        });
       }
       if (callbacks.onEmailAlerts) {
         const sorted = snap.docs
@@ -2804,7 +3068,10 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'sheetConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onSheetConfig) {
-        rememberDocMetadata(ctx, sheetConfigPath, snap.data());
+        rememberDocMetadata(ctx, sheetConfigPath, snap.data(), undefined, {
+          fromPendingWrite: snap.metadata.hasPendingWrites,
+          fromCache: snap.metadata.fromCache,
+        });
         callbacks.onSheetConfig(docToSheetConfig(snap.data()));
       }
     },

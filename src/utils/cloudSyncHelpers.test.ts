@@ -640,6 +640,55 @@ test('cloud builders normalize legacy enums, guard blank strings, and clamp mult
   assert.equal(emailCfgPayload.recipientEmail, 'alerts@example.com');
 });
 
+test('tnd-11-23 tender payload preserves valid Timestamp createdAt and passes all 40 firestore.rules key invariants', () => {
+  const serverCreatedTimestamp = { seconds: 1795400000, nanoseconds: 123000000 };
+  const tender: Tender = {
+    id: 'tnd-11-23',
+    tenderId: 'GEM/2026/B/8270880',
+    portal: 'GeM',
+    clientName: 'Defence Unit',
+    department: 'Ministry of Defence',
+    locationDepartment: 'Jaipur / Defence',
+    location: 'Jaipur',
+    category: 'Access Control',
+    title: 'Access Control System',
+    publishDate: '2026-11-12',
+    submissionDueDate: '2026-11-23T14:00',
+    preBidDate: '',
+    technicalOpeningDate: '',
+    financialOpeningDate: '',
+    estimatedValue: 500000,
+    quotedValue: 480000,
+    l1BidderName: '',
+    l1QuotedValue: 0,
+    ourPositionRank: '',
+    assignedOwner: 'Vansh Saxena',
+    emdStatus: 'Exempted - MSME/Startup',
+    emdAmount: 0,
+    stage: 'Identified / Reviewing',
+    resultInfo: 'Ongoing',
+    completionDate: '',
+    checklist: [],
+    remarks: [],
+    attachments: [],
+    createdAt: '2026-11-23T08:00:00.000Z',
+    updatedAt: '2026-11-24T10:33:00.000Z',
+  };
+
+  const payload = buildCloudTenderPayload(
+    tender,
+    'JdizphoE56bNDu7OPtS4WZxrb0H2',
+    TOKEN,
+    serverCreatedTimestamp,
+  );
+  assert.equal(payload.id, 'tnd-11-23');
+  assert.equal(payload.ownerUid, 'JdizphoE56bNDu7OPtS4WZxrb0H2');
+  assert.equal(payload.createdAt, serverCreatedTimestamp);
+  assert.equal(payload.updatedAt, TOKEN);
+  assert.equal(Object.keys(payload).length, 40);
+});
+
+
 
 
 

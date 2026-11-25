@@ -351,3 +351,103 @@ test('timestamp skew buffer, legacy scan TTL, and missing-index fallback helpers
   );
   assert.equal(shouldFallbackFromMissingIndex(new Error('permission-denied')), false);
 });
+
+test('mergeDirtySnapshots, subtractDirtySnapshots, and hasDirtyOperations manage failed retry sets cleanly', async () => {
+  const {
+    createEmptyDirtySnapshot,
+    hasDirtyOperations,
+    mergeDirtySnapshots,
+    subtractDirtySnapshots,
+  } = await import('./deltaSync.ts');
+
+  const empty = createEmptyDirtySnapshot();
+  assert.equal(hasDirtyOperations(empty), false);
+
+  const failed = {
+    ...empty,
+    tenders: { upserts: ['tnd-11-23'], deletes: [] },
+    singletons: ['profile' as const],
+  };
+  const newer = {
+    ...empty,
+    tenders: { upserts: ['tnd-11-24'], deletes: ['tnd-11-23'] },
+    singletons: ['sheetConfig' as const],
+  };
+
+  const merged = mergeDirtySnapshots(failed, newer);
+  assert.equal(hasDirtyOperations(merged), true);
+  assert.deepEqual(merged.tenders.upserts, ['tnd-11-24']);
+  assert.deepEqual(merged.tenders.deletes, ['tnd-11-23']);
+  assert.deepEqual(merged.singletons.sort(), ['profile', 'sheetConfig']);
+
+  const partialDone = {
+    ...empty,
+    tenders: { upserts: [], deletes: ['tnd-11-23'] },
+    singletons: ['sheetConfig' as const],
+  };
+  const remaining = subtractDirtySnapshots(merged, partialDone);
+  assert.deepEqual(remaining.tenders.upserts, ['tnd-11-24']);
+  assert.deepEqual(remaining.tenders.deletes, []);
+  assert.deepEqual(remaining.singletons, ['profile']);
+});
+
+test('reconcileRemoteRecordsWithPendingLocal prevents Firestore rollback/snapshot from overwriting unsaved local edits or resurrecting deletes', async () => {
+  const { reconcileRemoteRecordsWithPendingLocal } = await import('./deltaSync.ts');
+
+  const remote = [
+    makeTender('t1', 'Old Server Title 1'),
+    makeTender('t2', 'Server Title 2'),
+    makeTender('t3', 'Deleted Locally On Server'),
+  ];
+  const local = [
+    makeTender('tnd-new-local', 'Brand New Unsynced Tender'),
+    makeTender('t1', 'Edited Local Title 1'),
+    makeTender('t2', 'Server Title 2'),
+  ];
+
+  const reconciled = reconcileRemoteRecordsWithPendingLocal({
+    remoteRecords: remote,
+    currentLocalRecords: local,
+    pendingUpsertIds: new Set(['t1', 'tnd-new-local']),
+    pendingDeleteIds: new Set(['t3']),
+  });
+
+  assert.deepEqual(
+    reconciled.map((t) => t.id),
+    ['tnd-new-local', 't1', 't2'],
+  );
+  assert.equal(reconciled.find((t) => t.id === 't1')?.title, 'Edited Local Title 1');
+  assert.equal(reconciled.some((t) => t.id === 't3'), false);
+});
+
+test('scheduler.getProtectedSnapshot exposes in-flight ops until onFlush finishes', async () => {
+  let releaseFlush!: () => void;
+  const flushBlocked = new Promise<void>((resolve) => {
+    releaseFlush = resolve;
+  });
+
+  const scheduler = createDebouncedDeltaScheduler({
+    debounceMs: 20,
+    maxWaitMs: 60,
+    onFlush: async () => {
+      await flushBlocked;
+    },
+  });
+
+  scheduler.markUpsert('tenders', 'tnd-11-23');
+  const flushPromise = scheduler.flush();
+  await new Promise((r) => setTimeout(r, 10));
+
+  // While onFlush is awaiting network, buffer is empty but getProtectedSnapshot protects tnd-11-23
+  assert.equal(scheduler.hasPending(), false);
+  assert.deepEqual(scheduler.getProtectedSnapshot().tenders.upserts, ['tnd-11-23']);
+
+  // Another edit arrives mid-flight -> both are protected
+  scheduler.markSingleton('sheetConfig');
+  assert.deepEqual(scheduler.getProtectedSnapshot().singletons, ['sheetConfig']);
+
+  releaseFlush();
+  await flushPromise;
+  scheduler.dispose();
+});
+

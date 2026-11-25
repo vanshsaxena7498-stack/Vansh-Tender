@@ -496,9 +496,149 @@ export interface DebouncedSyncScheduler {
   markSingleton: (singleton: DeltaSingletonKey) => void;
   hasPending: () => boolean;
   peekSnapshot: () => DirtySyncSnapshot;
+  getProtectedSnapshot: () => DirtySyncSnapshot;
   flush: () => Promise<void>;
   clear: () => void;
   dispose: () => void;
+}
+
+export function createEmptyDirtySnapshot(): DirtySyncSnapshot {
+  return {
+    tenders: { upserts: [], deletes: [] },
+    emdRecords: { upserts: [], deletes: [] },
+    mafTrackers: { upserts: [], deletes: [] },
+    oemRecords: { upserts: [], deletes: [] },
+    singletons: [],
+  };
+}
+
+export function hasDirtyOperations(snapshot: DirtySyncSnapshot): boolean {
+  if (snapshot.singletons.length > 0) return true;
+  return (
+    snapshot.tenders.upserts.length > 0 ||
+    snapshot.tenders.deletes.length > 0 ||
+    snapshot.emdRecords.upserts.length > 0 ||
+    snapshot.emdRecords.deletes.length > 0 ||
+    snapshot.mafTrackers.upserts.length > 0 ||
+    snapshot.mafTrackers.deletes.length > 0 ||
+    snapshot.oemRecords.upserts.length > 0 ||
+    snapshot.oemRecords.deletes.length > 0
+  );
+}
+
+function mergeEntityPair(
+  older: { upserts: string[]; deletes: string[] },
+  newer: { upserts: string[]; deletes: string[] },
+): { upserts: string[]; deletes: string[] } {
+  const upserts = new Set(older.upserts);
+  const deletes = new Set(older.deletes);
+  for (const id of newer.upserts) {
+    deletes.delete(id);
+    upserts.add(id);
+  }
+  for (const id of newer.deletes) {
+    upserts.delete(id);
+    deletes.add(id);
+  }
+  return {
+    upserts: Array.from(upserts),
+    deletes: Array.from(deletes),
+  };
+}
+
+export function mergeDirtySnapshots(
+  older: DirtySyncSnapshot,
+  newer: DirtySyncSnapshot,
+): DirtySyncSnapshot {
+  return {
+    tenders: mergeEntityPair(older.tenders, newer.tenders),
+    emdRecords: mergeEntityPair(older.emdRecords, newer.emdRecords),
+    mafTrackers: mergeEntityPair(older.mafTrackers, newer.mafTrackers),
+    oemRecords: mergeEntityPair(older.oemRecords, newer.oemRecords),
+    singletons: Array.from(new Set([...older.singletons, ...newer.singletons])),
+  };
+}
+
+export function subtractDirtySnapshots(
+  target: DirtySyncSnapshot,
+  committed: DirtySyncSnapshot,
+): DirtySyncSnapshot {
+  const subtractPair = (
+    src: { upserts: string[]; deletes: string[] },
+    done: { upserts: string[]; deletes: string[] },
+  ) => {
+    const doneUpserts = new Set(done.upserts);
+    const doneDeletes = new Set(done.deletes);
+    return {
+      upserts: src.upserts.filter((id) => !doneUpserts.has(id)),
+      deletes: src.deletes.filter((id) => !doneDeletes.has(id)),
+    };
+  };
+  const committedSingletons = new Set(committed.singletons);
+  return {
+    tenders: subtractPair(target.tenders, committed.tenders),
+    emdRecords: subtractPair(target.emdRecords, committed.emdRecords),
+    mafTrackers: subtractPair(target.mafTrackers, committed.mafTrackers),
+    oemRecords: subtractPair(target.oemRecords, committed.oemRecords),
+    singletons: target.singletons.filter((s) => !committedSingletons.has(s)),
+  };
+}
+
+/**
+ * Reconciles incoming remote snapshot records against locally edited / pending / failed records
+ * so Firestore snapshots (including rollback events or mid-debounce updates) never overwrite
+ * or delete an unsaved local edit.
+ */
+export function reconcileRemoteRecordsWithPendingLocal<T extends { id: string }>(params: {
+  remoteRecords: readonly T[];
+  currentLocalRecords: readonly T[];
+  pendingUpsertIds: ReadonlySet<string>;
+  pendingDeleteIds: ReadonlySet<string>;
+}): T[] {
+  const { remoteRecords, currentLocalRecords, pendingUpsertIds, pendingDeleteIds } = params;
+  if (pendingUpsertIds.size === 0 && pendingDeleteIds.size === 0) {
+    return [...remoteRecords];
+  }
+
+  const localBySafeId = new Map<string, T>();
+  for (const item of currentLocalRecords) {
+    if (!item?.id) continue;
+    localBySafeId.set(sanitizeDocId(item.id), item);
+  }
+
+  const result: T[] = [];
+  const seenSafeIds = new Set<string>();
+
+  for (const remoteItem of remoteRecords) {
+    if (!remoteItem?.id) continue;
+    const safeId = sanitizeDocId(remoteItem.id);
+    if (pendingDeleteIds.has(safeId)) {
+      continue;
+    }
+    seenSafeIds.add(safeId);
+    if (pendingUpsertIds.has(safeId)) {
+      const localVersion = localBySafeId.get(safeId);
+      if (localVersion) {
+        result.push(localVersion);
+        continue;
+      }
+    }
+    result.push(remoteItem);
+  }
+
+  // Prepend newly created local items that haven't landed on the server snapshot yet
+  const newLocalItems: T[] = [];
+  for (const localItem of currentLocalRecords) {
+    if (!localItem?.id) continue;
+    const safeId = sanitizeDocId(localItem.id);
+    if (pendingDeleteIds.has(safeId) || seenSafeIds.has(safeId)) continue;
+    if (pendingUpsertIds.has(safeId)) {
+      seenSafeIds.add(safeId);
+      newLocalItems.push(localItem);
+    }
+  }
+
+  return newLocalItems.length > 0 ? [...newLocalItems, ...result] : result;
 }
 
 export function createDebouncedDeltaScheduler(params: {
@@ -521,6 +661,7 @@ export function createDebouncedDeltaScheduler(params: {
   let maxWaitTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   let activeFlushPromise: Promise<void> | null = null;
+  let inFlightSnapshot: DirtySyncSnapshot | null = null;
 
   const hasPending = (): boolean => {
     if (singletons.size > 0) return true;
@@ -556,6 +697,11 @@ export function createDebouncedDeltaScheduler(params: {
     singletons: Array.from(singletons),
   });
 
+  const getProtectedSnapshot = (): DirtySyncSnapshot => {
+    const queued = peekSnapshot();
+    return inFlightSnapshot ? mergeDirtySnapshots(inFlightSnapshot, queued) : queued;
+  };
+
   const clearTimers = () => {
     if (debounceTimer !== null) {
       clearTimeout(debounceTimer);
@@ -583,7 +729,12 @@ export function createDebouncedDeltaScheduler(params: {
     while (!disposed) {
       const snap = drainSnapshot();
       if (!snap) break;
-      await params.onFlush(snap);
+      inFlightSnapshot = snap;
+      try {
+        await params.onFlush(snap);
+      } finally {
+        inFlightSnapshot = null;
+      }
     }
   };
 
@@ -638,9 +789,11 @@ export function createDebouncedDeltaScheduler(params: {
     },
     hasPending,
     peekSnapshot,
+    getProtectedSnapshot,
     flush,
     clear() {
       clearTimers();
+      inFlightSnapshot = null;
       for (const key of Object.keys(buffers) as DeltaEntityCollectionKey[]) {
         buffers[key].upserts.clear();
         buffers[key].deletes.clear();
@@ -650,6 +803,7 @@ export function createDebouncedDeltaScheduler(params: {
     dispose() {
       disposed = true;
       clearTimers();
+      inFlightSnapshot = null;
       for (const key of Object.keys(buffers) as DeltaEntityCollectionKey[]) {
         buffers[key].upserts.clear();
         buffers[key].deletes.clear();

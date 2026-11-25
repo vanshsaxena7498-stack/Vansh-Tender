@@ -120,18 +120,25 @@ import {
   mergeCloudMafTrackersWithFiles,
   mergeCloudProfileWithLocal,
   mergeCloudTendersWithFiles,
+  sanitizeDocId,
 } from './utils/cloudSyncHelpers';
 import {
   buildDeltaSyncScopeKey,
   collectMissingAttachmentIds,
   createDebouncedDeltaScheduler,
+  createEmptyDirtySnapshot,
   DEFAULT_SYNC_DEBOUNCE_MS,
   DEFAULT_SYNC_MAX_WAIT_MS,
+  hasDirtyOperations,
   isLegacyFallbackScanDue,
   loadDeltaSyncManifest,
+  mergeDirtySnapshots,
+  reconcileRemoteRecordsWithPendingLocal,
+  subtractDirtySnapshots,
   type DebouncedSyncScheduler,
   type DeltaEntityCollectionKey,
   type DeltaSingletonKey,
+  type DirtySyncSnapshot,
 } from './utils/deltaSync';
 import {
   buildTenderEmailMessage,
@@ -430,6 +437,26 @@ export default function App() {
   const cloudWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const backgroundAttachmentTaskSeqRef = useRef<number>(0);
   const deltaSchedulerRef = useRef<DebouncedSyncScheduler | null>(null);
+  const failedDirtyRef = useRef<DirtySyncSnapshot>(createEmptyDirtySnapshot());
+
+  const getPendingEntityIds = (
+    collection: DeltaEntityCollectionKey,
+  ): { upsertIds: Set<string>; deleteIds: Set<string> } => {
+    const active = deltaSchedulerRef.current?.getProtectedSnapshot() ?? createEmptyDirtySnapshot();
+    const combined = mergeDirtySnapshots(failedDirtyRef.current, active);
+    return {
+      upsertIds: new Set(combined[collection].upserts.map((id) => sanitizeDocId(id))),
+      deleteIds: new Set(combined[collection].deletes.map((id) => sanitizeDocId(id))),
+    };
+  };
+
+  const isSingletonPending = (singleton: DeltaSingletonKey): boolean => {
+    const active = deltaSchedulerRef.current?.getProtectedSnapshot() ?? createEmptyDirtySnapshot();
+    return (
+      failedDirtyRef.current.singletons.includes(singleton) ||
+      active.singletons.includes(singleton)
+    );
+  };
 
   const beginCloudSync = () => {
     activeCloudSyncCountRef.current += 1;
@@ -717,6 +744,9 @@ export default function App() {
         if (curState.currentUser?.role === 'secondary' && !target.isByoc) return;
         if (localWorkspaceClearedRef.current) return;
 
+        const effectiveDirty = mergeDirtySnapshots(failedDirtyRef.current, dirty);
+        if (!hasDirtyOperations(effectiveDirty)) return;
+
         // Capture snapshot synchronously so rapid logout/account-switch flushes preserve exact user/target/data
         const snapshot = {
           user,
@@ -737,7 +767,7 @@ export default function App() {
           const result = await enqueueCloudOperation(() =>
             syncDeltaBatchToCloud({
               user: snapshot.user,
-              dirty,
+              dirty: effectiveDirty,
               tenders: snapshot.tenders,
               emdRecords: snapshot.emdRecords,
               mafTrackers: snapshot.mafTrackers,
@@ -751,8 +781,14 @@ export default function App() {
               deferAttachmentsToBackground: true,
             }),
           );
+          failedDirtyRef.current = subtractDirtySnapshots(
+            failedDirtyRef.current,
+            effectiveDirty,
+          );
           markSyncedNow();
-          setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+          if (!hasDirtyOperations(failedDirtyRef.current)) {
+            setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+          }
 
           // Upload heavy base64 attachment payloads asynchronously in background without blocking UI
           if (result.deferredAttachments.length > 0) {
@@ -781,6 +817,7 @@ export default function App() {
             }, 40);
           }
         } catch (err) {
+          failedDirtyRef.current = mergeDirtySnapshots(failedDirtyRef.current, effectiveDirty);
           setCloudFeedback({
             type: 'err',
             msg: formatCloudErrorMessage(err, snapshot.target.projectId, snapshot.target.databaseId),
@@ -967,15 +1004,17 @@ export default function App() {
                 combined.oemRecords.length > 0;
               if (fallbackHasData) {
                 attachmentFilesRef.current = combined.attachmentFiles;
-                if (combined.profile) {
+                if (combined.profile && !isSingletonPending('profile')) {
                   setFirmProfile((prev) => mergeCloudProfileWithLocal(combined.profile!, prev));
                 }
-                if (combined.preferences) {
+                if (combined.preferences && !isSingletonPending('preferences')) {
                   setAdminPin(combined.preferences.adminPin);
                   setDarkMode(combined.preferences.darkMode);
                 }
-                if (combined.emailConfig) setEmailSettings(combined.emailConfig);
-                if (combined.sheetConfig) {
+                if (combined.emailConfig && !isSingletonPending('emailConfig')) {
+                  setEmailSettings(combined.emailConfig);
+                }
+                if (combined.sheetConfig && !isSingletonPending('sheetConfig')) {
                   setSheetSettings(combined.sheetConfig);
                   setSheetSyncStatus(
                     combined.sheetConfig.webhookUrl
@@ -988,20 +1027,65 @@ export default function App() {
                 if (combined.emailAlerts.length > 0) {
                   setEmailLogs((prev) => mergeEmailLogs(combined.emailAlerts, prev));
                 }
-                setTenders((prev) =>
-                  mergeCloudTendersWithFiles(combined.tenders, combined.attachmentFiles, prev),
-                );
-                setEmdRecords((prev) =>
-                  mergeCloudEmdWithFiles(combined.emdRecords, combined.attachmentFiles, prev),
-                );
-                if (combined.mafTrackers.length > 0) {
-                  setMafTrackers((prev) =>
-                    mergeCloudMafTrackersWithFiles(combined.mafTrackers, combined.attachmentFiles, prev),
+                setTenders((prev) => {
+                  const { upsertIds, deleteIds } = getPendingEntityIds('tenders');
+                  const merged = mergeCloudTendersWithFiles(
+                    combined.tenders,
+                    combined.attachmentFiles,
+                    prev,
                   );
+                  return reconcileRemoteRecordsWithPendingLocal({
+                    remoteRecords: merged,
+                    currentLocalRecords: prev,
+                    pendingUpsertIds: upsertIds,
+                    pendingDeleteIds: deleteIds,
+                  });
+                });
+                setEmdRecords((prev) => {
+                  const { upsertIds, deleteIds } = getPendingEntityIds('emdRecords');
+                  const merged = mergeCloudEmdWithFiles(
+                    combined.emdRecords,
+                    combined.attachmentFiles,
+                    prev,
+                  );
+                  return reconcileRemoteRecordsWithPendingLocal({
+                    remoteRecords: merged,
+                    currentLocalRecords: prev,
+                    pendingUpsertIds: upsertIds,
+                    pendingDeleteIds: deleteIds,
+                  });
+                });
+                if (combined.mafTrackers.length > 0) {
+                  setMafTrackers((prev) => {
+                    const { upsertIds, deleteIds } = getPendingEntityIds('mafTrackers');
+                    const merged = mergeCloudMafTrackersWithFiles(
+                      combined.mafTrackers,
+                      combined.attachmentFiles,
+                      prev,
+                    );
+                    return reconcileRemoteRecordsWithPendingLocal({
+                      remoteRecords: merged,
+                      currentLocalRecords: prev,
+                      pendingUpsertIds: upsertIds,
+                      pendingDeleteIds: deleteIds,
+                    });
+                  });
                 }
-                if (combined.oemRecords.length > 0) setOemRecords(combined.oemRecords);
+                if (combined.oemRecords.length > 0) {
+                  setOemRecords((prev) => {
+                    const { upsertIds, deleteIds } = getPendingEntityIds('oemRecords');
+                    return reconcileRemoteRecordsWithPendingLocal({
+                      remoteRecords: combined.oemRecords,
+                      currentLocalRecords: prev,
+                      pendingUpsertIds: upsertIds,
+                      pendingDeleteIds: deleteIds,
+                    });
+                  });
+                }
                 markSyncedNow();
-                setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+                if (!hasDirtyOperations(failedDirtyRef.current)) {
+                  setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+                }
                 return combined;
               }
             }
@@ -1044,17 +1128,17 @@ export default function App() {
             return null;
           }
 
-          if (cloud.profile) {
+          if (cloud.profile && !isSingletonPending('profile')) {
             setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
           }
-          if (cloud.preferences) {
+          if (cloud.preferences && !isSingletonPending('preferences')) {
             setAdminPin(cloud.preferences.adminPin);
             setDarkMode(cloud.preferences.darkMode);
           }
-          if (cloud.emailConfig) {
+          if (cloud.emailConfig && !isSingletonPending('emailConfig')) {
             setEmailSettings(cloud.emailConfig);
           }
-          if (cloud.sheetConfig) {
+          if (cloud.sheetConfig && !isSingletonPending('sheetConfig')) {
             setSheetSettings(cloud.sheetConfig);
             setSheetSyncStatus(
               cloud.sheetConfig.webhookUrl
@@ -1067,22 +1151,65 @@ export default function App() {
           if (cloud.emailAlerts.length > 0) {
             setEmailLogs((prev) => mergeEmailLogs(cloud.emailAlerts, prev));
           }
-          setTenders((prev) =>
-            mergeCloudTendersWithFiles(cloud.tenders, attachmentFilesRef.current, prev),
-          );
-          setEmdRecords((prev) =>
-            mergeCloudEmdWithFiles(cloud.emdRecords, attachmentFilesRef.current, prev),
-          );
-          if (cloud.mafTrackers.length > 0) {
-            setMafTrackers((prev) =>
-              mergeCloudMafTrackersWithFiles(cloud.mafTrackers, attachmentFilesRef.current, prev),
+          setTenders((prev) => {
+            const { upsertIds, deleteIds } = getPendingEntityIds('tenders');
+            const merged = mergeCloudTendersWithFiles(
+              cloud.tenders,
+              attachmentFilesRef.current,
+              prev,
             );
+            return reconcileRemoteRecordsWithPendingLocal({
+              remoteRecords: merged,
+              currentLocalRecords: prev,
+              pendingUpsertIds: upsertIds,
+              pendingDeleteIds: deleteIds,
+            });
+          });
+          setEmdRecords((prev) => {
+            const { upsertIds, deleteIds } = getPendingEntityIds('emdRecords');
+            const merged = mergeCloudEmdWithFiles(
+              cloud.emdRecords,
+              attachmentFilesRef.current,
+              prev,
+            );
+            return reconcileRemoteRecordsWithPendingLocal({
+              remoteRecords: merged,
+              currentLocalRecords: prev,
+              pendingUpsertIds: upsertIds,
+              pendingDeleteIds: deleteIds,
+            });
+          });
+          if (cloud.mafTrackers.length > 0) {
+            setMafTrackers((prev) => {
+              const { upsertIds, deleteIds } = getPendingEntityIds('mafTrackers');
+              const merged = mergeCloudMafTrackersWithFiles(
+                cloud.mafTrackers,
+                attachmentFilesRef.current,
+                prev,
+              );
+              return reconcileRemoteRecordsWithPendingLocal({
+                remoteRecords: merged,
+                currentLocalRecords: prev,
+                pendingUpsertIds: upsertIds,
+                pendingDeleteIds: deleteIds,
+              });
+            });
           }
           if (cloud.oemRecords.length > 0) {
-            setOemRecords(cloud.oemRecords);
+            setOemRecords((prev) => {
+              const { upsertIds, deleteIds } = getPendingEntityIds('oemRecords');
+              return reconcileRemoteRecordsWithPendingLocal({
+                remoteRecords: cloud.oemRecords,
+                currentLocalRecords: prev,
+                pendingUpsertIds: upsertIds,
+                pendingDeleteIds: deleteIds,
+              });
+            });
           }
           markSyncedNow();
-          setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+          if (!hasDirtyOperations(failedDirtyRef.current)) {
+            setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+          }
           return cloud;
         });
         if (cancelled) return;
@@ -1193,25 +1320,33 @@ export default function App() {
           cloudUid,
           {
             onProfile: (remoteProfile) => {
-              setFirmProfile((prev) => mergeCloudProfileWithLocal(remoteProfile, prev));
+              if (!isSingletonPending('profile')) {
+                setFirmProfile((prev) => mergeCloudProfileWithLocal(remoteProfile, prev));
+              }
               markSyncedNow();
             },
             onPreferences: (remotePrefs) => {
-              setAdminPin(remotePrefs.adminPin);
-              setDarkMode(remotePrefs.darkMode);
+              if (!isSingletonPending('preferences')) {
+                setAdminPin(remotePrefs.adminPin);
+                setDarkMode(remotePrefs.darkMode);
+              }
               markSyncedNow();
             },
             onEmailConfig: (remoteConfig) => {
-              setEmailSettings(remoteConfig);
+              if (!isSingletonPending('emailConfig')) {
+                setEmailSettings(remoteConfig);
+              }
               markSyncedNow();
             },
             onSheetConfig: (remoteSheetConfig) => {
-              setSheetSettings(remoteSheetConfig);
-              setSheetSyncStatus((prev) => {
-                if (prev === 'syncing') return prev;
-                if (!remoteSheetConfig.webhookUrl) return 'unconfigured';
-                return remoteSheetConfig.lastSyncedAt ? 'synced' : 'idle';
-              });
+              if (!isSingletonPending('sheetConfig')) {
+                setSheetSettings(remoteSheetConfig);
+                setSheetSyncStatus((prev) => {
+                  if (prev === 'syncing') return prev;
+                  if (!remoteSheetConfig.webhookUrl) return 'unconfigured';
+                  return remoteSheetConfig.lastSyncedAt ? 'synced' : 'idle';
+                });
+              }
               markSyncedNow();
             },
             onEmailAlerts: (remoteLogs) => {
@@ -1226,9 +1361,20 @@ export default function App() {
               const combinedTenders = isAdminSession
                 ? mergeAdminRecordsById(remoteTenders, adminSupplementalRef.current.tenders)
                 : remoteTenders;
-              setTenders((prev) =>
-                mergeCloudTendersWithFiles(combinedTenders, attachmentFilesRef.current, prev),
-              );
+              setTenders((prev) => {
+                const { upsertIds, deleteIds } = getPendingEntityIds('tenders');
+                const merged = mergeCloudTendersWithFiles(
+                  combinedTenders,
+                  attachmentFilesRef.current,
+                  prev,
+                );
+                return reconcileRemoteRecordsWithPendingLocal({
+                  remoteRecords: merged,
+                  currentLocalRecords: prev,
+                  pendingUpsertIds: upsertIds,
+                  pendingDeleteIds: deleteIds,
+                });
+              });
               scheduleBackgroundAttachmentHydration({
                 cloudUid,
                 tenantId: activeTenantId,
@@ -1245,9 +1391,20 @@ export default function App() {
               const combinedEmd = isAdminSession
                 ? mergeAdminRecordsById(remoteEmd, adminSupplementalRef.current.emdRecords)
                 : remoteEmd;
-              setEmdRecords((prev) =>
-                mergeCloudEmdWithFiles(combinedEmd, attachmentFilesRef.current, prev),
-              );
+              setEmdRecords((prev) => {
+                const { upsertIds, deleteIds } = getPendingEntityIds('emdRecords');
+                const merged = mergeCloudEmdWithFiles(
+                  combinedEmd,
+                  attachmentFilesRef.current,
+                  prev,
+                );
+                return reconcileRemoteRecordsWithPendingLocal({
+                  remoteRecords: merged,
+                  currentLocalRecords: prev,
+                  pendingUpsertIds: upsertIds,
+                  pendingDeleteIds: deleteIds,
+                });
+              });
               scheduleBackgroundAttachmentHydration({
                 cloudUid,
                 tenantId: activeTenantId,
@@ -1264,9 +1421,20 @@ export default function App() {
               const combinedMaf = isAdminSession
                 ? mergeAdminRecordsById(remoteMaf, adminSupplementalRef.current.mafTrackers)
                 : remoteMaf;
-              setMafTrackers((prev) =>
-                mergeCloudMafTrackersWithFiles(combinedMaf, attachmentFilesRef.current, prev),
-              );
+              setMafTrackers((prev) => {
+                const { upsertIds, deleteIds } = getPendingEntityIds('mafTrackers');
+                const merged = mergeCloudMafTrackersWithFiles(
+                  combinedMaf,
+                  attachmentFilesRef.current,
+                  prev,
+                );
+                return reconcileRemoteRecordsWithPendingLocal({
+                  remoteRecords: merged,
+                  currentLocalRecords: prev,
+                  pendingUpsertIds: upsertIds,
+                  pendingDeleteIds: deleteIds,
+                });
+              });
               scheduleBackgroundAttachmentHydration({
                 cloudUid,
                 tenantId: activeTenantId,
@@ -1284,7 +1452,15 @@ export default function App() {
                 ? mergeAdminRecordsById(remoteOems, adminSupplementalRef.current.oemRecords)
                 : remoteOems;
               if (combinedOems.length > 0 || !isAdminSession) {
-                setOemRecords(combinedOems);
+                setOemRecords((prev) => {
+                  const { upsertIds, deleteIds } = getPendingEntityIds('oemRecords');
+                  return reconcileRemoteRecordsWithPendingLocal({
+                    remoteRecords: combinedOems,
+                    currentLocalRecords: prev,
+                    pendingUpsertIds: upsertIds,
+                    pendingDeleteIds: deleteIds,
+                  });
+                });
               }
               markSyncedNow();
             },
@@ -1460,33 +1636,44 @@ export default function App() {
     } = stateRef.current;
     const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
     const preserveExistingCloud = localWorkspaceClearedRef.current;
+    const queuedSnapshot =
+      deltaSchedulerRef.current?.getProtectedSnapshot() ?? createEmptyDirtySnapshot();
+    const pendingSnapshot = mergeDirtySnapshots(failedDirtyRef.current, queuedSnapshot);
+    const shouldForceFull = hasDirtyOperations(pendingSnapshot);
     localWorkspaceClearedRef.current = false;
+    failedDirtyRef.current = pendingSnapshot;
     deltaSchedulerRef.current?.clear();
     void runCloudTask(
-      (user, target) =>
-        preserveExistingCloud
-          ? backupAllToCloud(
-              user,
-              curProfile,
-              prefs,
-              curTenders,
-              curEmd,
-              curMaf,
-              tenantId,
-              target,
-              curOems,
-            )
-          : replaceCloudDataset(
-              user,
-              curProfile,
-              prefs,
-              curTenders,
-              curEmd,
-              curMaf,
-              tenantId,
-              target,
-              curOems,
-            ),
+      async (user, target) => {
+        if (preserveExistingCloud) {
+          await backupAllToCloud(
+            user,
+            curProfile,
+            prefs,
+            curTenders,
+            curEmd,
+            curMaf,
+            tenantId,
+            target,
+            curOems,
+            { forceFull: shouldForceFull },
+          );
+        } else {
+          await replaceCloudDataset(
+            user,
+            curProfile,
+            prefs,
+            curTenders,
+            curEmd,
+            curMaf,
+            tenantId,
+            target,
+            curOems,
+            { forceFull: shouldForceFull },
+          );
+        }
+        failedDirtyRef.current = createEmptyDirtySnapshot();
+      },
       preserveExistingCloud
         ? `Delta synced ${curTenders.length} local tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers & ${curEmd.length} EMD/BG records non-destructively to Firestore.`
         : `Delta synced ${curTenders.length} tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
@@ -1499,7 +1686,7 @@ export default function App() {
     const tenantId = stateRef.current.workspaceTenantId;
     const userSession = stateRef.current.currentUser;
     void runCloudTask(async (user, target) => {
-      await ensureUserRootDocument(user, tenantId, userSession, target);
+      await ensureUserRootDocument(user, tenantId, userSession, target, { forceServerCheck: true });
       let cloud: CloudWorkspaceDataset;
       if (userSession?.role === 'admin') {
         const primary = await fetchAllFromCloud(user.uid, null, target, {
@@ -1518,6 +1705,7 @@ export default function App() {
           forceFull: true,
         });
       }
+      failedDirtyRef.current = createEmptyDirtySnapshot();
       if (cloud.profile) {
         setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
       }
@@ -3030,6 +3218,7 @@ export default function App() {
     const activeCentralFbUser = stateRef.current.firebaseUser;
 
     deltaSchedulerRef.current?.clear();
+    failedDirtyRef.current = createEmptyDirtySnapshot();
     backgroundAttachmentTaskSeqRef.current += 1;
     clearCloudSessionCache();
     localWorkspaceClearedRef.current = false;
@@ -3190,6 +3379,7 @@ export default function App() {
     } else {
       deltaSchedulerRef.current?.clear();
     }
+    failedDirtyRef.current = createEmptyDirtySnapshot();
     backgroundAttachmentTaskSeqRef.current += 1;
     clearPerTabCrmSession();
     if (exitingSession) {
@@ -3355,6 +3545,7 @@ export default function App() {
     // NEVER send delete/replace commands to Google Cloud Firestore, BYOC storage, or Google Drive Sheet.
     localWorkspaceClearedRef.current = true;
     deltaSchedulerRef.current?.clear();
+    failedDirtyRef.current = createEmptyDirtySnapshot();
     backgroundAttachmentTaskSeqRef.current += 1;
     adminSupplementalRef.current = createEmptyCloudDataset();
     attachmentFilesRef.current.clear();
