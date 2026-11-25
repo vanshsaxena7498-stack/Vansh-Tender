@@ -1,15 +1,42 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, type FirebaseApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  type Firestore,
+} from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 import firebaseConfig from '../../firebase-applet-config.json';
 
+function initPersistentFirestore(targetApp: FirebaseApp, databaseId?: string): Firestore {
+  try {
+    if (typeof window !== 'undefined' && typeof window.indexedDB !== 'undefined') {
+      return initializeFirestore(
+        targetApp,
+        {
+          localCache: persistentLocalCache({
+            tabManager: persistentMultipleTabManager(),
+          }),
+        },
+        databaseId,
+      );
+    }
+  } catch {
+    // Fallback cleanly if Firestore instance was already initialized or IndexedDB is unavailable
+  }
+  return databaseId ? getFirestore(targetApp, databaseId) : getFirestore(targetApp);
+}
+
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const db = initPersistentFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const hasNamedFirestoreDatabase = Boolean(
   firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)',
 );
-export const defaultDb = hasNamedFirestoreDatabase ? getFirestore(app) : null;
+export const defaultDb = hasNamedFirestoreDatabase ? initPersistentFirestore(app) : null;
 export const auth = getAuth(app);
 export const storage = getStorage(app);
 export const googleProvider = new GoogleAuthProvider();

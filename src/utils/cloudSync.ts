@@ -5,12 +5,17 @@ import {
   doc,
   getDoc,
   getDocs,
+  getDocsFromCache,
   onSnapshot,
   query,
   serverTimestamp,
   setDoc,
+  Timestamp,
   where,
+  writeBatch,
   type Firestore,
+  type Query,
+  type QueryDocumentSnapshot,
   type Unsubscribe,
 } from 'firebase/firestore';
 import {
@@ -64,7 +69,29 @@ import {
   normalizeAdminFirestoreTimestamp,
   pickValidExistingCreatedAt,
   sanitizeDocId,
+  utf8ByteLength,
 } from './cloudSyncHelpers.ts';
+import {
+  chunkOperations,
+  collectDirtyAttachmentsFromEntities,
+  computeCollectionDeltaDiff,
+  loadDeltaSyncManifest,
+  resolveQuerySinceTimestampMs,
+  saveDeltaSyncManifest,
+  shouldFallbackFromMissingIndex,
+  signatureForAttachment,
+  signatureForEmailConfig,
+  signatureForEmd,
+  signatureForMaf,
+  signatureForOem,
+  signatureForPreferences,
+  signatureForProfile,
+  signatureForSheetConfig,
+  signatureForTender,
+  yieldToMainThread,
+  type DeltaSyncScopeDescriptor,
+  type DirtySyncSnapshot,
+} from './deltaSync.ts';
 import {
   getMafContactDetails,
   getMafRequestedDate,
@@ -110,13 +137,10 @@ const TERMINAL_TENDER_STAGES = new Set<Tender['stage']>([
   'Cancelled / Retendered',
 ]);
 
-const ensuredWorkspaceKeys = new Set<string>();
-const syncedAttachmentKeys = new Set<string>();
-
-export function clearCloudSessionCache(): void {
-  ensuredWorkspaceKeys.clear();
-  syncedAttachmentKeys.clear();
-}
+const TERMINAL_FINANCIAL_STATUS = new Set<EmdBgRecord['status']>([
+  'Refunded / Released',
+  'Forfeited',
+]);
 
 const USER_ROOT_ALLOWED_KEYS = new Set(['ownerUid', 'email', 'createdAt', 'updatedAt']);
 const WORKSPACE_ROOT_ALLOWED_KEYS = new Set([
@@ -127,6 +151,67 @@ const WORKSPACE_ROOT_ALLOWED_KEYS = new Set([
   'createdAt',
   'updatedAt',
 ]);
+
+// Session-scoped in-memory metadata caches keyed by isolated project/database/path
+const ensuredWorkspaceKeys = new Set<string>();
+const syncedAttachmentKeys = new Set<string>();
+// Value = valid Firestore Timestamp to preserve on update, or null when doc is missing/legacy (use serverTimestamp)
+const cloudCreatedAtCache = new Map<string, unknown>();
+const cloudOwnerUidCache = new Map<string, string>();
+const cloudTerminalTenderCache = new Set<string>();
+const cloudTerminalEmdCache = new Set<string>();
+
+export function clearCloudSessionCache(): void {
+  ensuredWorkspaceKeys.clear();
+  syncedAttachmentKeys.clear();
+  cloudCreatedAtCache.clear();
+  cloudOwnerUidCache.clear();
+  cloudTerminalTenderCache.clear();
+  cloudTerminalEmdCache.clear();
+}
+
+function buildDocCacheKey(ctx: CloudTargetContext, docPath: string): string {
+  return `${ctx.projectId}::${ctx.databaseId || '(default)'}::${docPath}`;
+}
+
+function rememberDocMetadata(
+  ctx: CloudTargetContext,
+  docPath: string,
+  data: Record<string, unknown> | null | undefined,
+  kind?: 'tender' | 'emd',
+): void {
+  const key = buildDocCacheKey(ctx, docPath);
+  if (!data) {
+    cloudCreatedAtCache.set(key, null);
+    cloudOwnerUidCache.delete(key);
+    cloudTerminalTenderCache.delete(key);
+    cloudTerminalEmdCache.delete(key);
+    return;
+  }
+
+  const validCreated = pickValidExistingCreatedAt(data.createdAt);
+  cloudCreatedAtCache.set(key, validCreated ?? null);
+
+  if (typeof data.ownerUid === 'string' && data.ownerUid.trim()) {
+    cloudOwnerUidCache.set(key, data.ownerUid.trim());
+  }
+
+  if (kind === 'tender') {
+    const stage = data.stage as Tender['stage'];
+    if (TERMINAL_TENDER_STAGES.has(stage)) {
+      cloudTerminalTenderCache.add(key);
+    } else {
+      cloudTerminalTenderCache.delete(key);
+    }
+  } else if (kind === 'emd') {
+    const status = data.status as EmdBgRecord['status'];
+    if (TERMINAL_FINANCIAL_STATUS.has(status)) {
+      cloudTerminalEmdCache.add(key);
+    } else {
+      cloudTerminalEmdCache.delete(key);
+    }
+  }
+}
 
 async function runInBatches<T>(
   items: readonly T[],
@@ -140,11 +225,6 @@ async function runInBatches<T>(
     await Promise.all(chunk.map((item) => worker(item)));
   }
 }
-
-const TERMINAL_FINANCIAL_STATUS = new Set<EmdBgRecord['status']>([
-  'Refunded / Released',
-  'Forfeited',
-]);
 
 function isBootstrappedAdminUser(user: User | null): boolean {
   return Boolean(user?.emailVerified && user.email === 'vanshsaxena7498@gmail.com');
@@ -170,6 +250,19 @@ function resolveScope(
   const scopedTenant = ctx.isByoc ? null : normalizeTenantId(workspaceTenantId);
   const prefix = scopedTenant ? `users/${uid}/workspaces/${scopedTenant}` : `users/${uid}`;
   return { ctx, scopedTenant, prefix };
+}
+
+function buildScopeDescriptor(
+  ctx: CloudTargetContext,
+  uid: string,
+  scopedTenant: string | null,
+): DeltaSyncScopeDescriptor {
+  return {
+    projectId: ctx.projectId,
+    databaseId: ctx.databaseId || '(default)',
+    uid,
+    tenantId: scopedTenant,
+  };
 }
 
 function getScopedDoc(
@@ -393,6 +486,167 @@ function docToEmailAlertLog(data: Record<string, unknown>, fallbackDocId = ''): 
   };
 }
 
+/**
+ * Ensures doc `createdAt` metadata & terminal guards are known before a batch commit.
+ * Skips Firestore reads completely for documents already cached from snapshots/fetches.
+ */
+async function primeDocMetadataForPaths(
+  ctx: CloudTargetContext,
+  entries: Array<{
+    docRef: ReturnType<typeof doc>;
+    path: string;
+    kind?: 'tender' | 'emd';
+  }>,
+): Promise<void> {
+  const uncached = entries.filter((e) => !cloudCreatedAtCache.has(buildDocCacheKey(ctx, e.path)));
+  if (uncached.length === 0) return;
+
+  await runInBatches(uncached, 10, async (entry) => {
+    try {
+      const snap = await getDoc(entry.docRef);
+      rememberDocMetadata(ctx, entry.path, snap.exists() ? snap.data() : null, entry.kind);
+    } catch {
+      // Leave uncached if read failed transiently; caller handles error cleanly on write
+    }
+  });
+}
+
+interface BatchWriteOp {
+  type: 'set' | 'delete';
+  ref: ReturnType<typeof doc>;
+  path: string;
+  data?: Record<string, unknown>;
+  approxBytes?: number;
+}
+
+/**
+ * Commits mixed Firestore set/delete operations using writeBatch in safe <=400-op chunks
+ * (or byte-budgeted chunks for heavy attachments), yielding cleanly between chunks.
+ */
+async function commitWriteBatchOps(
+  ctx: CloudTargetContext,
+  ops: readonly BatchWriteOp[],
+  options?: { maxOpsPerBatch?: number; maxBytesPerBatch?: number },
+): Promise<void> {
+  if (ops.length === 0) return;
+  const maxOps = options?.maxOpsPerBatch ?? 400;
+  const maxBytes = options?.maxBytesPerBatch ?? 0;
+
+  let chunks: BatchWriteOp[][];
+  if (maxBytes > 0) {
+    chunks = [];
+    let currentChunk: BatchWriteOp[] = [];
+    let currentBytes = 0;
+    for (const op of ops) {
+      const opBytes = op.approxBytes ?? 2048;
+      if (
+        currentChunk.length > 0 &&
+        (currentChunk.length >= maxOps || currentBytes + opBytes > maxBytes)
+      ) {
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentBytes = 0;
+      }
+      currentChunk.push(op);
+      currentBytes += opBytes;
+    }
+    if (currentChunk.length > 0) chunks.push(currentChunk);
+  } else {
+    chunks = chunkOperations(ops, maxOps);
+  }
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
+    const batch = writeBatch(ctx.db);
+    for (const op of chunk) {
+      if (op.type === 'set' && op.data) {
+        batch.set(op.ref, op.data);
+      } else if (op.type === 'delete') {
+        batch.delete(op.ref);
+      }
+    }
+    try {
+      await batch.commit();
+      for (const op of chunk) {
+        if (op.type === 'delete') {
+          rememberDocMetadata(ctx, op.path, null);
+        }
+      }
+    } catch (error) {
+      const firstOp = chunk[0];
+      handleFirestoreError(
+        error,
+        firstOp?.type === 'delete' ? OperationType.DELETE : OperationType.WRITE,
+        firstOp?.path ?? null,
+      );
+    }
+    if (i < chunks.length - 1) {
+      await yieldToMainThread();
+    }
+  }
+}
+
+/**
+ * Delta query helper:
+ * 1) Reads persistent local IndexedDB cache first (if available) in ~2-5ms.
+ * 2) When sinceMs > 0 and local cache has docs and !forceFull, queries server for ONLY
+ *    `updatedAt > sinceMs` and merges changed docs cleanly.
+ * 3) Automatically falls back to full ownerUid query if composite index is absent.
+ */
+async function queryCollectionDeltaOrFull(
+  ctx: CloudTargetContext,
+  uid: string,
+  scopedTenant: string | null,
+  colName: string,
+  prefix: string,
+  options?: { sinceMs?: number; forceFull?: boolean; kind?: 'tender' | 'emd' },
+): Promise<QueryDocumentSnapshot[]> {
+  const colRef = getScopedCollection(ctx, uid, scopedTenant, colName);
+  const baseQuery: Query = query(colRef, where('ownerUid', '==', uid));
+  const sinceMs = options?.forceFull ? 0 : resolveQuerySinceTimestampMs(options?.sinceMs);
+
+  let cachedDocs: QueryDocumentSnapshot[] = [];
+  if (!options?.forceFull && sinceMs > 0) {
+    try {
+      const cacheSnap = await getDocsFromCache(baseQuery);
+      cachedDocs = cacheSnap.docs;
+    } catch {
+      cachedDocs = [];
+    }
+  }
+
+  if (!options?.forceFull && sinceMs > 0 && cachedDocs.length > 0) {
+    try {
+      const deltaQuery = query(
+        colRef,
+        where('ownerUid', '==', uid),
+        where('updatedAt', '>', Timestamp.fromMillis(sinceMs)),
+      );
+      const deltaSnap = await getDocs(deltaQuery);
+      const byId = new Map<string, QueryDocumentSnapshot>();
+      for (const d of cachedDocs) {
+        rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind);
+        byId.set(d.id, d);
+      }
+      for (const d of deltaSnap.docs) {
+        rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind);
+        byId.set(d.id, d);
+      }
+      return Array.from(byId.values());
+    } catch (err) {
+      if (!shouldFallbackFromMissingIndex(err)) {
+        // Still try standard base query below on transient error before throwing
+      }
+    }
+  }
+
+  const fullSnap = await getDocs(baseQuery);
+  for (const d of fullSnap.docs) {
+    rememberDocMetadata(ctx, `${prefix}/${colName}/${d.id}`, d.data(), options?.kind);
+  }
+  return fullSnap.docs;
+}
+
 export async function ensureUserRootDocument(
   user: User,
   workspaceTenantId?: string | null,
@@ -400,7 +654,7 @@ export async function ensureUserRootDocument(
   target?: CloudTargetContext | null,
 ): Promise<void> {
   const { ctx, scopedTenant } = resolveScope(user.uid, workspaceTenantId, target);
-  const cacheKey = `${ctx.projectId}::${user.uid}::${scopedTenant || 'root'}`;
+  const cacheKey = `${ctx.projectId}::${ctx.databaseId || '(default)'}::${user.uid}::${scopedTenant || 'root'}`;
   if (ensuredWorkspaceKeys.has(cacheKey)) return;
 
   const userPath = `users/${user.uid}`;
@@ -484,12 +738,12 @@ export async function syncSecondaryUserToCloud(
     new Set([summary.userId, ...(summary.aliasUserIds ?? [])].map((id) => sanitizeDocId(id))),
   );
   const primarySafeId = sanitizeDocId(summary.userId);
-  for (const safeId of candidateIds) {
+  await runInBatches(candidateIds, 6, async (safeId) => {
     const ref = doc(centralDb, 'secondaryUsers', safeId);
     try {
       const snap = await getDoc(ref);
       // Update canonical doc always; only update alias docs that already exist
-      if (safeId !== primarySafeId && !snap.exists()) continue;
+      if (safeId !== primarySafeId && !snap.exists()) return;
       const existingData = snap.exists() ? snap.data() : null;
       const existingCreatedAt = pickValidExistingCreatedAt(existingData?.createdAt);
       const ownerUid =
@@ -518,7 +772,7 @@ export async function syncSecondaryUserToCloud(
     } catch {
       // Non-fatal if central directory write isn't permitted for current auth user
     }
-  }
+  });
 }
 
 export async function fetchSecondaryUsersFromCloud(
@@ -580,10 +834,9 @@ export async function syncPreferencesToCloud(
   const path = `${prefix}/settings/preferences`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences');
   try {
-    const snap = await getDoc(ref);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
+    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
     const payload = buildCloudPreferencesPayload(
       prefs,
       user.uid,
@@ -607,10 +860,9 @@ export async function syncProfileToCloud(
   const path = `${prefix}/profile/firm`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm');
   try {
-    const snap = await getDoc(ref);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
+    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
     const payload = buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt);
     await setDoc(ref, payload);
   } catch (error) {
@@ -629,10 +881,9 @@ export async function syncEmailConfigToCloud(
   const path = `${prefix}/emailConfig/default`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default');
   try {
-    const snap = await getDoc(ref);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
+    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
     const payload = buildCloudEmailConfigPayload(
       config,
       user.uid,
@@ -656,10 +907,9 @@ export async function syncSheetConfigToCloud(
   const path = `${prefix}/sheetConfig/default`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default');
   try {
-    const snap = await getDoc(ref);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
+    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
     const payload = buildCloudSheetConfigPayload(
       config,
       user.uid,
@@ -684,10 +934,9 @@ export async function syncEmailAlertLogToCloud(
   const path = `${prefix}/emailAlerts/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emailAlerts', safeId);
   try {
-    const snap = await getDoc(ref);
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, path));
+    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
     const payload = buildCloudEmailAlertLogPayload(
       { ...log, id: safeId },
       user.uid,
@@ -700,50 +949,86 @@ export async function syncEmailAlertLogToCloud(
   }
 }
 
+/**
+ * Batch-uploads attachments in byte-budgeted Firestore writeBatch chunks (<= 8 docs & <= 3.5 MB/commit)
+ * skipping attachments already matched in the delta manifest or in-memory cache.
+ */
 export async function syncAttachmentFilesToCloud(
   user: User,
   attachments: AttachmentItem[] | undefined,
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
 ): Promise<void> {
-  const list = attachments ?? [];
-  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
-  for (const att of list) {
-    if (!att.dataUrl) continue;
-    const safeId = sanitizeDocId(att.id);
-    const cacheKey = `${ctx.projectId}:${user.uid}:${scopedTenant || 'root'}:${safeId}:${att.fileSize}:${att.uploadedAt}`;
-    if (syncedAttachmentKeys.has(cacheKey)) continue;
+  const list = (attachments ?? []).filter((a) => Boolean(a.dataUrl));
+  if (list.length === 0) return;
 
-    const path = `${prefix}/attachmentFiles/${safeId}`;
-    const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId);
-    try {
-      const snap = await getDoc(ref);
-      const existingData = snap.exists() ? snap.data() : null;
-      if (
-        existingData &&
-        existingData.ownerUid === user.uid &&
-        existingData.fileSize === att.fileSize &&
-        existingData.fileName === (att.fileName.trim() || 'attachment') &&
-        isFirestoreTimestampObject(existingData.createdAt)
-      ) {
-        syncedAttachmentKeys.add(cacheKey);
-        continue;
-      }
-      const existingCreatedAt = pickValidExistingCreatedAt(existingData?.createdAt);
-      const payload = buildCloudAttachmentFilePayload(
-        att,
-        user.uid,
-        serverTimestamp(),
-        existingCreatedAt,
-      );
-      if (payload) {
-        await setDoc(ref, payload);
-        syncedAttachmentKeys.add(cacheKey);
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, path);
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  const scope = buildScopeDescriptor(ctx, user.uid, scopedTenant);
+  const manifest = loadDeltaSyncManifest(scope);
+
+  const candidates: Array<{ att: AttachmentItem; safeId: string; path: string; sig: string; cacheKey: string }> = [];
+  for (const att of list) {
+    const safeId = sanitizeDocId(att.id);
+    const sig = signatureForAttachment(att);
+    const cacheKey = `${ctx.projectId}:${ctx.databaseId || '(default)'}:${user.uid}:${scopedTenant || 'root'}:${safeId}:${sig}`;
+    if (syncedAttachmentKeys.has(cacheKey) || manifest.signatures.attachments[safeId] === sig) {
+      syncedAttachmentKeys.add(cacheKey);
+      continue;
     }
+    candidates.push({
+      att,
+      safeId,
+      path: `${prefix}/attachmentFiles/${safeId}`,
+      sig,
+      cacheKey,
+    });
   }
+
+  if (candidates.length === 0) return;
+
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+  await primeDocMetadataForPaths(
+    ctx,
+    candidates.map((c) => ({
+      docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', c.safeId),
+      path: c.path,
+    })),
+  );
+
+  const batchOps: BatchWriteOp[] = [];
+  const nextSignatures = { ...manifest.signatures.attachments };
+  for (const c of candidates) {
+    const cachedCreatedAt = cloudCreatedAtCache.get(buildDocCacheKey(ctx, c.path));
+    const existingCreatedAt = pickValidExistingCreatedAt(cachedCreatedAt);
+    const payload = buildCloudAttachmentFilePayload(
+      c.att,
+      user.uid,
+      serverTimestamp(),
+      existingCreatedAt,
+    );
+    if (!payload) continue;
+    const approxBytes = utf8ByteLength(String(payload.dataUrl || '')) + 1024;
+    batchOps.push({
+      type: 'set',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', c.safeId),
+      path: c.path,
+      data: payload,
+      approxBytes,
+    });
+    nextSignatures[c.safeId] = c.sig;
+  }
+
+  if (batchOps.length === 0) return;
+  await commitWriteBatchOps(ctx, batchOps, {
+    maxOpsPerBatch: 8,
+    maxBytesPerBatch: 3_500_000,
+  });
+
+  for (const c of candidates) {
+    syncedAttachmentKeys.add(c.cacheKey);
+  }
+  manifest.signatures.attachments = nextSignatures;
+  saveDeltaSyncManifest(manifest);
 }
 
 export async function uploadMafDocumentFile(
@@ -766,7 +1051,6 @@ export async function uploadMafDocumentFile(
   const isCompressibleImage =
     file.type.startsWith('image/') && file.type !== 'image/svg+xml' && file.type !== 'image/gif';
 
-  // Use scoped Firebase Storage ONLY when authenticated AND isolated target is valid
   if (!isCompressibleImage && file.size > MAX_ATTACHMENT_BYTES) {
     if (!user) {
       throw new Error(
@@ -796,7 +1080,6 @@ export async function uploadMafDocumentFile(
     }
   }
 
-  // Images (auto-compressed) or PDFs <= 650 KB -> store cleanly in attachmentFiles subcollection (or inline local if unconfigured)
   const prepared = await readAttachmentForFirestore(file);
   const attId = sanitizeDocId(`maf_${itemId}_${Date.now()}`);
   const attachmentItem: AttachmentItem = {
@@ -833,22 +1116,17 @@ export async function syncTenderToCloud(
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-  await syncAttachmentFilesToCloud(user, tender.attachments, workspaceTenantId, ctx);
 
   const safeId = sanitizeDocId(tender.id);
   const path = `${prefix}/tenders/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId);
   try {
-    const snap = await getDoc(ref);
-    if (snap.exists()) {
-      const existingStage = snap.data().stage as Tender['stage'];
-      if (TERMINAL_TENDER_STAGES.has(existingStage) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
-        return;
-      }
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path, kind: 'tender' }]);
+    const docKey = buildDocCacheKey(ctx, path);
+    if (cloudTerminalTenderCache.has(docKey) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
+      return;
     }
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
     const payload = buildCloudTenderPayload(
       { ...tender, id: safeId },
       user.uid,
@@ -856,6 +1134,7 @@ export async function syncTenderToCloud(
       existingCreatedAt,
     );
     await setDoc(ref, payload);
+    await syncAttachmentFilesToCloud(user, tender.attachments, workspaceTenantId, ctx);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -872,17 +1151,13 @@ export async function deleteTenderFromCloud(
   const path = `${prefix}/tenders/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId);
   try {
-    const snap = await getDoc(ref);
-    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
-    if (
-      snap.exists() &&
-      typeof docOwner === 'string' &&
-      docOwner.trim().length > 0 &&
-      docOwner !== user.uid
-    ) {
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path, kind: 'tender' }]);
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
+    rememberDocMetadata(ctx, path, null);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -896,22 +1171,17 @@ export async function syncEmdRecordToCloud(
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-  await syncAttachmentFilesToCloud(user, record.attachments, workspaceTenantId, ctx);
 
   const safeId = sanitizeDocId(record.id);
   const path = `${prefix}/emdRecords/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId);
   try {
-    const snap = await getDoc(ref);
-    if (snap.exists()) {
-      const existingStatus = snap.data().status as EmdBgRecord['status'];
-      if (TERMINAL_FINANCIAL_STATUS.has(existingStatus) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
-        return;
-      }
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path, kind: 'emd' }]);
+    const docKey = buildDocCacheKey(ctx, path);
+    if (cloudTerminalEmdCache.has(docKey) && !isBootstrappedAdminUser(user) && !ctx.isByoc) {
+      return;
     }
-    const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
-    );
+    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
     const payload = buildCloudEmdPayload(
       { ...record, id: safeId },
       user.uid,
@@ -919,6 +1189,7 @@ export async function syncEmdRecordToCloud(
       existingCreatedAt,
     );
     await setDoc(ref, payload);
+    await syncAttachmentFilesToCloud(user, record.attachments, workspaceTenantId, ctx);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -935,17 +1206,13 @@ export async function deleteEmdRecordFromCloud(
   const path = `${prefix}/emdRecords/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId);
   try {
-    const snap = await getDoc(ref);
-    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
-    if (
-      snap.exists() &&
-      typeof docOwner === 'string' &&
-      docOwner.trim().length > 0 &&
-      docOwner !== user.uid
-    ) {
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path, kind: 'emd' }]);
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
+    rememberDocMetadata(ctx, path, null);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -960,33 +1227,13 @@ export async function syncMafTrackerToCloud(
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
 
-  const inlineMafAttachments: AttachmentItem[] = [];
-  for (const item of tracker.itemsMAF ?? []) {
-    if (item.mafAttachmentId && item.mafDocumentUrl?.startsWith('data:')) {
-      inlineMafAttachments.push({
-        id: item.mafAttachmentId,
-        slotLabel: 'MAF Document',
-        fileName: item.mafDocumentName || `${item.oemName}_MAF`,
-        fileType: item.mafDocumentUrl.startsWith('data:application/pdf')
-          ? 'application/pdf'
-          : 'image/jpeg',
-        fileSize: Math.round((item.mafDocumentUrl.length * 3) / 4),
-        uploadedAt: item.updatedAt || tracker.updatedAt,
-        dataUrl: item.mafDocumentUrl,
-      });
-    }
-  }
-  if (inlineMafAttachments.length > 0) {
-    await syncAttachmentFilesToCloud(user, inlineMafAttachments, workspaceTenantId, ctx);
-  }
-
   const safeId = sanitizeDocId(tracker.id);
   const path = `${prefix}/maf_tracker/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
   try {
-    const snap = await getDoc(ref);
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
     const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
+      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
     );
     const payload = buildCloudMafTrackerPayload(
       { ...tracker, id: safeId },
@@ -995,6 +1242,11 @@ export async function syncMafTrackerToCloud(
       existingCreatedAt,
     );
     await setDoc(ref, payload);
+
+    const inlineMafAttachments = collectDirtyAttachmentsFromEntities({ mafTrackers: [tracker] });
+    if (inlineMafAttachments.length > 0) {
+      await syncAttachmentFilesToCloud(user, inlineMafAttachments, workspaceTenantId, ctx);
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -1011,17 +1263,13 @@ export async function deleteMafTrackerFromCloud(
   const path = `${prefix}/maf_tracker/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId);
   try {
-    const snap = await getDoc(ref);
-    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
-    if (
-      snap.exists() &&
-      typeof docOwner === 'string' &&
-      docOwner.trim().length > 0 &&
-      docOwner !== user.uid
-    ) {
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
+    rememberDocMetadata(ctx, path, null);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -1039,9 +1287,9 @@ export async function syncOemRecordToCloud(
   const path = `${prefix}/oemDetails/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
   try {
-    const snap = await getDoc(ref);
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
     const existingCreatedAt = pickValidExistingCreatedAt(
-      snap.exists() ? snap.data().createdAt : undefined,
+      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
     );
     const payload = buildCloudOemPayload(
       { ...oem, id: safeId },
@@ -1066,17 +1314,13 @@ export async function deleteOemRecordFromCloud(
   const path = `${prefix}/oemDetails/${safeId}`;
   const ref = getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId);
   try {
-    const snap = await getDoc(ref);
-    const docOwner = snap.exists() ? snap.data().ownerUid : undefined;
-    if (
-      snap.exists() &&
-      typeof docOwner === 'string' &&
-      docOwner.trim().length > 0 &&
-      docOwner !== user.uid
-    ) {
+    await primeDocMetadataForPaths(ctx, [{ docRef: ref, path }]);
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) {
       throw new Error('PERMISSION_DENIED: Cannot delete record owned by another user.');
     }
     await deleteDoc(ref);
+    rememberDocMetadata(ctx, path, null);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -1094,6 +1338,7 @@ export async function fetchAttachmentFileDataUrl(
   try {
     const snap = await getDoc(getScopedDoc(ctx, uid, scopedTenant, 'attachmentFiles', safeId));
     if (!snap.exists()) return null;
+    rememberDocMetadata(ctx, path, snap.data());
     const dataUrl = snap.data().dataUrl;
     return typeof dataUrl === 'string' && dataUrl.length > 0 ? dataUrl : null;
   } catch (error) {
@@ -1101,23 +1346,27 @@ export async function fetchAttachmentFileDataUrl(
   }
 }
 
+/**
+ * Fetches core metadata collections in parallel (profile, preferences, configs, alerts, tenders,
+ * emdRecords, maf_tracker, oemDetails) using local persistent cache + `updatedAt > lastSynced` delta queries.
+ * Heavy `attachmentFiles` blobs can be skipped here and hydrated non-blockingly in the background.
+ */
 export async function fetchAllFromCloud(
   uid: string,
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
-): Promise<{
-  profile: FirmProfile | null;
-  preferences: UserPreferences | null;
-  emailConfig: EmailAlertSettings | null;
-  sheetConfig: GoogleSheetSettings | null;
-  emailAlerts: EmailAlertLog[];
-  tenders: Tender[];
-  emdRecords: EmdBgRecord[];
-  mafTrackers: MafTrackerRecord[];
-  oemRecords: OemRecord[];
-  attachmentFiles: Map<string, string>;
-}> {
+  options?: { includeAttachments?: boolean; sinceMs?: number; forceFull?: boolean },
+): Promise<CloudWorkspaceDataset> {
   const { ctx, scopedTenant, prefix } = resolveScope(uid, workspaceTenantId, target);
+  const scope = buildScopeDescriptor(ctx, uid, scopedTenant);
+  const manifest = loadDeltaSyncManifest(scope);
+  const effectiveSinceMs = options?.forceFull
+    ? 0
+    : options?.sinceMs !== undefined
+      ? options.sinceMs
+      : manifest.lastSyncedAtMs;
+  const includeAttachments = options?.includeAttachments !== false;
+
   const profilePath = `${prefix}/profile/firm`;
   const prefsPath = `${prefix}/settings/preferences`;
   const emailConfigPath = `${prefix}/emailConfig/default`;
@@ -1129,131 +1378,144 @@ export async function fetchAllFromCloud(
   const oemPath = `${prefix}/oemDetails`;
   const filesPath = `${prefix}/attachmentFiles`;
 
+  const [
+    profileSnap,
+    prefsSnap,
+    emailConfigSnap,
+    sheetConfigSnap,
+    tenderDocs,
+    emdDocs,
+    mafDocs,
+    oemDocs,
+    emailAlertDocs,
+    fileDocs,
+  ] = await Promise.all([
+    getDoc(getScopedDoc(ctx, uid, scopedTenant, 'profile', 'firm')).catch((error) =>
+      handleFirestoreError(error, OperationType.GET, profilePath),
+    ),
+    getDoc(getScopedDoc(ctx, uid, scopedTenant, 'settings', 'preferences')).catch((error) =>
+      handleFirestoreError(error, OperationType.GET, prefsPath),
+    ),
+    getDoc(getScopedDoc(ctx, uid, scopedTenant, 'emailConfig', 'default')).catch((error) =>
+      handleFirestoreError(error, OperationType.GET, emailConfigPath),
+    ),
+    getDoc(getScopedDoc(ctx, uid, scopedTenant, 'sheetConfig', 'default')).catch((error) =>
+      handleFirestoreError(error, OperationType.GET, sheetConfigPath),
+    ),
+    queryCollectionDeltaOrFull(ctx, uid, scopedTenant, 'tenders', prefix, {
+      sinceMs: effectiveSinceMs,
+      forceFull: options?.forceFull,
+      kind: 'tender',
+    }).catch((error) => handleFirestoreError(error, OperationType.LIST, tendersPath)),
+    queryCollectionDeltaOrFull(ctx, uid, scopedTenant, 'emdRecords', prefix, {
+      sinceMs: effectiveSinceMs,
+      forceFull: options?.forceFull,
+      kind: 'emd',
+    }).catch((error) => handleFirestoreError(error, OperationType.LIST, emdPath)),
+    queryCollectionDeltaOrFull(ctx, uid, scopedTenant, 'maf_tracker', prefix, {
+      sinceMs: effectiveSinceMs,
+      forceFull: options?.forceFull,
+    }).catch((error) => handleFirestoreError(error, OperationType.LIST, mafPath)),
+    queryCollectionDeltaOrFull(ctx, uid, scopedTenant, 'oemDetails', prefix, {
+      sinceMs: effectiveSinceMs,
+      forceFull: options?.forceFull,
+    }).catch((error) => handleFirestoreError(error, OperationType.LIST, oemPath)),
+    queryCollectionDeltaOrFull(ctx, uid, scopedTenant, 'emailAlerts', prefix, {
+      sinceMs: effectiveSinceMs,
+      forceFull: options?.forceFull,
+    }).catch((error) => handleFirestoreError(error, OperationType.LIST, emailAlertsPath)),
+    includeAttachments
+      ? queryCollectionDeltaOrFull(ctx, uid, scopedTenant, 'attachmentFiles', prefix, {
+          sinceMs: effectiveSinceMs,
+          forceFull: options?.forceFull,
+        }).catch((error) => handleFirestoreError(error, OperationType.LIST, filesPath))
+      : Promise.resolve([] as QueryDocumentSnapshot[]),
+  ]);
+
   let profile: FirmProfile | null = null;
+  if (profileSnap.exists()) {
+    rememberDocMetadata(ctx, profilePath, profileSnap.data());
+    profile = docToProfile(profileSnap.data());
+  } else {
+    rememberDocMetadata(ctx, profilePath, null);
+  }
+
   let preferences: UserPreferences | null = null;
+  if (prefsSnap.exists()) {
+    rememberDocMetadata(ctx, prefsPath, prefsSnap.data());
+    preferences = docToPreferences(prefsSnap.data());
+  } else {
+    rememberDocMetadata(ctx, prefsPath, null);
+  }
+
   let emailConfig: EmailAlertSettings | null = null;
+  if (emailConfigSnap.exists()) {
+    rememberDocMetadata(ctx, emailConfigPath, emailConfigSnap.data());
+    emailConfig = docToEmailConfig(emailConfigSnap.data());
+  } else {
+    rememberDocMetadata(ctx, emailConfigPath, null);
+  }
+
   let sheetConfig: GoogleSheetSettings | null = null;
-  let emailAlerts: EmailAlertLog[] = [];
-  let tenders: Tender[] = [];
-  let emdRecords: EmdBgRecord[] = [];
-  let mafTrackers: MafTrackerRecord[] = [];
-  let oemRecords: OemRecord[] = [];
+  if (sheetConfigSnap.exists()) {
+    rememberDocMetadata(ctx, sheetConfigPath, sheetConfigSnap.data());
+    sheetConfig = docToSheetConfig(sheetConfigSnap.data());
+  } else {
+    rememberDocMetadata(ctx, sheetConfigPath, null);
+  }
+
+  const tenders = tenderDocs.map((d) => docToTender(d.data(), d.id));
+  const emdRecords = emdDocs.map((d) => docToEmdRecord(d.data(), d.id));
+  const mafTrackers = mafDocs.map((d) => docToMafTracker(d.data(), d.id));
+  const oemRecords = oemDocs
+    .map((d) => docToOemRecord(d.data(), d.id))
+    .filter((item) => item.oemName.trim().length > 0);
+  const emailAlerts = emailAlertDocs
+    .map((d) => docToEmailAlertLog(d.data(), d.id))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
   const attachmentFiles = new Map<string, string>();
-
-  try {
-    const profileSnap = await getDoc(getScopedDoc(ctx, uid, scopedTenant, 'profile', 'firm'));
-    if (profileSnap.exists()) {
-      profile = docToProfile(profileSnap.data());
+  for (const d of fileDocs) {
+    const data = d.data();
+    if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
+      attachmentFiles.set(String(data.id ?? d.id), data.dataUrl);
     }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, profilePath);
   }
 
-  try {
-    const prefsSnap = await getDoc(getScopedDoc(ctx, uid, scopedTenant, 'settings', 'preferences'));
-    if (prefsSnap.exists()) {
-      preferences = docToPreferences(prefsSnap.data());
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, prefsPath);
-  }
-
-  try {
-    const tQuery = query(
-      getScopedCollection(ctx, uid, scopedTenant, 'tenders'),
-      where('ownerUid', '==', uid),
-    );
-    const tSnap = await getDocs(tQuery);
-    tenders = tSnap.docs.map((d) => docToTender(d.data()));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, tendersPath);
-  }
-
-  try {
-    const eQuery = query(
-      getScopedCollection(ctx, uid, scopedTenant, 'emdRecords'),
-      where('ownerUid', '==', uid),
-    );
-    const eSnap = await getDocs(eQuery);
-    emdRecords = eSnap.docs.map((d) => docToEmdRecord(d.data()));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, emdPath);
-  }
-
-  try {
-    const mQuery = query(
-      getScopedCollection(ctx, uid, scopedTenant, 'maf_tracker'),
-      where('ownerUid', '==', uid),
-    );
-    const mSnap = await getDocs(mQuery);
-    mafTrackers = mSnap.docs.map((d) => docToMafTracker(d.data()));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, mafPath);
-  }
-
-  try {
-    const oQuery = query(
-      getScopedCollection(ctx, uid, scopedTenant, 'oemDetails'),
-      where('ownerUid', '==', uid),
-    );
-    const oSnap = await getDocs(oQuery);
-    oemRecords = oSnap.docs
-      .map((d) => docToOemRecord(d.data(), d.id))
-      .filter((item) => item.oemName.trim().length > 0);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, oemPath);
-  }
-
-  try {
-    const fQuery = query(
-      getScopedCollection(ctx, uid, scopedTenant, 'attachmentFiles'),
-      where('ownerUid', '==', uid),
-    );
-    const fSnap = await getDocs(fQuery);
-    for (const d of fSnap.docs) {
-      const data = d.data();
-      if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
-        attachmentFiles.set(String(data.id ?? d.id), data.dataUrl);
-      }
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, filesPath);
-  }
-
-  try {
-    const emailConfigSnap = await getDoc(
-      getScopedDoc(ctx, uid, scopedTenant, 'emailConfig', 'default'),
-    );
-    if (emailConfigSnap.exists()) {
-      emailConfig = docToEmailConfig(emailConfigSnap.data());
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, emailConfigPath);
-  }
-
-  try {
-    const sheetConfigSnap = await getDoc(
-      getScopedDoc(ctx, uid, scopedTenant, 'sheetConfig', 'default'),
-    );
-    if (sheetConfigSnap.exists()) {
-      sheetConfig = docToSheetConfig(sheetConfigSnap.data());
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, sheetConfigPath);
-  }
-
-  try {
-    const emailAlertsQuery = query(
-      getScopedCollection(ctx, uid, scopedTenant, 'emailAlerts'),
-      where('ownerUid', '==', uid),
-    );
-    const emailSnap = await getDocs(emailAlertsQuery);
-    emailAlerts = emailSnap.docs
-      .map((d) => docToEmailAlertLog(d.data()))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, emailAlertsPath);
-  }
+  // Record latest signatures & watermark for loaded core records
+  const nowMs = Date.now();
+  const nextManifest = loadDeltaSyncManifest(scope);
+  nextManifest.lastSyncedAtMs = nowMs;
+  nextManifest.lastSyncedIso = new Date(nowMs).toISOString();
+  nextManifest.signatures.tenders = computeCollectionDeltaDiff(
+    tenders,
+    nextManifest.signatures.tenders,
+    (t) => sanitizeDocId(t.id),
+    signatureForTender,
+  ).nextSignatures;
+  nextManifest.signatures.emdRecords = computeCollectionDeltaDiff(
+    emdRecords,
+    nextManifest.signatures.emdRecords,
+    (r) => sanitizeDocId(r.id),
+    signatureForEmd,
+  ).nextSignatures;
+  nextManifest.signatures.mafTrackers = computeCollectionDeltaDiff(
+    mafTrackers,
+    nextManifest.signatures.mafTrackers,
+    (m) => sanitizeDocId(m.id),
+    signatureForMaf,
+  ).nextSignatures;
+  nextManifest.signatures.oemRecords = computeCollectionDeltaDiff(
+    oemRecords,
+    nextManifest.signatures.oemRecords,
+    (o) => sanitizeDocId(o.id),
+    signatureForOem,
+  ).nextSignatures;
+  if (profile) nextManifest.signatures.singletons.profile = signatureForProfile(profile);
+  if (preferences) nextManifest.signatures.singletons.preferences = signatureForPreferences(preferences);
+  if (emailConfig) nextManifest.signatures.singletons.emailConfig = signatureForEmailConfig(emailConfig);
+  if (sheetConfig) nextManifest.signatures.singletons.sheetConfig = signatureForSheetConfig(sheetConfig);
+  saveDeltaSyncManifest(nextManifest);
 
   return {
     profile,
@@ -1267,6 +1529,105 @@ export async function fetchAllFromCloud(
     oemRecords,
     attachmentFiles,
   };
+}
+
+/**
+ * Fast startup hydration: fetches only core records in parallel (excluding heavy base64 attachments)
+ * so the dashboard, tender list, OEM directory, MAF tracker, and BID/RA view render immediately.
+ */
+export async function fetchCoreCloudWorkspaceFast(
+  uid: string,
+  workspaceTenantId?: string | null,
+  target?: CloudTargetContext | null,
+  options?: { forceFull?: boolean },
+): Promise<CloudWorkspaceDataset> {
+  return fetchAllFromCloud(uid, workspaceTenantId, target, {
+    includeAttachments: false,
+    forceFull: options?.forceFull,
+  });
+}
+
+/**
+ * Non-blocking background attachment hydrator: fetches only missing attachment IDs referenced
+ * by active tenders, EMD/BG records, and MAF items in small batches, yielding between batches
+ * so scrolling and interactions remain completely responsive.
+ */
+export async function fetchMissingAttachmentsBackground(params: {
+  uid: string;
+  attachmentIds: string[];
+  workspaceTenantId?: string | null;
+  target?: CloudTargetContext | null;
+  shouldCancel?: () => boolean;
+  onBatchLoaded?: (batchMap: Map<string, string>) => void;
+}): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const uniqueIds = Array.from(new Set(params.attachmentIds.map((id) => sanitizeDocId(id))));
+  if (uniqueIds.length === 0) return result;
+
+  const { ctx, scopedTenant, prefix } = resolveScope(
+    params.uid,
+    params.workspaceTenantId,
+    params.target,
+  );
+
+  // For larger missing sets (>12), 1 collection query is faster than N individual getDocs
+  if (uniqueIds.length > 12) {
+    try {
+      const fSnap = await getDocs(
+        query(getScopedCollection(ctx, params.uid, scopedTenant, 'attachmentFiles'), where('ownerUid', '==', params.uid)),
+      );
+      if (params.shouldCancel?.()) return result;
+      for (const d of fSnap.docs) {
+        rememberDocMetadata(ctx, `${prefix}/attachmentFiles/${d.id}`, d.data());
+        const data = d.data();
+        if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
+          result.set(String(data.id ?? d.id), data.dataUrl);
+        }
+      }
+      if (result.size > 0) {
+        params.onBatchLoaded?.(result);
+      }
+      return result;
+    } catch {
+      // Fall back to incremental per-ID loading below
+    }
+  }
+
+  const chunks = chunkOperations(uniqueIds, 4);
+  for (const chunk of chunks) {
+    if (params.shouldCancel?.()) break;
+    const batchMap = new Map<string, string>();
+    await Promise.all(
+      chunk.map(async (safeId) => {
+        try {
+          const path = `${prefix}/attachmentFiles/${safeId}`;
+          const snap = await getDoc(
+            getScopedDoc(ctx, params.uid, scopedTenant, 'attachmentFiles', safeId),
+          );
+          if (!snap.exists()) {
+            rememberDocMetadata(ctx, path, null);
+            return;
+          }
+          const data = snap.data();
+          rememberDocMetadata(ctx, path, data);
+          if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
+            const key = String(data.id ?? safeId);
+            batchMap.set(key, data.dataUrl);
+            result.set(key, data.dataUrl);
+          }
+        } catch {
+          // Non-fatal; subsequent manual download or restore can retry
+        }
+      }),
+    );
+    if (params.shouldCancel?.()) break;
+    if (batchMap.size > 0) {
+      params.onBatchLoaded?.(batchMap);
+    }
+    await yieldToMainThread();
+  }
+
+  return result;
 }
 
 export const KNOWN_ADMIN_UIDS = [
@@ -1320,24 +1681,19 @@ async function safeGetDoc(docRef: ReturnType<typeof doc>) {
 
 /**
  * Strictly for Bootstrapped Primary Admin (vanshsaxena7498@gmail.com).
- * Read-only hydration across current UID, sibling Admin UIDs, legacy root collections,
- * and the (default) Firestore database without mutating live records or pulling secondary workspaces.
+ * Parallel read-only scan across sibling Admin UIDs, legacy root collections, and the (default) DB.
+ * Designed so it can execute in a non-blocking background pass after fast core UI hydration.
  */
-export async function fetchAdminCloudWorkspaceWithFallback(
+export async function fetchAdminLegacyFallbackWorkspace(
   adminUser: User,
-): Promise<{
-  primary: CloudWorkspaceDataset;
-  supplemental: CloudWorkspaceDataset;
-  merged: CloudWorkspaceDataset;
-}> {
-  const centralTarget = getCentralAdminCloudTarget();
-  const primary = await fetchAllFromCloud(adminUser.uid, null, centralTarget);
+  options?: { includeAttachments?: boolean },
+): Promise<CloudWorkspaceDataset> {
   const supplemental = createEmptyCloudDataset();
-
   if (!isBootstrappedAdminUser(adminUser)) {
-    return { primary, supplemental, merged: primary };
+    return supplemental;
   }
 
+  const includeAttachments = options?.includeAttachments !== false;
   const knownAdminUidSet = new Set<string>([adminUser.uid, ...KNOWN_ADMIN_UIDS]);
   const excludedSecondaryOwnerUids = new Set<string>();
 
@@ -1376,7 +1732,6 @@ export async function fetchAdminCloudWorkspaceWithFallback(
       | 'settings'
       | 'emailConfig'
       | 'sheetConfig',
-    uidOwnerHint?: string,
   ) => {
     for (const d of docs) {
       const raw = d.data();
@@ -1433,107 +1788,124 @@ export async function fetchAdminCloudWorkspaceWithFallback(
         }
       }
     }
-    void uidOwnerHint;
   };
 
-  for (const targetDb of dbsToInspect) {
-    const isCentralPrimaryDb = targetDb === centralDb;
+  await Promise.all(
+    dbsToInspect.map(async (targetDb) => {
+      const isCentralPrimaryDb = targetDb === centralDb;
 
-    // 1. Inspect /users/{uid}/... across current UID (unfiltered fallback + emd_bg_tracker) & sibling Admin UIDs
-    for (const candidateUid of uidsToInspect) {
-      const skipStrictCurrentMatches = isCentralPrimaryDb && candidateUid === adminUser.uid;
-      const rootDocSnap = await safeGetDoc(doc(targetDb, 'users', candidateUid));
-      if (rootDocSnap?.exists()) {
-        const rootEmail = String(rootDocSnap.data().email ?? '')
-          .trim()
-          .toLowerCase();
-        if (rootEmail && rootEmail !== 'vanshsaxena7498@gmail.com') {
-          excludedSecondaryOwnerUids.add(candidateUid);
-          continue;
+      const uidInspectTasks = uidsToInspect.map(async (candidateUid) => {
+        const skipStrictCurrentMatches = isCentralPrimaryDb && candidateUid === adminUser.uid;
+        const rootDocSnap = await safeGetDoc(doc(targetDb, 'users', candidateUid));
+        if (rootDocSnap?.exists()) {
+          const rootEmail = String(rootDocSnap.data().email ?? '')
+            .trim()
+            .toLowerCase();
+          if (rootEmail && rootEmail !== 'vanshsaxena7498@gmail.com') {
+            excludedSecondaryOwnerUids.add(candidateUid);
+            return;
+          }
         }
-      }
 
-      if (!skipStrictCurrentMatches) {
-        const [pSnap, sSnap, ecSnap, scSnap] = await Promise.all([
-          safeGetDoc(doc(targetDb, 'users', candidateUid, 'profile', 'firm')),
-          safeGetDoc(doc(targetDb, 'users', candidateUid, 'settings', 'preferences')),
-          safeGetDoc(doc(targetDb, 'users', candidateUid, 'emailConfig', 'default')),
-          safeGetDoc(doc(targetDb, 'users', candidateUid, 'sheetConfig', 'default')),
+        const singletonPromise = skipStrictCurrentMatches
+          ? Promise.resolve([null, null, null, null] as const)
+          : Promise.all([
+              safeGetDoc(doc(targetDb, 'users', candidateUid, 'profile', 'firm')),
+              safeGetDoc(doc(targetDb, 'users', candidateUid, 'settings', 'preferences')),
+              safeGetDoc(doc(targetDb, 'users', candidateUid, 'emailConfig', 'default')),
+              safeGetDoc(doc(targetDb, 'users', candidateUid, 'sheetConfig', 'default')),
+            ]);
+
+        const [
+          [pSnap, sSnap, ecSnap, scSnap],
+          [tSnap, eSnap, eLegacySnap, mSnap, oSnap, fSnap, eaSnap],
+        ] = await Promise.all([
+          singletonPromise,
+          Promise.all([
+            safeGetDocs(collection(targetDb, 'users', candidateUid, 'tenders')),
+            safeGetDocs(collection(targetDb, 'users', candidateUid, 'emdRecords')),
+            safeGetDocs(collection(targetDb, 'users', candidateUid, 'emd_bg_tracker')),
+            safeGetDocs(collection(targetDb, 'users', candidateUid, 'maf_tracker')),
+            safeGetDocs(collection(targetDb, 'users', candidateUid, 'oemDetails')),
+            includeAttachments
+              ? safeGetDocs(collection(targetDb, 'users', candidateUid, 'attachmentFiles'))
+              : Promise.resolve(null),
+            safeGetDocs(collection(targetDb, 'users', candidateUid, 'emailAlerts')),
+          ]),
         ]);
-        if (pSnap?.exists()) absorbCollectionDocs([{ id: pSnap.id, data: () => pSnap.data() }], 'profile', candidateUid);
-        if (sSnap?.exists()) absorbCollectionDocs([{ id: sSnap.id, data: () => sSnap.data() }], 'settings', candidateUid);
-        if (ecSnap?.exists()) absorbCollectionDocs([{ id: ecSnap.id, data: () => ecSnap.data() }], 'emailConfig', candidateUid);
-        if (scSnap?.exists()) absorbCollectionDocs([{ id: scSnap.id, data: () => scSnap.data() }], 'sheetConfig', candidateUid);
-      }
 
-      const [
-        tSnap,
-        eSnap,
-        eLegacySnap,
-        mSnap,
-        oSnap,
-        fSnap,
-        eaSnap,
-      ] = await Promise.all([
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'tenders')),
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'emdRecords')),
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'emd_bg_tracker')),
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'maf_tracker')),
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'oemDetails')),
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'attachmentFiles')),
-        safeGetDocs(collection(targetDb, 'users', candidateUid, 'emailAlerts')),
-      ]);
+        if (pSnap?.exists()) absorbCollectionDocs([{ id: pSnap.id, data: () => pSnap.data() }], 'profile');
+        if (sSnap?.exists()) absorbCollectionDocs([{ id: sSnap.id, data: () => sSnap.data() }], 'settings');
+        if (ecSnap?.exists()) absorbCollectionDocs([{ id: ecSnap.id, data: () => ecSnap.data() }], 'emailConfig');
+        if (scSnap?.exists()) absorbCollectionDocs([{ id: scSnap.id, data: () => scSnap.data() }], 'sheetConfig');
+        if (tSnap) absorbCollectionDocs(tSnap.docs, 'tenders');
+        if (eSnap) absorbCollectionDocs(eSnap.docs, 'emdRecords');
+        if (eLegacySnap) absorbCollectionDocs(eLegacySnap.docs, 'emdRecords');
+        if (mSnap) absorbCollectionDocs(mSnap.docs, 'maf_tracker');
+        if (oSnap) absorbCollectionDocs(oSnap.docs, 'oemDetails');
+        if (fSnap) absorbCollectionDocs(fSnap.docs, 'attachmentFiles');
+        if (eaSnap) absorbCollectionDocs(eaSnap.docs, 'emailAlerts');
+      });
 
-      if (tSnap) absorbCollectionDocs(tSnap.docs, 'tenders', candidateUid);
-      if (eSnap) absorbCollectionDocs(eSnap.docs, 'emdRecords', candidateUid);
-      if (eLegacySnap) absorbCollectionDocs(eLegacySnap.docs, 'emdRecords', candidateUid);
-      if (mSnap) absorbCollectionDocs(mSnap.docs, 'maf_tracker', candidateUid);
-      if (oSnap) absorbCollectionDocs(oSnap.docs, 'oemDetails', candidateUid);
-      if (fSnap) absorbCollectionDocs(fSnap.docs, 'attachmentFiles', candidateUid);
-      if (eaSnap) absorbCollectionDocs(eaSnap.docs, 'emailAlerts', candidateUid);
-    }
+      const rootInspectTask = Promise.all([
+        safeGetDocs(collection(targetDb, 'tenders')),
+        safeGetDocs(collection(targetDb, 'emdRecords')),
+        safeGetDocs(collection(targetDb, 'emd_bg_tracker')),
+        safeGetDocs(collection(targetDb, 'maf_tracker')),
+        safeGetDocs(collection(targetDb, 'oemDetails')),
+        includeAttachments ? safeGetDocs(collection(targetDb, 'attachmentFiles')) : Promise.resolve(null),
+        safeGetDocs(collection(targetDb, 'emailAlerts')),
+        safeGetDocs(collection(targetDb, 'profile')),
+        safeGetDocs(collection(targetDb, 'settings')),
+        safeGetDocs(collection(targetDb, 'emailConfig')),
+        safeGetDocs(collection(targetDb, 'sheetConfig')),
+      ]).then(
+        ([
+          rootTenders,
+          rootEmd,
+          rootEmdLegacy,
+          rootMaf,
+          rootOems,
+          rootFiles,
+          rootEmailAlerts,
+          rootProfile,
+          rootSettings,
+          rootEmailConfig,
+          rootSheetConfig,
+        ]) => {
+          if (rootTenders) absorbCollectionDocs(rootTenders.docs, 'tenders');
+          if (rootEmd) absorbCollectionDocs(rootEmd.docs, 'emdRecords');
+          if (rootEmdLegacy) absorbCollectionDocs(rootEmdLegacy.docs, 'emdRecords');
+          if (rootMaf) absorbCollectionDocs(rootMaf.docs, 'maf_tracker');
+          if (rootOems) absorbCollectionDocs(rootOems.docs, 'oemDetails');
+          if (rootFiles) absorbCollectionDocs(rootFiles.docs, 'attachmentFiles');
+          if (rootEmailAlerts) absorbCollectionDocs(rootEmailAlerts.docs, 'emailAlerts');
+          if (rootProfile) absorbCollectionDocs(rootProfile.docs, 'profile');
+          if (rootSettings) absorbCollectionDocs(rootSettings.docs, 'settings');
+          if (rootEmailConfig) absorbCollectionDocs(rootEmailConfig.docs, 'emailConfig');
+          if (rootSheetConfig) absorbCollectionDocs(rootSheetConfig.docs, 'sheetConfig');
+        },
+      );
 
-    // 2. Inspect legacy root collections
-    const [
-      rootTenders,
-      rootEmd,
-      rootEmdLegacy,
-      rootMaf,
-      rootOems,
-      rootFiles,
-      rootEmailAlerts,
-      rootProfile,
-      rootSettings,
-      rootEmailConfig,
-      rootSheetConfig,
-    ] = await Promise.all([
-      safeGetDocs(collection(targetDb, 'tenders')),
-      safeGetDocs(collection(targetDb, 'emdRecords')),
-      safeGetDocs(collection(targetDb, 'emd_bg_tracker')),
-      safeGetDocs(collection(targetDb, 'maf_tracker')),
-      safeGetDocs(collection(targetDb, 'oemDetails')),
-      safeGetDocs(collection(targetDb, 'attachmentFiles')),
-      safeGetDocs(collection(targetDb, 'emailAlerts')),
-      safeGetDocs(collection(targetDb, 'profile')),
-      safeGetDocs(collection(targetDb, 'settings')),
-      safeGetDocs(collection(targetDb, 'emailConfig')),
-      safeGetDocs(collection(targetDb, 'sheetConfig')),
-    ]);
+      await Promise.all([...uidInspectTasks, rootInspectTask]);
+    }),
+  );
 
-    if (rootTenders) absorbCollectionDocs(rootTenders.docs, 'tenders');
-    if (rootEmd) absorbCollectionDocs(rootEmd.docs, 'emdRecords');
-    if (rootEmdLegacy) absorbCollectionDocs(rootEmdLegacy.docs, 'emdRecords');
-    if (rootMaf) absorbCollectionDocs(rootMaf.docs, 'maf_tracker');
-    if (rootOems) absorbCollectionDocs(rootOems.docs, 'oemDetails');
-    if (rootFiles) absorbCollectionDocs(rootFiles.docs, 'attachmentFiles');
-    if (rootEmailAlerts) absorbCollectionDocs(rootEmailAlerts.docs, 'emailAlerts');
-    if (rootProfile) absorbCollectionDocs(rootProfile.docs, 'profile');
-    if (rootSettings) absorbCollectionDocs(rootSettings.docs, 'settings');
-    if (rootEmailConfig) absorbCollectionDocs(rootEmailConfig.docs, 'emailConfig');
-    if (rootSheetConfig) absorbCollectionDocs(rootSheetConfig.docs, 'sheetConfig');
-  }
+  // Persist legacy scan completion timestamp in Admin's delta manifest
+  const centralTarget = getCentralAdminCloudTarget();
+  const scope = buildScopeDescriptor(centralTarget, adminUser.uid, null);
+  const manifest = loadDeltaSyncManifest(scope);
+  manifest.legacyScanDoneAtMs = Date.now();
+  saveDeltaSyncManifest(manifest);
 
-  const merged: CloudWorkspaceDataset = {
+  return supplemental;
+}
+
+export function mergeCloudDatasets(
+  primary: CloudWorkspaceDataset,
+  supplemental: CloudWorkspaceDataset,
+): CloudWorkspaceDataset {
+  return {
     profile: primary.profile || supplemental.profile,
     preferences: primary.preferences || supplemental.preferences,
     emailConfig: primary.emailConfig || supplemental.emailConfig,
@@ -1550,8 +1922,382 @@ export async function fetchAdminCloudWorkspaceWithFallback(
       supplemental.attachmentFiles,
     ),
   };
+}
 
-  return { primary, supplemental, merged };
+export async function fetchAdminCloudWorkspaceWithFallback(
+  adminUser: User,
+): Promise<{
+  primary: CloudWorkspaceDataset;
+  supplemental: CloudWorkspaceDataset;
+  merged: CloudWorkspaceDataset;
+}> {
+  const centralTarget = getCentralAdminCloudTarget();
+  const [primary, supplemental] = await Promise.all([
+    fetchAllFromCloud(adminUser.uid, null, centralTarget, { includeAttachments: true, forceFull: true }),
+    isBootstrappedAdminUser(adminUser)
+      ? fetchAdminLegacyFallbackWorkspace(adminUser, { includeAttachments: true })
+      : Promise.resolve(createEmptyCloudDataset()),
+  ]);
+
+  return {
+    primary,
+    supplemental,
+    merged: mergeCloudDatasets(primary, supplemental),
+  };
+}
+
+/**
+ * Batch + Delta Cloud Sync:
+ * Commits ONLY modified/added/removed records (or dirty snapshot keys) via Firestore `writeBatch`
+ * chunks, preserving existing `createdAt` timestamps cleanly and optionally syncing heavy attachments
+ * in the background after metadata commit completes.
+ */
+export async function syncDeltaBatchToCloud(params: {
+  user: User;
+  dirty: DirtySyncSnapshot;
+  tenders: Tender[];
+  emdRecords: EmdBgRecord[];
+  mafTrackers: MafTrackerRecord[];
+  oemRecords: OemRecord[];
+  profile: FirmProfile;
+  preferences: UserPreferences;
+  emailConfig?: EmailAlertSettings;
+  sheetConfig?: GoogleSheetSettings;
+  workspaceTenantId?: string | null;
+  target?: CloudTargetContext | null;
+  deferAttachmentsToBackground?: boolean;
+}): Promise<{ syncedOps: number; deferredAttachments: AttachmentItem[] }> {
+  const {
+    user,
+    dirty,
+    tenders,
+    emdRecords,
+    mafTrackers,
+    oemRecords,
+    profile,
+    preferences,
+    emailConfig,
+    sheetConfig,
+    workspaceTenantId,
+    target,
+    deferAttachmentsToBackground = true,
+  } = params;
+
+  const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
+  await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
+
+  const scope = buildScopeDescriptor(ctx, user.uid, scopedTenant);
+  const manifest = loadDeltaSyncManifest(scope);
+
+  const tenderById = new Map(tenders.map((t) => [sanitizeDocId(t.id), t]));
+  const emdById = new Map(emdRecords.map((r) => [sanitizeDocId(r.id), r]));
+  const mafById = new Map(mafTrackers.map((m) => [sanitizeDocId(m.id), m]));
+  const oemById = new Map(oemRecords.map((o) => [sanitizeDocId(o.id), o]));
+
+  const metadataPrimeEntries: Array<{
+    docRef: ReturnType<typeof doc>;
+    path: string;
+    kind?: 'tender' | 'emd';
+  }> = [];
+
+  for (const id of [...dirty.tenders.upserts, ...dirty.tenders.deletes]) {
+    const safeId = sanitizeDocId(id);
+    metadataPrimeEntries.push({
+      docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
+      path: `${prefix}/tenders/${safeId}`,
+      kind: 'tender',
+    });
+  }
+  for (const id of [...dirty.emdRecords.upserts, ...dirty.emdRecords.deletes]) {
+    const safeId = sanitizeDocId(id);
+    metadataPrimeEntries.push({
+      docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
+      path: `${prefix}/emdRecords/${safeId}`,
+      kind: 'emd',
+    });
+  }
+  for (const id of [...dirty.mafTrackers.upserts, ...dirty.mafTrackers.deletes]) {
+    const safeId = sanitizeDocId(id);
+    metadataPrimeEntries.push({
+      docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
+      path: `${prefix}/maf_tracker/${safeId}`,
+    });
+  }
+  for (const id of [...dirty.oemRecords.upserts, ...dirty.oemRecords.deletes]) {
+    const safeId = sanitizeDocId(id);
+    metadataPrimeEntries.push({
+      docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
+      path: `${prefix}/oemDetails/${safeId}`,
+    });
+  }
+  for (const singleton of dirty.singletons) {
+    if (singleton === 'profile') {
+      metadataPrimeEntries.push({
+        docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm'),
+        path: `${prefix}/profile/firm`,
+      });
+    } else if (singleton === 'preferences') {
+      metadataPrimeEntries.push({
+        docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences'),
+        path: `${prefix}/settings/preferences`,
+      });
+    } else if (singleton === 'emailConfig' && emailConfig) {
+      metadataPrimeEntries.push({
+        docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default'),
+        path: `${prefix}/emailConfig/default`,
+      });
+    } else if (singleton === 'sheetConfig' && sheetConfig) {
+      metadataPrimeEntries.push({
+        docRef: getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default'),
+        path: `${prefix}/sheetConfig/default`,
+      });
+    }
+  }
+
+  await primeDocMetadataForPaths(ctx, metadataPrimeEntries);
+
+  const ops: BatchWriteOp[] = [];
+  const upsertedTenders: Tender[] = [];
+  const upsertedEmd: EmdBgRecord[] = [];
+  const upsertedMaf: MafTrackerRecord[] = [];
+  const isAdminUser = isBootstrappedAdminUser(user);
+
+  // Singletons
+  for (const singleton of dirty.singletons) {
+    if (singleton === 'profile') {
+      const path = `${prefix}/profile/firm`;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+      );
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'profile', 'firm'),
+        path,
+        data: buildCloudProfilePayload(profile, user.uid, serverTimestamp(), existingCreatedAt),
+      });
+      manifest.signatures.singletons.profile = signatureForProfile(profile);
+    } else if (singleton === 'preferences') {
+      const path = `${prefix}/settings/preferences`;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+      );
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'settings', 'preferences'),
+        path,
+        data: buildCloudPreferencesPayload(
+          preferences,
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+      });
+      manifest.signatures.singletons.preferences = signatureForPreferences(preferences);
+    } else if (singleton === 'emailConfig' && emailConfig) {
+      const path = `${prefix}/emailConfig/default`;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+      );
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emailConfig', 'default'),
+        path,
+        data: buildCloudEmailConfigPayload(
+          emailConfig,
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+      });
+      manifest.signatures.singletons.emailConfig = signatureForEmailConfig(emailConfig);
+    } else if (singleton === 'sheetConfig' && sheetConfig) {
+      const path = `${prefix}/sheetConfig/default`;
+      const existingCreatedAt = pickValidExistingCreatedAt(
+        cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+      );
+      ops.push({
+        type: 'set',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'sheetConfig', 'default'),
+        path,
+        data: buildCloudSheetConfigPayload(
+          sheetConfig,
+          user.uid,
+          serverTimestamp(),
+          existingCreatedAt,
+        ),
+      });
+      manifest.signatures.singletons.sheetConfig = signatureForSheetConfig(sheetConfig);
+    }
+  }
+
+  // Tenders upserts + deletes
+  for (const id of dirty.tenders.upserts) {
+    const safeId = sanitizeDocId(id);
+    const tender = tenderById.get(safeId);
+    if (!tender) continue;
+    const path = `${prefix}/tenders/${safeId}`;
+    const docKey = buildDocCacheKey(ctx, path);
+    if (cloudTerminalTenderCache.has(docKey) && !isAdminUser && !ctx.isByoc) {
+      continue;
+    }
+    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
+    ops.push({
+      type: 'set',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
+      path,
+      data: buildCloudTenderPayload(
+        { ...tender, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+    });
+    manifest.signatures.tenders[safeId] = signatureForTender(tender);
+    upsertedTenders.push(tender);
+  }
+  for (const id of dirty.tenders.deletes) {
+    const safeId = sanitizeDocId(id);
+    const path = `${prefix}/tenders/${safeId}`;
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) continue;
+    ops.push({
+      type: 'delete',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'tenders', safeId),
+      path,
+    });
+    delete manifest.signatures.tenders[safeId];
+  }
+
+  // EMD/BG upserts + deletes
+  for (const id of dirty.emdRecords.upserts) {
+    const safeId = sanitizeDocId(id);
+    const record = emdById.get(safeId);
+    if (!record) continue;
+    const path = `${prefix}/emdRecords/${safeId}`;
+    const docKey = buildDocCacheKey(ctx, path);
+    if (cloudTerminalEmdCache.has(docKey) && !isAdminUser && !ctx.isByoc) {
+      continue;
+    }
+    const existingCreatedAt = pickValidExistingCreatedAt(cloudCreatedAtCache.get(docKey));
+    ops.push({
+      type: 'set',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
+      path,
+      data: buildCloudEmdPayload(
+        { ...record, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+    });
+    manifest.signatures.emdRecords[safeId] = signatureForEmd(record);
+    upsertedEmd.push(record);
+  }
+  for (const id of dirty.emdRecords.deletes) {
+    const safeId = sanitizeDocId(id);
+    const path = `${prefix}/emdRecords/${safeId}`;
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) continue;
+    ops.push({
+      type: 'delete',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'emdRecords', safeId),
+      path,
+    });
+    delete manifest.signatures.emdRecords[safeId];
+  }
+
+  // MAF upserts + deletes
+  for (const id of dirty.mafTrackers.upserts) {
+    const safeId = sanitizeDocId(id);
+    const tracker = mafById.get(safeId);
+    if (!tracker) continue;
+    const path = `${prefix}/maf_tracker/${safeId}`;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+    );
+    ops.push({
+      type: 'set',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
+      path,
+      data: buildCloudMafTrackerPayload(
+        { ...tracker, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+    });
+    manifest.signatures.mafTrackers[safeId] = signatureForMaf(tracker);
+    upsertedMaf.push(tracker);
+  }
+  for (const id of dirty.mafTrackers.deletes) {
+    const safeId = sanitizeDocId(id);
+    const path = `${prefix}/maf_tracker/${safeId}`;
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) continue;
+    ops.push({
+      type: 'delete',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'maf_tracker', safeId),
+      path,
+    });
+    delete manifest.signatures.mafTrackers[safeId];
+  }
+
+  // OEM upserts + deletes
+  for (const id of dirty.oemRecords.upserts) {
+    const safeId = sanitizeDocId(id);
+    const oem = oemById.get(safeId);
+    if (!oem) continue;
+    const path = `${prefix}/oemDetails/${safeId}`;
+    const existingCreatedAt = pickValidExistingCreatedAt(
+      cloudCreatedAtCache.get(buildDocCacheKey(ctx, path)),
+    );
+    ops.push({
+      type: 'set',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
+      path,
+      data: buildCloudOemPayload(
+        { ...oem, id: safeId },
+        user.uid,
+        serverTimestamp(),
+        existingCreatedAt,
+      ),
+    });
+    manifest.signatures.oemRecords[safeId] = signatureForOem(oem);
+  }
+  for (const id of dirty.oemRecords.deletes) {
+    const safeId = sanitizeDocId(id);
+    const path = `${prefix}/oemDetails/${safeId}`;
+    const docOwner = cloudOwnerUidCache.get(buildDocCacheKey(ctx, path));
+    if (docOwner && docOwner !== user.uid) continue;
+    ops.push({
+      type: 'delete',
+      ref: getScopedDoc(ctx, user.uid, scopedTenant, 'oemDetails', safeId),
+      path,
+    });
+    delete manifest.signatures.oemRecords[safeId];
+  }
+
+  await commitWriteBatchOps(ctx, ops);
+
+  const dirtyAttachments = collectDirtyAttachmentsFromEntities({
+    tenders: upsertedTenders,
+    emdRecords: upsertedEmd,
+    mafTrackers: upsertedMaf,
+  });
+
+  if (!deferAttachmentsToBackground && dirtyAttachments.length > 0) {
+    await syncAttachmentFilesToCloud(user, dirtyAttachments, workspaceTenantId, ctx);
+  }
+
+  const nowMs = Date.now();
+  manifest.lastSyncedAtMs = nowMs;
+  manifest.lastSyncedIso = new Date(nowMs).toISOString();
+  saveDeltaSyncManifest(manifest);
+
+  return {
+    syncedOps: ops.length,
+    deferredAttachments: deferAttachmentsToBackground ? dirtyAttachments : [],
+  };
 }
 
 export async function backupAllToCloud(
@@ -1564,26 +2310,83 @@ export async function backupAllToCloud(
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
   oemRecords: OemRecord[] = [],
+  options?: { forceFull?: boolean; deferAttachmentsToBackground?: boolean },
 ): Promise<void> {
-  const { ctx } = resolveScope(user.uid, workspaceTenantId, target);
+  const { ctx, scopedTenant } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-  await Promise.all([
-    syncProfileToCloud(user, profile, workspaceTenantId, ctx),
-    syncPreferencesToCloud(user, preferences, workspaceTenantId, ctx),
-  ]);
+  const scope = buildScopeDescriptor(ctx, user.uid, scopedTenant);
+  const manifest = loadDeltaSyncManifest(scope);
+  const forceAll = Boolean(options?.forceFull) || manifest.lastSyncedAtMs === 0;
 
-  await runInBatches(tenders, 6, (tender) =>
-    syncTenderToCloud(user, tender, workspaceTenantId, ctx),
+  const tenderDiff = computeCollectionDeltaDiff(
+    tenders,
+    manifest.signatures.tenders,
+    (t) => sanitizeDocId(t.id),
+    signatureForTender,
+    { forceAll, allowDeletes: false },
   );
-  await runInBatches(emdRecords, 6, (record) =>
-    syncEmdRecordToCloud(user, record, workspaceTenantId, ctx),
+  const emdDiff = computeCollectionDeltaDiff(
+    emdRecords,
+    manifest.signatures.emdRecords,
+    (r) => sanitizeDocId(r.id),
+    signatureForEmd,
+    { forceAll, allowDeletes: false },
   );
-  await runInBatches(mafTrackers, 6, (tracker) =>
-    syncMafTrackerToCloud(user, tracker, workspaceTenantId, ctx),
+  const mafDiff = computeCollectionDeltaDiff(
+    mafTrackers,
+    manifest.signatures.mafTrackers,
+    (m) => sanitizeDocId(m.id),
+    signatureForMaf,
+    { forceAll, allowDeletes: false },
   );
-  await runInBatches(oemRecords, 6, (oem) =>
-    syncOemRecordToCloud(user, oem, workspaceTenantId, ctx),
+  const oemDiff = computeCollectionDeltaDiff(
+    oemRecords,
+    manifest.signatures.oemRecords,
+    (o) => sanitizeDocId(o.id),
+    signatureForOem,
+    { forceAll, allowDeletes: false },
   );
+
+  const singletons: DirtySyncSnapshot['singletons'] = [];
+  if (forceAll || manifest.signatures.singletons.profile !== signatureForProfile(profile)) {
+    singletons.push('profile');
+  }
+  if (forceAll || manifest.signatures.singletons.preferences !== signatureForPreferences(preferences)) {
+    singletons.push('preferences');
+  }
+
+  const dirty: DirtySyncSnapshot = {
+    tenders: { upserts: tenderDiff.toUpsert.map((t) => sanitizeDocId(t.id)), deletes: [] },
+    emdRecords: { upserts: emdDiff.toUpsert.map((r) => sanitizeDocId(r.id)), deletes: [] },
+    mafTrackers: { upserts: mafDiff.toUpsert.map((m) => sanitizeDocId(m.id)), deletes: [] },
+    oemRecords: { upserts: oemDiff.toUpsert.map((o) => sanitizeDocId(o.id)), deletes: [] },
+    singletons,
+  };
+
+  const result = await syncDeltaBatchToCloud({
+    user,
+    dirty,
+    tenders,
+    emdRecords,
+    mafTrackers,
+    oemRecords,
+    profile,
+    preferences,
+    workspaceTenantId,
+    target: ctx,
+    deferAttachmentsToBackground: options?.deferAttachmentsToBackground ?? false,
+  });
+
+  if (options?.deferAttachmentsToBackground && result.deferredAttachments.length > 0) {
+    void syncAttachmentFilesToCloud(
+      user,
+      result.deferredAttachments,
+      workspaceTenantId,
+      ctx,
+    ).catch(() => {
+      // Attachment background retry happens cleanly on next sync
+    });
+  }
 }
 
 export async function replaceCloudDataset(
@@ -1596,10 +2399,29 @@ export async function replaceCloudDataset(
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
   oemRecords: OemRecord[] = [],
+  options?: { forceFull?: boolean },
 ): Promise<void> {
   const { ctx, scopedTenant, prefix } = resolveScope(user.uid, workspaceTenantId, target);
   await ensureUserRootDocument(user, workspaceTenantId, null, ctx);
-  const existing = await fetchAllFromCloud(user.uid, workspaceTenantId, ctx);
+  const scope = buildScopeDescriptor(ctx, user.uid, scopedTenant);
+  const manifest = loadDeltaSyncManifest(scope);
+
+  // If manifest already tracks cloud IDs cleanly and !forceFull, compute delta deletes directly
+  // without re-downloading every attachment/record from Firestore!
+  const canUseManifestDiff =
+    !options?.forceFull &&
+    manifest.lastSyncedAtMs > 0 &&
+    (Object.keys(manifest.signatures.tenders).length > 0 ||
+      Object.keys(manifest.signatures.emdRecords).length > 0 ||
+      Object.keys(manifest.signatures.mafTrackers).length > 0 ||
+      Object.keys(manifest.signatures.oemRecords).length > 0);
+
+  let deleteTenderIds: string[];
+  let deleteEmdIds: string[];
+  let deleteMafIds: string[];
+  let deleteOemIds: string[];
+  let obsoleteAttIds: string[] = [];
+
   const nextTenderIds = new Set(tenders.map((t) => sanitizeDocId(t.id)));
   const nextEmdIds = new Set(emdRecords.map((r) => sanitizeDocId(r.id)));
   const nextMafIds = new Set(mafTrackers.map((m) => sanitizeDocId(m.id)));
@@ -1620,55 +2442,151 @@ export async function replaceCloudDataset(
     }
   }
 
-  const obsoleteTenders = existing.tenders.filter(
-    (oldTender) => !nextTenderIds.has(sanitizeDocId(oldTender.id)),
+  if (canUseManifestDiff) {
+    deleteTenderIds = computeCollectionDeltaDiff(
+      tenders,
+      manifest.signatures.tenders,
+      (t) => sanitizeDocId(t.id),
+      signatureForTender,
+    ).toDeleteIds;
+    deleteEmdIds = computeCollectionDeltaDiff(
+      emdRecords,
+      manifest.signatures.emdRecords,
+      (r) => sanitizeDocId(r.id),
+      signatureForEmd,
+    ).toDeleteIds;
+    deleteMafIds = computeCollectionDeltaDiff(
+      mafTrackers,
+      manifest.signatures.mafTrackers,
+      (m) => sanitizeDocId(m.id),
+      signatureForMaf,
+    ).toDeleteIds;
+    deleteOemIds = computeCollectionDeltaDiff(
+      oemRecords,
+      manifest.signatures.oemRecords,
+      (o) => sanitizeDocId(o.id),
+      signatureForOem,
+    ).toDeleteIds;
+    obsoleteAttIds = Object.keys(manifest.signatures.attachments).filter(
+      (attId) => !nextAttachmentIds.has(sanitizeDocId(attId)),
+    );
+  } else {
+    const existing = await fetchAllFromCloud(user.uid, workspaceTenantId, ctx, {
+      includeAttachments: true,
+      forceFull: true,
+    });
+    deleteTenderIds = existing.tenders
+      .map((t) => sanitizeDocId(t.id))
+      .filter((id) => !nextTenderIds.has(id));
+    deleteEmdIds = existing.emdRecords
+      .map((r) => sanitizeDocId(r.id))
+      .filter((id) => !nextEmdIds.has(id));
+    deleteMafIds = existing.mafTrackers
+      .map((m) => sanitizeDocId(m.id))
+      .filter((id) => !nextMafIds.has(id));
+    deleteOemIds = existing.oemRecords
+      .map((o) => sanitizeDocId(o.id))
+      .filter((id) => !nextOemIds.has(id));
+    obsoleteAttIds = Array.from(existing.attachmentFiles.keys())
+      .map((id) => sanitizeDocId(id))
+      .filter((id) => !nextAttachmentIds.has(id));
+  }
+
+  const tenderDiff = computeCollectionDeltaDiff(
+    tenders,
+    manifest.signatures.tenders,
+    (t) => sanitizeDocId(t.id),
+    signatureForTender,
+    { forceAll: Boolean(options?.forceFull) || !canUseManifestDiff },
   );
-  const obsoleteEmd = existing.emdRecords.filter(
-    (oldEmd) => !nextEmdIds.has(sanitizeDocId(oldEmd.id)),
+  const emdDiff = computeCollectionDeltaDiff(
+    emdRecords,
+    manifest.signatures.emdRecords,
+    (r) => sanitizeDocId(r.id),
+    signatureForEmd,
+    { forceAll: Boolean(options?.forceFull) || !canUseManifestDiff },
   );
-  const obsoleteMaf = existing.mafTrackers.filter(
-    (oldMaf) => !nextMafIds.has(sanitizeDocId(oldMaf.id)),
+  const mafDiff = computeCollectionDeltaDiff(
+    mafTrackers,
+    manifest.signatures.mafTrackers,
+    (m) => sanitizeDocId(m.id),
+    signatureForMaf,
+    { forceAll: Boolean(options?.forceFull) || !canUseManifestDiff },
   );
-  const obsoleteOems = existing.oemRecords.filter(
-    (oldOem) => !nextOemIds.has(sanitizeDocId(oldOem.id)),
-  );
-  const obsoleteAttIds = Array.from(existing.attachmentFiles.keys()).filter(
-    (oldAttId) => !nextAttachmentIds.has(sanitizeDocId(oldAttId)),
+  const oemDiff = computeCollectionDeltaDiff(
+    oemRecords,
+    manifest.signatures.oemRecords,
+    (o) => sanitizeDocId(o.id),
+    signatureForOem,
+    { forceAll: Boolean(options?.forceFull) || !canUseManifestDiff },
   );
 
-  await runInBatches(obsoleteTenders, 6, (oldTender) =>
-    deleteTenderFromCloud(user, oldTender.id, workspaceTenantId, ctx),
-  );
-  await runInBatches(obsoleteEmd, 6, (oldEmd) =>
-    deleteEmdRecordFromCloud(user, oldEmd.id, workspaceTenantId, ctx),
-  );
-  await runInBatches(obsoleteMaf, 6, (oldMaf) =>
-    deleteMafTrackerFromCloud(user, oldMaf.id, workspaceTenantId, ctx),
-  );
-  await runInBatches(obsoleteOems, 6, (oldOem) =>
-    deleteOemRecordFromCloud(user, oldOem.id, workspaceTenantId, ctx),
-  );
-  await runInBatches(obsoleteAttIds, 6, async (oldAttId) => {
-    const safeId = sanitizeDocId(oldAttId);
-    const path = `${prefix}/attachmentFiles/${safeId}`;
-    try {
-      await deleteDoc(getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId));
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, path);
-    }
-  });
+  const singletons: DirtySyncSnapshot['singletons'] = [];
+  if (
+    options?.forceFull ||
+    !canUseManifestDiff ||
+    manifest.signatures.singletons.profile !== signatureForProfile(profile)
+  ) {
+    singletons.push('profile');
+  }
+  if (
+    options?.forceFull ||
+    !canUseManifestDiff ||
+    manifest.signatures.singletons.preferences !== signatureForPreferences(preferences)
+  ) {
+    singletons.push('preferences');
+  }
 
-  await backupAllToCloud(
+  const dirty: DirtySyncSnapshot = {
+    tenders: {
+      upserts: tenderDiff.toUpsert.map((t) => sanitizeDocId(t.id)),
+      deletes: deleteTenderIds,
+    },
+    emdRecords: {
+      upserts: emdDiff.toUpsert.map((r) => sanitizeDocId(r.id)),
+      deletes: deleteEmdIds,
+    },
+    mafTrackers: {
+      upserts: mafDiff.toUpsert.map((m) => sanitizeDocId(m.id)),
+      deletes: deleteMafIds,
+    },
+    oemRecords: {
+      upserts: oemDiff.toUpsert.map((o) => sanitizeDocId(o.id)),
+      deletes: deleteOemIds,
+    },
+    singletons,
+  };
+
+  await syncDeltaBatchToCloud({
     user,
-    profile,
-    preferences,
+    dirty,
     tenders,
     emdRecords,
     mafTrackers,
-    workspaceTenantId,
-    ctx,
     oemRecords,
-  );
+    profile,
+    preferences,
+    workspaceTenantId,
+    target: ctx,
+    deferAttachmentsToBackground: false,
+  });
+
+  if (obsoleteAttIds.length > 0) {
+    const attDeleteOps: BatchWriteOp[] = obsoleteAttIds.map((attId) => {
+      const safeId = sanitizeDocId(attId);
+      return {
+        type: 'delete',
+        ref: getScopedDoc(ctx, user.uid, scopedTenant, 'attachmentFiles', safeId),
+        path: `${prefix}/attachmentFiles/${safeId}`,
+      };
+    });
+    await commitWriteBatchOps(ctx, attDeleteOps);
+    const updatedManifest = loadDeltaSyncManifest(scope);
+    for (const attId of obsoleteAttIds) {
+      delete updatedManifest.signatures.attachments[sanitizeDocId(attId)];
+    }
+    saveDeltaSyncManifest(updatedManifest);
+  }
 }
 
 export function subscribeToUserCloudData(
@@ -1683,11 +2601,12 @@ export function subscribeToUserCloudData(
     onEmdRecords: (records: EmdBgRecord[]) => void;
     onMafTrackers: (trackers: MafTrackerRecord[]) => void;
     onOemRecords?: (oems: OemRecord[]) => void;
-    onAttachmentFiles: (fileMap: Map<string, string>) => void;
+    onAttachmentFiles?: (fileMap: Map<string, string>) => void;
     onError: (err: Error) => void;
   },
   workspaceTenantId?: string | null,
   target?: CloudTargetContext | null,
+  options?: { includeAttachments?: boolean },
 ): Unsubscribe {
   const { ctx, scopedTenant, prefix } = resolveScope(uid, workspaceTenantId, target);
   const profilePath = `${prefix}/profile/firm`;
@@ -1705,7 +2624,10 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'profile', 'firm'),
     (snap) => {
       if (snap.exists()) {
+        rememberDocMetadata(ctx, profilePath, snap.data());
         callbacks.onProfile(docToProfile(snap.data()));
+      } else {
+        rememberDocMetadata(ctx, profilePath, null);
       }
     },
     (error) => {
@@ -1721,7 +2643,10 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'settings', 'preferences'),
     (snap) => {
       if (snap.exists()) {
+        rememberDocMetadata(ctx, prefsPath, snap.data());
         callbacks.onPreferences(docToPreferences(snap.data()));
+      } else {
+        rememberDocMetadata(ctx, prefsPath, null);
       }
     },
     (error) => {
@@ -1736,7 +2661,10 @@ export function subscribeToUserCloudData(
   const unsubTenders = onSnapshot(
     query(getScopedCollection(ctx, uid, scopedTenant, 'tenders'), where('ownerUid', '==', uid)),
     (snap) => {
-      callbacks.onTenders(snap.docs.map((d) => docToTender(d.data())));
+      for (const d of snap.docs) {
+        rememberDocMetadata(ctx, `${tendersPath}/${d.id}`, d.data(), 'tender');
+      }
+      callbacks.onTenders(snap.docs.map((d) => docToTender(d.data(), d.id)));
     },
     (error) => {
       try {
@@ -1750,7 +2678,10 @@ export function subscribeToUserCloudData(
   const unsubEmd = onSnapshot(
     query(getScopedCollection(ctx, uid, scopedTenant, 'emdRecords'), where('ownerUid', '==', uid)),
     (snap) => {
-      callbacks.onEmdRecords(snap.docs.map((d) => docToEmdRecord(d.data())));
+      for (const d of snap.docs) {
+        rememberDocMetadata(ctx, `${emdPath}/${d.id}`, d.data(), 'emd');
+      }
+      callbacks.onEmdRecords(snap.docs.map((d) => docToEmdRecord(d.data(), d.id)));
     },
     (error) => {
       try {
@@ -1764,7 +2695,10 @@ export function subscribeToUserCloudData(
   const unsubMaf = onSnapshot(
     query(getScopedCollection(ctx, uid, scopedTenant, 'maf_tracker'), where('ownerUid', '==', uid)),
     (snap) => {
-      callbacks.onMafTrackers(snap.docs.map((d) => docToMafTracker(d.data())));
+      for (const d of snap.docs) {
+        rememberDocMetadata(ctx, `${mafPath}/${d.id}`, d.data());
+      }
+      callbacks.onMafTrackers(snap.docs.map((d) => docToMafTracker(d.data(), d.id)));
     },
     (error) => {
       try {
@@ -1778,6 +2712,9 @@ export function subscribeToUserCloudData(
   const unsubOems = onSnapshot(
     query(getScopedCollection(ctx, uid, scopedTenant, 'oemDetails'), where('ownerUid', '==', uid)),
     (snap) => {
+      for (const d of snap.docs) {
+        rememberDocMetadata(ctx, `${oemPath}/${d.id}`, d.data());
+      }
       if (callbacks.onOemRecords) {
         const list = snap.docs
           .map((d) => docToOemRecord(d.data(), d.id))
@@ -1794,34 +2731,41 @@ export function subscribeToUserCloudData(
     },
   );
 
-  const unsubFiles = onSnapshot(
-    query(
-      getScopedCollection(ctx, uid, scopedTenant, 'attachmentFiles'),
-      where('ownerUid', '==', uid),
-    ),
-    (snap) => {
-      const map = new Map<string, string>();
-      for (const d of snap.docs) {
-        const data = d.data();
-        if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
-          map.set(String(data.id ?? d.id), data.dataUrl);
-        }
-      }
-      callbacks.onAttachmentFiles(map);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, filesPath);
-      } catch (wrapped) {
-        callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
-      }
-    },
-  );
+  // Heavy attachmentFiles subscription is disabled by default during live sessions because
+  // missing/new blobs are loaded lazily & incrementally in the background without blocking UI.
+  const unsubFiles: Unsubscribe | null =
+    options?.includeAttachments && callbacks.onAttachmentFiles
+      ? onSnapshot(
+          query(
+            getScopedCollection(ctx, uid, scopedTenant, 'attachmentFiles'),
+            where('ownerUid', '==', uid),
+          ),
+          (snap) => {
+            const map = new Map<string, string>();
+            for (const d of snap.docs) {
+              rememberDocMetadata(ctx, `${filesPath}/${d.id}`, d.data());
+              const data = d.data();
+              if (typeof data.dataUrl === 'string' && data.dataUrl.length > 0) {
+                map.set(String(data.id ?? d.id), data.dataUrl);
+              }
+            }
+            callbacks.onAttachmentFiles?.(map);
+          },
+          (error) => {
+            try {
+              handleFirestoreError(error, OperationType.LIST, filesPath);
+            } catch (wrapped) {
+              callbacks.onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+            }
+          },
+        )
+      : null;
 
   const unsubEmailConfig = onSnapshot(
     getScopedDoc(ctx, uid, scopedTenant, 'emailConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onEmailConfig) {
+        rememberDocMetadata(ctx, emailConfigPath, snap.data());
         callbacks.onEmailConfig(docToEmailConfig(snap.data()));
       }
     },
@@ -1837,9 +2781,12 @@ export function subscribeToUserCloudData(
   const unsubEmailAlerts = onSnapshot(
     query(getScopedCollection(ctx, uid, scopedTenant, 'emailAlerts'), where('ownerUid', '==', uid)),
     (snap) => {
+      for (const d of snap.docs) {
+        rememberDocMetadata(ctx, `${emailAlertsPath}/${d.id}`, d.data());
+      }
       if (callbacks.onEmailAlerts) {
         const sorted = snap.docs
-          .map((d) => docToEmailAlertLog(d.data()))
+          .map((d) => docToEmailAlertLog(d.data(), d.id))
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         callbacks.onEmailAlerts(sorted);
       }
@@ -1857,6 +2804,7 @@ export function subscribeToUserCloudData(
     getScopedDoc(ctx, uid, scopedTenant, 'sheetConfig', 'default'),
     (snap) => {
       if (snap.exists() && callbacks.onSheetConfig) {
+        rememberDocMetadata(ctx, sheetConfigPath, snap.data());
         callbacks.onSheetConfig(docToSheetConfig(snap.data()));
       }
     },
@@ -1879,6 +2827,6 @@ export function subscribeToUserCloudData(
     unsubEmd();
     unsubMaf();
     unsubOems();
-    unsubFiles();
+    if (unsubFiles) unsubFiles();
   };
 }

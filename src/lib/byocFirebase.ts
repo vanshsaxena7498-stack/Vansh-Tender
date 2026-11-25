@@ -8,7 +8,15 @@ import {
   type Auth,
   type User,
 } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore, type Firestore } from 'firebase/firestore';
+import {
+  doc,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  type Firestore,
+} from 'firebase/firestore';
 import { getStorage, type FirebaseStorage } from 'firebase/storage';
 import type { ByocConnectionState, ByocFirebaseConfig } from '../types/crm';
 import {
@@ -153,9 +161,28 @@ export async function getOrInitByocContext(
     },
     appName,
   );
-  const db = normalized.firestoreDatabaseId
-    ? getFirestore(app, normalized.firestoreDatabaseId)
-    : getFirestore(app);
+  let db: Firestore;
+  try {
+    if (typeof window !== 'undefined' && typeof window.indexedDB !== 'undefined') {
+      db = initializeFirestore(
+        app,
+        {
+          localCache: persistentLocalCache({
+            tabManager: persistentMultipleTabManager(),
+          }),
+        },
+        normalized.firestoreDatabaseId || undefined,
+      );
+    } else {
+      db = normalized.firestoreDatabaseId
+        ? getFirestore(app, normalized.firestoreDatabaseId)
+        : getFirestore(app);
+    }
+  } catch {
+    db = normalized.firestoreDatabaseId
+      ? getFirestore(app, normalized.firestoreDatabaseId)
+      : getFirestore(app);
+  }
   const auth = getAuth(app);
   const storage = getStorage(app);
   const provider = new GoogleAuthProvider();

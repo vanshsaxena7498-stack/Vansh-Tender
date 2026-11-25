@@ -96,27 +96,21 @@ import {
   type CloudTargetContext,
   type CloudWorkspaceDataset,
   createEmptyCloudDataset,
-  deleteEmdRecordFromCloud,
-  deleteMafTrackerFromCloud,
-  deleteOemRecordFromCloud,
-  deleteTenderFromCloud,
   ensureUserRootDocument,
   fetchAdminCloudWorkspaceWithFallback,
+  fetchAdminLegacyFallbackWorkspace,
   fetchAllFromCloud,
+  fetchCoreCloudWorkspaceFast,
+  fetchMissingAttachmentsBackground,
   fetchSecondaryUsersFromCloud,
   getCentralAdminCloudTarget,
+  mergeCloudDatasets,
   replaceCloudDataset,
   subscribeToUserCloudData,
+  syncAttachmentFilesToCloud,
+  syncDeltaBatchToCloud,
   syncEmailAlertLogToCloud,
-  syncEmailConfigToCloud,
-  syncEmdRecordToCloud,
-  syncMafTrackerToCloud,
-  syncOemRecordToCloud,
-  syncPreferencesToCloud,
-  syncProfileToCloud,
   syncSecondaryUserToCloud,
-  syncSheetConfigToCloud,
-  syncTenderToCloud,
   uploadMafDocumentFile,
 } from './utils/cloudSync';
 import {
@@ -127,6 +121,18 @@ import {
   mergeCloudProfileWithLocal,
   mergeCloudTendersWithFiles,
 } from './utils/cloudSyncHelpers';
+import {
+  buildDeltaSyncScopeKey,
+  collectMissingAttachmentIds,
+  createDebouncedDeltaScheduler,
+  DEFAULT_SYNC_DEBOUNCE_MS,
+  DEFAULT_SYNC_MAX_WAIT_MS,
+  isLegacyFallbackScanDue,
+  loadDeltaSyncManifest,
+  type DebouncedSyncScheduler,
+  type DeltaEntityCollectionKey,
+  type DeltaSingletonKey,
+} from './utils/deltaSync';
 import {
   buildTenderEmailMessage,
   computePendingEmailAlerts,
@@ -422,6 +428,8 @@ export default function App() {
   );
   const activeCloudSyncCountRef = useRef<number>(0);
   const cloudWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const backgroundAttachmentTaskSeqRef = useRef<number>(0);
+  const deltaSchedulerRef = useRef<DebouncedSyncScheduler | null>(null);
 
   const beginCloudSync = () => {
     activeCloudSyncCountRef.current += 1;
@@ -696,6 +704,162 @@ export default function App() {
     };
   }, [isAuthenticated, currentUser?.userId, currentUser?.role, byocConfig]);
 
+  // Debounced dirty-entity delta batch sync scheduler (coalesces rapid edits into 1 writeBatch commit)
+  useEffect(() => {
+    const scheduler = createDebouncedDeltaScheduler({
+      debounceMs: DEFAULT_SYNC_DEBOUNCE_MS,
+      maxWaitMs: DEFAULT_SYNC_MAX_WAIT_MS,
+      onFlush: async (dirty) => {
+        const curState = stateRef.current;
+        const user = curState.activeCloudUser;
+        const target = curState.activeCloudTarget;
+        if (!user || !target) return;
+        if (curState.currentUser?.role === 'secondary' && !target.isByoc) return;
+        if (localWorkspaceClearedRef.current) return;
+
+        // Capture snapshot synchronously so rapid logout/account-switch flushes preserve exact user/target/data
+        const snapshot = {
+          user,
+          target,
+          tenders: curState.tenders,
+          emdRecords: curState.emdRecords,
+          mafTrackers: curState.mafTrackers,
+          oemRecords: curState.oemRecords,
+          profile: curState.firmProfile,
+          preferences: { adminPin: curState.adminPin, darkMode: curState.darkMode },
+          emailConfig: curState.emailSettings,
+          sheetConfig: curState.sheetSettings,
+          workspaceTenantId: curState.workspaceTenantId,
+        };
+
+        beginCloudSync();
+        try {
+          const result = await enqueueCloudOperation(() =>
+            syncDeltaBatchToCloud({
+              user: snapshot.user,
+              dirty,
+              tenders: snapshot.tenders,
+              emdRecords: snapshot.emdRecords,
+              mafTrackers: snapshot.mafTrackers,
+              oemRecords: snapshot.oemRecords,
+              profile: snapshot.profile,
+              preferences: snapshot.preferences,
+              emailConfig: snapshot.emailConfig,
+              sheetConfig: snapshot.sheetConfig,
+              workspaceTenantId: snapshot.workspaceTenantId,
+              target: snapshot.target,
+              deferAttachmentsToBackground: true,
+            }),
+          );
+          markSyncedNow();
+          setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+
+          // Upload heavy base64 attachment payloads asynchronously in background without blocking UI
+          if (result.deferredAttachments.length > 0) {
+            window.setTimeout(() => {
+              void enqueueCloudOperation(() =>
+                syncAttachmentFilesToCloud(
+                  snapshot.user,
+                  result.deferredAttachments,
+                  snapshot.workspaceTenantId,
+                  snapshot.target,
+                ),
+              )
+                .then(() => {
+                  markSyncedNow();
+                })
+                .catch((err) => {
+                  setCloudFeedback({
+                    type: 'err',
+                    msg: formatCloudErrorMessage(
+                      err,
+                      snapshot.target.projectId,
+                      snapshot.target.databaseId,
+                    ),
+                  });
+                });
+            }, 40);
+          }
+        } catch (err) {
+          setCloudFeedback({
+            type: 'err',
+            msg: formatCloudErrorMessage(err, snapshot.target.projectId, snapshot.target.databaseId),
+          });
+        } finally {
+          endCloudSync();
+        }
+      },
+    });
+    deltaSchedulerRef.current = scheduler;
+    return () => {
+      scheduler.dispose();
+      if (deltaSchedulerRef.current === scheduler) {
+        deltaSchedulerRef.current = null;
+      }
+    };
+  }, []);
+
+  const queueEntityUpsert = (collection: DeltaEntityCollectionKey, id: string) => {
+    if (!stateRef.current.activeCloudUser || !stateRef.current.activeCloudTarget) return;
+    localWorkspaceClearedRef.current = false;
+    deltaSchedulerRef.current?.markUpsert(collection, id);
+  };
+
+  const queueEntityDelete = (collection: DeltaEntityCollectionKey, id: string) => {
+    if (!stateRef.current.activeCloudUser || !stateRef.current.activeCloudTarget) return;
+    if (localWorkspaceClearedRef.current) return;
+    deltaSchedulerRef.current?.markDelete(collection, id);
+  };
+
+  const queueSingletonDeltaSync = (singleton: DeltaSingletonKey) => {
+    if (!stateRef.current.activeCloudUser || !stateRef.current.activeCloudTarget) return;
+    deltaSchedulerRef.current?.markSingleton(singleton);
+  };
+
+  const scheduleBackgroundAttachmentHydration = (params: {
+    cloudUid: string;
+    tenantId: string | null;
+    target: CloudTargetContext;
+    tendersList: Tender[];
+    emdList: EmdBgRecord[];
+    mafList: MafTrackerRecord[];
+    shouldCancel?: () => boolean;
+  }) => {
+    const missingIds = collectMissingAttachmentIds({
+      tenders: params.tendersList,
+      emdRecords: params.emdList,
+      mafTrackers: params.mafList,
+      loadedAttachmentFiles: attachmentFilesRef.current,
+    });
+    if (missingIds.length === 0) return;
+
+    const seq = ++backgroundAttachmentTaskSeqRef.current;
+    window.setTimeout(() => {
+      if (params.shouldCancel?.() || backgroundAttachmentTaskSeqRef.current !== seq) return;
+      void fetchMissingAttachmentsBackground({
+        uid: params.cloudUid,
+        attachmentIds: missingIds,
+        workspaceTenantId: params.tenantId,
+        target: params.target,
+        shouldCancel: () =>
+          Boolean(params.shouldCancel?.()) ||
+          backgroundAttachmentTaskSeqRef.current !== seq ||
+          localWorkspaceClearedRef.current,
+        onBatchLoaded: (batchMap) => {
+          if (batchMap.size === 0) return;
+          for (const [k, v] of batchMap.entries()) {
+            attachmentFilesRef.current.set(k, v);
+          }
+          const filesSnapshot = attachmentFilesRef.current;
+          setTenders((prev) => mergeCloudTendersWithFiles(prev, filesSnapshot, prev));
+          setEmdRecords((prev) => mergeCloudEmdWithFiles(prev, filesSnapshot, prev));
+          setMafTrackers((prev) => mergeCloudMafTrackersWithFiles(prev, filesSnapshot, prev));
+          markSyncedNow();
+        },
+      });
+    }, 60);
+  };
+
   // Persist isolated secondary user workspace offline without affecting Admin or clearing localStorage
   useEffect(() => {
     if (!isAuthenticated || currentUser?.role !== 'secondary') return;
@@ -769,23 +933,15 @@ export default function App() {
       beginCloudSync();
       didBeginSync = true;
       try {
-        await enqueueCloudOperation(async () => {
+        const loadedCoreCloud: CloudWorkspaceDataset | null = await enqueueCloudOperation(async () => {
           await ensureUserRootDocument(activeCloudUser, activeTenantId, currentUser, targetRef);
-          if (cancelled) return;
+          if (cancelled) return null;
 
-          let cloud: CloudWorkspaceDataset;
-          if (currentUser.role === 'admin') {
-            const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(activeCloudUser);
-            if (cancelled) return;
-            adminSupplementalRef.current = adminWorkspace.supplemental;
-            cloud = adminWorkspace.merged;
-          } else {
-            adminSupplementalRef.current = createEmptyCloudDataset();
-            cloud = await fetchAllFromCloud(cloudUid, activeTenantId, targetRef);
-            if (cancelled) return;
-          }
-
-          attachmentFilesRef.current = cloud.attachmentFiles;
+          adminSupplementalRef.current = createEmptyCloudDataset();
+          // Fast foreground load: read core collections in parallel via persistent cache + delta query
+          // without blocking initial UI rendering on heavy attachment blobs or Admin's legacy scan.
+          const cloud = await fetchCoreCloudWorkspaceFast(cloudUid, activeTenantId, targetRef);
+          if (cancelled) return null;
 
           const cloudIsEmpty =
             !cloud.profile &&
@@ -796,6 +952,60 @@ export default function App() {
             cloud.oemRecords.length === 0;
 
           if (cloudIsEmpty) {
+            if (currentUser.role === 'admin') {
+              // On an empty primary UID doc, check legacy Admin fallback once before seeding
+              const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(activeCloudUser);
+              if (cancelled) return null;
+              adminSupplementalRef.current = adminWorkspace.supplemental;
+              const combined = adminWorkspace.merged;
+              const fallbackHasData =
+                Boolean(combined.profile) ||
+                Boolean(combined.preferences) ||
+                combined.tenders.length > 0 ||
+                combined.emdRecords.length > 0 ||
+                combined.mafTrackers.length > 0 ||
+                combined.oemRecords.length > 0;
+              if (fallbackHasData) {
+                attachmentFilesRef.current = combined.attachmentFiles;
+                if (combined.profile) {
+                  setFirmProfile((prev) => mergeCloudProfileWithLocal(combined.profile!, prev));
+                }
+                if (combined.preferences) {
+                  setAdminPin(combined.preferences.adminPin);
+                  setDarkMode(combined.preferences.darkMode);
+                }
+                if (combined.emailConfig) setEmailSettings(combined.emailConfig);
+                if (combined.sheetConfig) {
+                  setSheetSettings(combined.sheetConfig);
+                  setSheetSyncStatus(
+                    combined.sheetConfig.webhookUrl
+                      ? combined.sheetConfig.lastSyncedAt
+                        ? 'synced'
+                        : 'idle'
+                      : 'unconfigured',
+                  );
+                }
+                if (combined.emailAlerts.length > 0) {
+                  setEmailLogs((prev) => mergeEmailLogs(combined.emailAlerts, prev));
+                }
+                setTenders((prev) =>
+                  mergeCloudTendersWithFiles(combined.tenders, combined.attachmentFiles, prev),
+                );
+                setEmdRecords((prev) =>
+                  mergeCloudEmdWithFiles(combined.emdRecords, combined.attachmentFiles, prev),
+                );
+                if (combined.mafTrackers.length > 0) {
+                  setMafTrackers((prev) =>
+                    mergeCloudMafTrackersWithFiles(combined.mafTrackers, combined.attachmentFiles, prev),
+                  );
+                }
+                if (combined.oemRecords.length > 0) setOemRecords(combined.oemRecords);
+                markSyncedNow();
+                setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+                return combined;
+              }
+            }
+
             const {
               firmProfile: curProfile,
               tenders: curTenders,
@@ -818,9 +1028,12 @@ export default function App() {
               activeTenantId,
               targetRef,
               curOems,
+              { forceFull: true, deferAttachmentsToBackground: true },
             );
-            await syncEmailConfigToCloud(activeCloudUser, curEmailSettings, activeTenantId, targetRef);
-            await syncSheetConfigToCloud(activeCloudUser, curSheetSettings, activeTenantId, targetRef);
+            deltaSchedulerRef.current?.markSingleton('emailConfig');
+            deltaSchedulerRef.current?.markSingleton('sheetConfig');
+            void curEmailSettings;
+            void curSheetSettings;
             if (!cancelled) {
               markSyncedNow();
               setCloudFeedback({
@@ -828,7 +1041,7 @@ export default function App() {
                 msg: `Connected as ${activeCloudUser.email} on "${targetRef.projectId}". All data is stored in your isolated Firebase workspace.`,
               });
             }
-            return;
+            return null;
           }
 
           if (cloud.profile) {
@@ -855,14 +1068,14 @@ export default function App() {
             setEmailLogs((prev) => mergeEmailLogs(cloud.emailAlerts, prev));
           }
           setTenders((prev) =>
-            mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
+            mergeCloudTendersWithFiles(cloud.tenders, attachmentFilesRef.current, prev),
           );
           setEmdRecords((prev) =>
-            mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
+            mergeCloudEmdWithFiles(cloud.emdRecords, attachmentFilesRef.current, prev),
           );
           if (cloud.mafTrackers.length > 0) {
             setMafTrackers((prev) =>
-              mergeCloudMafTrackersWithFiles(cloud.mafTrackers, cloud.attachmentFiles, prev),
+              mergeCloudMafTrackersWithFiles(cloud.mafTrackers, attachmentFilesRef.current, prev),
             );
           }
           if (cloud.oemRecords.length > 0) {
@@ -870,12 +1083,112 @@ export default function App() {
           }
           markSyncedNow();
           setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
+          return cloud;
         });
         if (cancelled) return;
 
-        if (cancelled) return;
+        // Release UI sync indicator immediately after fast core load; heavy blobs & legacy scan run in background
+        if (didBeginSync) {
+          endCloudSync();
+          didBeginSync = false;
+        }
 
+        if (loadedCoreCloud) {
+          scheduleBackgroundAttachmentHydration({
+            cloudUid,
+            tenantId: activeTenantId,
+            target: targetRef,
+            tendersList: loadedCoreCloud.tenders,
+            emdList: loadedCoreCloud.emdRecords,
+            mafList: loadedCoreCloud.mafTrackers,
+            shouldCancel: () => cancelled,
+          });
+        }
+
+        // Non-blocking background Admin legacy fallback scan (throttled via delta manifest TTL)
         const isAdminSession = currentUser.role === 'admin';
+        if (isAdminSession) {
+          const scopeKey = buildDeltaSyncScopeKey({
+            projectId: targetRef.projectId,
+            databaseId: targetRef.databaseId,
+            uid: cloudUid,
+            tenantId: null,
+          });
+          const adminManifest = loadDeltaSyncManifest({
+            projectId: targetRef.projectId,
+            databaseId: targetRef.databaseId,
+            uid: cloudUid,
+            tenantId: null,
+          });
+          void scopeKey;
+          if (isLegacyFallbackScanDue(adminManifest.legacyScanDoneAtMs)) {
+            window.setTimeout(() => {
+              if (cancelled || localWorkspaceClearedRef.current) return;
+              void fetchAdminLegacyFallbackWorkspace(activeCloudUser, {
+                includeAttachments: false,
+              })
+                .then((supplemental) => {
+                  if (cancelled || localWorkspaceClearedRef.current) return;
+                  adminSupplementalRef.current = supplemental;
+                  const hasSupplemental =
+                    supplemental.tenders.length > 0 ||
+                    supplemental.emdRecords.length > 0 ||
+                    supplemental.mafTrackers.length > 0 ||
+                    supplemental.oemRecords.length > 0 ||
+                    supplemental.emailAlerts.length > 0;
+                  if (!hasSupplemental) return;
+
+                  if (supplemental.tenders.length > 0) {
+                    setTenders((prev) =>
+                      mergeCloudTendersWithFiles(
+                        mergeAdminRecordsById(prev, supplemental.tenders),
+                        attachmentFilesRef.current,
+                        prev,
+                      ),
+                    );
+                  }
+                  if (supplemental.emdRecords.length > 0) {
+                    setEmdRecords((prev) =>
+                      mergeCloudEmdWithFiles(
+                        mergeAdminRecordsById(prev, supplemental.emdRecords),
+                        attachmentFilesRef.current,
+                        prev,
+                      ),
+                    );
+                  }
+                  if (supplemental.mafTrackers.length > 0) {
+                    setMafTrackers((prev) =>
+                      mergeCloudMafTrackersWithFiles(
+                        mergeAdminRecordsById(prev, supplemental.mafTrackers),
+                        attachmentFilesRef.current,
+                        prev,
+                      ),
+                    );
+                  }
+                  if (supplemental.oemRecords.length > 0) {
+                    setOemRecords((prev) => mergeAdminRecordsById(prev, supplemental.oemRecords));
+                  }
+                  if (supplemental.emailAlerts.length > 0) {
+                    setEmailLogs((prev) => mergeEmailLogs(supplemental.emailAlerts, prev));
+                  }
+
+                  scheduleBackgroundAttachmentHydration({
+                    cloudUid,
+                    tenantId: null,
+                    target: targetRef,
+                    tendersList: supplemental.tenders,
+                    emdList: supplemental.emdRecords,
+                    mafList: supplemental.mafTrackers,
+                    shouldCancel: () => cancelled,
+                  });
+                })
+                .catch(() => {
+                  // Non-fatal background legacy scan failure
+                });
+            }, 150);
+          }
+        }
+
         unsubCloud = subscribeToUserCloudData(
           cloudUid,
           {
@@ -916,6 +1229,15 @@ export default function App() {
               setTenders((prev) =>
                 mergeCloudTendersWithFiles(combinedTenders, attachmentFilesRef.current, prev),
               );
+              scheduleBackgroundAttachmentHydration({
+                cloudUid,
+                tenantId: activeTenantId,
+                target: targetRef,
+                tendersList: combinedTenders,
+                emdList: stateRef.current.emdRecords,
+                mafList: stateRef.current.mafTrackers,
+                shouldCancel: () => cancelled,
+              });
               markSyncedNow();
             },
             onEmdRecords: (remoteEmd) => {
@@ -926,6 +1248,15 @@ export default function App() {
               setEmdRecords((prev) =>
                 mergeCloudEmdWithFiles(combinedEmd, attachmentFilesRef.current, prev),
               );
+              scheduleBackgroundAttachmentHydration({
+                cloudUid,
+                tenantId: activeTenantId,
+                target: targetRef,
+                tendersList: stateRef.current.tenders,
+                emdList: combinedEmd,
+                mafList: stateRef.current.mafTrackers,
+                shouldCancel: () => cancelled,
+              });
               markSyncedNow();
             },
             onMafTrackers: (remoteMaf) => {
@@ -936,6 +1267,15 @@ export default function App() {
               setMafTrackers((prev) =>
                 mergeCloudMafTrackersWithFiles(combinedMaf, attachmentFilesRef.current, prev),
               );
+              scheduleBackgroundAttachmentHydration({
+                cloudUid,
+                tenantId: activeTenantId,
+                target: targetRef,
+                tendersList: stateRef.current.tenders,
+                emdList: stateRef.current.emdRecords,
+                mafList: combinedMaf,
+                shouldCancel: () => cancelled,
+              });
               markSyncedNow();
             },
             onOemRecords: (remoteOems) => {
@@ -968,6 +1308,7 @@ export default function App() {
           },
           activeTenantId,
           targetRef,
+          { includeAttachments: false },
         );
       } catch (err) {
         if (!cancelled) {
@@ -987,6 +1328,7 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      backgroundAttachmentTaskSeqRef.current += 1;
       if (unsubCloud) unsubCloud();
     };
   }, [
@@ -1080,6 +1422,7 @@ export default function App() {
   };
 
   const handleDisconnectCloud = async () => {
+    await deltaSchedulerRef.current?.flush();
     beginCloudSync();
     const session = stateRef.current.currentUser;
     const target = stateRef.current.activeCloudTarget;
@@ -1118,6 +1461,7 @@ export default function App() {
     const prefs: UserPreferences = { adminPin: curPin, darkMode: curDark };
     const preserveExistingCloud = localWorkspaceClearedRef.current;
     localWorkspaceClearedRef.current = false;
+    deltaSchedulerRef.current?.clear();
     void runCloudTask(
       (user, target) =>
         preserveExistingCloud
@@ -1144,27 +1488,36 @@ export default function App() {
               curOems,
             ),
       preserveExistingCloud
-        ? `Synced ${curTenders.length} local tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers & ${curEmd.length} EMD/BG records non-destructively to Firestore.`
-        : `Synced ${curTenders.length} tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
+        ? `Delta synced ${curTenders.length} local tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers & ${curEmd.length} EMD/BG records non-destructively to Firestore.`
+        : `Delta synced ${curTenders.length} tenders, ${curOems.length} OEMs, ${curMaf.length} MAF trackers, ${curEmd.length} EMD/BG records & settings to Firestore.`,
     );
   };
 
   const handleRestoreFromCloud = () => {
     localWorkspaceClearedRef.current = false;
+    deltaSchedulerRef.current?.clear();
     const tenantId = stateRef.current.workspaceTenantId;
     const userSession = stateRef.current.currentUser;
     void runCloudTask(async (user, target) => {
       await ensureUserRootDocument(user, tenantId, userSession, target);
       let cloud: CloudWorkspaceDataset;
       if (userSession?.role === 'admin') {
-        const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(user);
-        adminSupplementalRef.current = adminWorkspace.supplemental;
-        cloud = adminWorkspace.merged;
+        const primary = await fetchAllFromCloud(user.uid, null, target, {
+          includeAttachments: false,
+          forceFull: true,
+        });
+        const supplemental = await fetchAdminLegacyFallbackWorkspace(user, {
+          includeAttachments: false,
+        });
+        adminSupplementalRef.current = supplemental;
+        cloud = mergeCloudDatasets(primary, supplemental);
       } else {
         adminSupplementalRef.current = createEmptyCloudDataset();
-        cloud = await fetchAllFromCloud(user.uid, tenantId, target);
+        cloud = await fetchAllFromCloud(user.uid, tenantId, target, {
+          includeAttachments: false,
+          forceFull: true,
+        });
       }
-      attachmentFilesRef.current = cloud.attachmentFiles;
       if (cloud.profile) {
         setFirmProfile((prev) => mergeCloudProfileWithLocal(cloud.profile!, prev));
       }
@@ -1189,17 +1542,25 @@ export default function App() {
         setEmailLogs((prev) => mergeEmailLogs(cloud.emailAlerts, prev));
       }
       setTenders((prev) =>
-        mergeCloudTendersWithFiles(cloud.tenders, cloud.attachmentFiles, prev),
+        mergeCloudTendersWithFiles(cloud.tenders, attachmentFilesRef.current, prev),
       );
       setEmdRecords((prev) =>
-        mergeCloudEmdWithFiles(cloud.emdRecords, cloud.attachmentFiles, prev),
+        mergeCloudEmdWithFiles(cloud.emdRecords, attachmentFilesRef.current, prev),
       );
       setMafTrackers((prev) =>
-        mergeCloudMafTrackersWithFiles(cloud.mafTrackers, cloud.attachmentFiles, prev),
+        mergeCloudMafTrackersWithFiles(cloud.mafTrackers, attachmentFilesRef.current, prev),
       );
       if (cloud.oemRecords.length > 0 || userSession?.role === 'secondary') {
         setOemRecords(cloud.oemRecords);
       }
+      scheduleBackgroundAttachmentHydration({
+        cloudUid: user.uid,
+        tenantId,
+        target,
+        tendersList: cloud.tenders,
+        emdList: cloud.emdRecords,
+        mafList: cloud.mafTrackers,
+      });
     }, 'Reloaded latest data from Firebase Firestore.');
   };
 
@@ -1325,6 +1686,9 @@ export default function App() {
     }, 25_000);
 
     const dispatchUnloadBeacon = () => {
+      if (deltaSchedulerRef.current?.hasPending()) {
+        void deltaSchedulerRef.current.flush();
+      }
       try {
         const payload = JSON.stringify({
           userId: currentUser.userId,
@@ -1341,12 +1705,20 @@ export default function App() {
       }
     };
 
+    const handleVisibilityFlush = () => {
+      if (document.visibilityState === 'hidden' && deltaSchedulerRef.current?.hasPending()) {
+        void deltaSchedulerRef.current.flush();
+      }
+    };
+
     window.addEventListener('pagehide', dispatchUnloadBeacon);
     window.addEventListener('beforeunload', dispatchUnloadBeacon);
+    document.addEventListener('visibilitychange', handleVisibilityFlush);
     return () => {
       window.clearInterval(intervalId);
       window.removeEventListener('pagehide', dispatchUnloadBeacon);
       window.removeEventListener('beforeunload', dispatchUnloadBeacon);
+      document.removeEventListener('visibilitychange', handleVisibilityFlush);
     };
   }, [isAuthenticated, currentUser?.userId]);
 
@@ -1931,11 +2303,8 @@ export default function App() {
       stateRef.current.mafTrackers = merged.nextTrackers;
       setMafTrackers(merged.nextTrackers);
 
-      if (merged.targetTracker && stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
-        const activeTenant = stateRef.current.workspaceTenantId;
-        void runCloudTask((user, target) =>
-          syncMafTrackerToCloud(user, merged.targetTracker!, activeTenant, target),
-        );
+      if (merged.targetTracker) {
+        queueEntityUpsert('mafTrackers', merged.targetTracker.id);
       }
 
       if (merged.addedCount > 0) {
@@ -2037,16 +2406,7 @@ export default function App() {
       setSheetSyncStatus('synced');
       setSheetSyncError(null);
 
-      if (stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
-        const activeTenant = stateRef.current.workspaceTenantId;
-        const latestUser = stateRef.current.activeCloudUser;
-        const latestTarget = stateRef.current.activeCloudTarget;
-        void enqueueCloudOperation(() =>
-          syncSheetConfigToCloud(latestUser, updatedCfg, activeTenant, latestTarget),
-        ).catch(() => {
-          // Non-fatal: already updated in-memory
-        });
-      }
+      queueSingletonDeltaSync('sheetConfig');
 
       if (opts.force) {
         const label =
@@ -2169,19 +2529,16 @@ export default function App() {
 
     setTenderModalTarget(undefined);
 
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask(async (user, target) => {
-      await syncTenderToCloud(user, saved, activeTenant, target);
-      if (linkedRecordToSync) {
-        await syncEmdRecordToCloud(user, linkedRecordToSync, activeTenant, target);
-      }
-      if (linkedMafToSync) {
-        await syncMafTrackerToCloud(user, linkedMafToSync, activeTenant, target);
-      }
-      for (const updatedMaf of changedTrackers) {
-        await syncMafTrackerToCloud(user, updatedMaf, activeTenant, target);
-      }
-    });
+    queueEntityUpsert('tenders', saved.id);
+    if (linkedRecordToSync) {
+      queueEntityUpsert('emdRecords', linkedRecordToSync.id);
+    }
+    if (linkedMafToSync) {
+      queueEntityUpsert('mafTrackers', linkedMafToSync.id);
+    }
+    for (const updatedMaf of changedTrackers) {
+      queueEntityUpsert('mafTrackers', updatedMaf.id);
+    }
 
     void pushToGoogleSheet({
       action: isExisting ? 'UPDATE' : 'CREATE',
@@ -2219,13 +2576,10 @@ export default function App() {
       stateRef.current.mafTrackers = syncedResult.nextTrackers;
       setMafTrackers(syncedResult.nextTrackers);
     }
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask(async (user, target) => {
-      await syncTenderToCloud(user, updated, activeTenant, target);
-      for (const updatedMaf of changedTrackers) {
-        await syncMafTrackerToCloud(user, updatedMaf, activeTenant, target);
-      }
-    });
+    queueEntityUpsert('tenders', updated.id);
+    for (const updatedMaf of changedTrackers) {
+      queueEntityUpsert('mafTrackers', updatedMaf.id);
+    }
 
     void pushToGoogleSheet({
       action: 'UPDATE',
@@ -2268,8 +2622,7 @@ export default function App() {
     if (selectedTenderId === id) {
       setSelectedTenderId(null);
     }
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) => deleteTenderFromCloud(user, id, activeTenant, target));
+    queueEntityDelete('tenders', id);
 
     if (deletedTender) {
       void pushToGoogleSheet({
@@ -2291,8 +2644,7 @@ export default function App() {
       const nextEmdRecords = [linked, ...stateRef.current.emdRecords];
       stateRef.current.emdRecords = nextEmdRecords;
       setEmdRecords(nextEmdRecords);
-      const activeTenant = stateRef.current.workspaceTenantId;
-      void runCloudTask((user, target) => syncEmdRecordToCloud(user, linked, activeTenant, target));
+      queueEntityUpsert('emdRecords', linked.id);
       void pushToGoogleSheet({
         action: 'CREATE',
         entityType: 'EMD_BG',
@@ -2313,8 +2665,7 @@ export default function App() {
     stateRef.current.emdRecords = nextEmdRecords;
     setEmdRecords(nextEmdRecords);
     setEmdModalTarget(undefined);
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) => syncEmdRecordToCloud(user, saved, activeTenant, target));
+    queueEntityUpsert('emdRecords', saved.id);
 
     void pushToGoogleSheet({
       action: isExisting ? 'UPDATE' : 'CREATE',
@@ -2333,8 +2684,7 @@ export default function App() {
     const nextEmdRecords = stateRef.current.emdRecords.filter((r) => r.id !== id);
     stateRef.current.emdRecords = nextEmdRecords;
     setEmdRecords(nextEmdRecords);
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) => deleteEmdRecordFromCloud(user, id, activeTenant, target));
+    queueEntityDelete('emdRecords', id);
 
     if (deletedRecord) {
       void pushToGoogleSheet({
@@ -2347,34 +2697,19 @@ export default function App() {
     }
   };
 
-  // MAF Tracker Optimistic Handlers
-  const syncMafOptimistic = async (
-    prevSnapshot: MafTrackerRecord[],
+  // MAF Tracker Optimistic Handlers (batched via debounced delta scheduler)
+  const queueMafOptimisticChange = (
     nextList: MafTrackerRecord[],
-    cloudOp: (user: User, target: CloudTargetContext) => Promise<void>,
+    mutation: { type: 'upsert' | 'delete'; trackerId: string },
     toastMsg: string,
   ) => {
+    stateRef.current.mafTrackers = nextList;
     setMafTrackers(nextList);
     showToast('ok', toastMsg);
-    const curUser = stateRef.current.activeCloudUser;
-    const curTarget = stateRef.current.activeCloudTarget;
-    if (!curUser || !curTarget) return;
-    beginCloudSync();
-    try {
-      await enqueueCloudOperation(() => {
-        const latestUser = stateRef.current.activeCloudUser || curUser;
-        const latestTarget = stateRef.current.activeCloudTarget || curTarget;
-        return cloudOp(latestUser, latestTarget);
-      });
-      markSyncedNow();
-      setCloudFeedback((prev) => (prev?.type === 'err' ? null : prev));
-    } catch (err) {
-      setMafTrackers(prevSnapshot);
-      const formatted = formatCloudErrorMessage(err, curTarget.projectId, curTarget.databaseId);
-      showToast('err', formatted);
-      setCloudFeedback({ type: 'err', msg: formatted });
-    } finally {
-      endCloudSync();
+    if (mutation.type === 'delete') {
+      queueEntityDelete('mafTrackers', mutation.trackerId);
+    } else {
+      queueEntityUpsert('mafTrackers', mutation.trackerId);
     }
   };
 
@@ -2407,12 +2742,10 @@ export default function App() {
     const nextList = exists
       ? prevSnapshot.map((t) => (t.id === canonicalTracker.id ? canonicalTracker : t))
       : [canonicalTracker, ...prevSnapshot];
-    const activeTenant = stateRef.current.workspaceTenantId;
     setMafTrackerModalTarget(undefined);
-    void syncMafOptimistic(
-      prevSnapshot,
+    queueMafOptimisticChange(
       nextList,
-      (user, target) => syncMafTrackerToCloud(user, canonicalTracker, activeTenant, target),
+      { type: 'upsert', trackerId: canonicalTracker.id },
       exists
         ? `Updated MAF tracker for ${canonicalTracker.tenderId}.`
         : `Created MAF tracker for ${canonicalTracker.tenderId} (${canonicalTracker.itemsMAF.length} item(s)).`,
@@ -2426,11 +2759,9 @@ export default function App() {
       (t) => t.id !== trackerId,
     );
     const nextList = prevSnapshot.filter((t) => t.id !== trackerId);
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void syncMafOptimistic(
-      prevSnapshot,
+    queueMafOptimisticChange(
       nextList,
-      (user, cloudTarget) => deleteMafTrackerFromCloud(user, trackerId, activeTenant, cloudTarget),
+      { type: 'delete', trackerId },
       `Removed MAF tracker ${target?.tenderId ?? ''}.`,
     );
   };
@@ -2451,13 +2782,11 @@ export default function App() {
       updatedAt: nowIso,
     };
     const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
-    const activeTenant = stateRef.current.workspaceTenantId;
     setMafItemModalTarget(null);
 
-    void syncMafOptimistic(
-      prevSnapshot,
+    queueMafOptimisticChange(
       nextList,
-      (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
+      { type: 'upsert', trackerId },
       itemExists
         ? `Updated "${savedItem.itemName}" (${savedItem.oemName}).`
         : `Added "${savedItem.itemName}" (${savedItem.oemName}) to ${target.tenderId}.`,
@@ -2482,12 +2811,10 @@ export default function App() {
       updatedAt: nowIso,
     };
     const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
-    const activeTenant = stateRef.current.workspaceTenantId;
 
-    void syncMafOptimistic(
-      prevSnapshot,
+    queueMafOptimisticChange(
       nextList,
-      (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
+      { type: 'upsert', trackerId },
       `${item?.oemName ?? 'OEM'} MAF status set to "${nextStatus}".`,
     );
   };
@@ -2531,11 +2858,9 @@ export default function App() {
         updatedAt: nowIso,
       };
       const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
-      const activeTenant = stateRef.current.workspaceTenantId;
-      await syncMafOptimistic(
-        prevSnapshot,
+      queueMafOptimisticChange(
         nextList,
-        (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
+        { type: 'upsert', trackerId },
         `Uploaded "${uploaded.mafDocumentName}" successfully.`,
       );
     } catch (err) {
@@ -2555,12 +2880,10 @@ export default function App() {
       updatedAt: nowIso,
     };
     const nextList = prevSnapshot.map((t) => (t.id === trackerId ? updatedTracker : t));
-    const activeTenant = stateRef.current.workspaceTenantId;
 
-    void syncMafOptimistic(
-      prevSnapshot,
+    queueMafOptimisticChange(
       nextList,
-      (user, cloudTarget) => syncMafTrackerToCloud(user, updatedTracker, activeTenant, cloudTarget),
+      { type: 'upsert', trackerId },
       `Removed "${removed?.itemName ?? 'item'}" from ${target.tenderId}.`,
     );
   };
@@ -2580,8 +2903,7 @@ export default function App() {
       isExisting ? `Updated OEM "${saved.oemName}".` : `Added OEM "${saved.oemName}" to directory.`,
     );
 
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) => syncOemRecordToCloud(user, saved, activeTenant, target));
+    queueEntityUpsert('oemRecords', saved.id);
     void pushToGoogleSheet({
       action: 'FULL_SYNC',
       entityType: 'BULK',
@@ -2599,8 +2921,7 @@ export default function App() {
     setOemRecords(nextOems);
     showToast('ok', `Removed OEM "${removed?.oemName ?? 'record'}" from directory.`);
 
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) => deleteOemRecordFromCloud(user, id, activeTenant, target));
+    queueEntityDelete('oemRecords', id);
     void pushToGoogleSheet({
       action: 'FULL_SYNC',
       entityType: 'BULK',
@@ -2611,29 +2932,20 @@ export default function App() {
   const handleSaveProfile = (nextProfile: FirmProfile) => {
     stateRef.current.firmProfile = nextProfile;
     setFirmProfile(nextProfile);
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) => syncProfileToCloud(user, nextProfile, activeTenant, target));
+    queueSingletonDeltaSync('profile');
   };
 
   const handleSaveEmailSettings = (nextSettings: EmailAlertSettings) => {
     stateRef.current.emailSettings = nextSettings;
     setEmailSettings(nextSettings);
-    const activeTenant = stateRef.current.workspaceTenantId;
-    void runCloudTask((user, target) =>
-      syncEmailConfigToCloud(user, nextSettings, activeTenant, target),
-    );
+    queueSingletonDeltaSync('emailConfig');
   };
 
   const handleSaveSheetSettings = async (nextSettings: GoogleSheetSettings) => {
     stateRef.current.sheetSettings = nextSettings;
     setSheetSettings(nextSettings);
     setSheetSyncError(null);
-    if (stateRef.current.activeCloudUser && stateRef.current.activeCloudTarget) {
-      const activeTenant = stateRef.current.workspaceTenantId;
-      void runCloudTask((user, target) =>
-        syncSheetConfigToCloud(user, nextSettings, activeTenant, target),
-      );
-    }
+    queueSingletonDeltaSync('sheetConfig');
     if (!nextSettings.webhookUrl.trim()) {
       setSheetSyncStatus('unconfigured');
       return;
@@ -2680,15 +2992,8 @@ export default function App() {
   const handleToggleDarkMode = () => {
     setDarkMode((prev) => {
       const next = !prev;
-      const activeTenant = stateRef.current.workspaceTenantId;
-      void runCloudTask((user, target) =>
-        syncPreferencesToCloud(
-          user,
-          { adminPin: stateRef.current.adminPin, darkMode: next },
-          activeTenant,
-          target,
-        ),
-      );
+      stateRef.current.darkMode = next;
+      queueSingletonDeltaSync('preferences');
       return next;
     });
   };
@@ -2724,6 +3029,8 @@ export default function App() {
     const isSwitchingCrmAccount = Boolean(prevUserId && prevUserId !== session.userId);
     const activeCentralFbUser = stateRef.current.firebaseUser;
 
+    deltaSchedulerRef.current?.clear();
+    backgroundAttachmentTaskSeqRef.current += 1;
     clearCloudSessionCache();
     localWorkspaceClearedRef.current = false;
     adminSupplementalRef.current = createEmptyCloudDataset();
@@ -2878,6 +3185,12 @@ export default function App() {
 
   const handleLogout = (forceDisabledMessage?: string) => {
     const exitingSession = stateRef.current.currentUser;
+    if (deltaSchedulerRef.current?.hasPending()) {
+      void deltaSchedulerRef.current.flush();
+    } else {
+      deltaSchedulerRef.current?.clear();
+    }
+    backgroundAttachmentTaskSeqRef.current += 1;
     clearPerTabCrmSession();
     if (exitingSession) {
       void fetch('/api/auth/logout', {
@@ -3041,6 +3354,8 @@ export default function App() {
     // Strictly clear local/CRM workspace state only.
     // NEVER send delete/replace commands to Google Cloud Firestore, BYOC storage, or Google Drive Sheet.
     localWorkspaceClearedRef.current = true;
+    deltaSchedulerRef.current?.clear();
+    backgroundAttachmentTaskSeqRef.current += 1;
     adminSupplementalRef.current = createEmptyCloudDataset();
     attachmentFilesRef.current.clear();
     mafExtractionSignatureRef.current.clear();
