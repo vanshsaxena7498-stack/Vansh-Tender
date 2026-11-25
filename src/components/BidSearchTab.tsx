@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
+import { buildAuthorizedHeaders } from '../lib/apiClient';
 import type {
   AttachmentItem,
   EmdSecurityType,
@@ -100,6 +101,7 @@ interface ParsedExtractResponse {
   ok?: boolean;
   success?: boolean;
   retryable?: boolean;
+  code?: string;
   modelUsed?: string;
   fallbackUsed?: boolean;
   extracted?: ExtractedBidDraft;
@@ -211,7 +213,7 @@ export function BidSearchTab({
       const attemptStartedAt = Date.now();
       let res = await fetch('/api/tenders/extract-pdf', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }),
         signal: controller.signal,
         body: JSON.stringify({
           fileName: file.name,
@@ -223,10 +225,11 @@ export function BidSearchTab({
       let { json: data, rawText } = await safeReadExtractResponse(res);
       let isOk = Boolean(res.ok && (data?.ok || data?.success) && data?.extracted);
 
-      // If the server returned a quick transient 503/429 (e.g. primary model cooled down right after),
+      // If the server returned a quick transient 503/429 (not a hard plan quota limit),
       // wait 2.5s and perform 1 clean retry automatically within our remaining 58s window.
       if (
         !isOk &&
+        data?.code !== 'PLAN_QUOTA_EXCEEDED' &&
         (res.status === 503 || res.status === 429 || data?.retryable) &&
         Date.now() - attemptStartedAt < 32_000 &&
         !controller.signal.aborted
@@ -235,7 +238,7 @@ export function BidSearchTab({
         if (!controller.signal.aborted) {
           res = await fetch('/api/tenders/extract-pdf', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }),
             signal: controller.signal,
             body: JSON.stringify({
               fileName: file.name,

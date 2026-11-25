@@ -34,14 +34,30 @@ service cloud.firestore {
       return isVerifiedUser() && request.auth.uid == userId;
     }
 
-    function isBootstrappedAdmin() {
-      return isVerifiedUser() && request.auth.token.email == 'vanshsaxena7498@gmail.com';
+    function isAdmin() {
+      return isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
     }
 
-    function isAdmin() {
-      return isBootstrappedAdmin() || (
-        isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
+    function isCompanyMember(companyId) {
+      return isVerifiedUser() &&
+        isValidId(companyId) &&
+        exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid));
+    }
+
+    function companyMemberData(companyId) {
+      return get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data;
+    }
+
+    function isCompanyAdmin(companyId) {
+      return isCompanyMember(companyId) &&
+        companyMemberData(companyId).isEnabled == true &&
+        companyMemberData(companyId).role in ['owner', 'admin'];
+    }
+
+    function isCompanyWriter(companyId) {
+      return isCompanyMember(companyId) &&
+        companyMemberData(companyId).isEnabled == true &&
+        companyMemberData(companyId).role in ['owner', 'admin', 'manager', 'executive'];
     }
 
     function hasValidParentUser(userId) {
@@ -145,8 +161,7 @@ service cloud.firestore {
         data.ownerUid == userId &&
         data.ownerUid == request.auth.uid &&
         data.adminPin is string &&
-        data.adminPin.size() == 4 &&
-        data.adminPin.matches('^[0-9]{4}$') &&
+        (data.adminPin == '' || data.adminPin.matches('^[0-9]{4,6}$')) &&
         data.darkMode is bool &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
@@ -830,6 +845,120 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidVaultDocument(data, ownerOrCompanyId, docId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'id',
+          'docType',
+          'title',
+          'documentNumber',
+          'issuedDate',
+          'expiryDate',
+          'fileName',
+          'fileUrl',
+          'remarks',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'id',
+          'docType',
+          'title',
+          'documentNumber',
+          'issuedDate',
+          'expiryDate',
+          'fileName',
+          'fileUrl',
+          'remarks',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == ownerOrCompanyId &&
+        isValidId(data.id) &&
+        data.id == docId &&
+        data.docType is string &&
+        data.docType in ['MSME / Udyam', 'GST Certificate', 'ISO Certificate', 'PAN Card', 'Turnover CA Cert', 'DSC Token', 'Other'] &&
+        data.title is string &&
+        data.title.size() >= 1 &&
+        data.title.size() <= 160 &&
+        data.documentNumber is string &&
+        data.documentNumber.size() <= 100 &&
+        data.issuedDate is string &&
+        data.issuedDate.size() <= 32 &&
+        data.expiryDate is string &&
+        data.expiryDate.size() <= 32 &&
+        data.fileName is string &&
+        data.fileName.size() <= 200 &&
+        data.fileUrl is string &&
+        data.fileUrl.size() <= 2000 &&
+        (data.fileUrl == '' || data.fileUrl.matches('^https://.*')) &&
+        data.remarks is string &&
+        data.remarks.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLogEntry(data, ownerOrCompanyId, logId) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'id',
+          'entityType',
+          'entityId',
+          'action',
+          'actorUid',
+          'actorName',
+          'summary',
+          'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid',
+          'id',
+          'entityType',
+          'entityId',
+          'action',
+          'actorUid',
+          'actorName',
+          'summary',
+          'createdAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == ownerOrCompanyId &&
+        isValidId(data.id) &&
+        data.id == logId &&
+        data.entityType is string &&
+        data.entityType in ['tender', 'emd', 'maf', 'oem', 'vault', 'team', 'company'] &&
+        data.entityId is string &&
+        data.entityId.size() >= 1 &&
+        data.entityId.size() <= 128 &&
+        data.action is string &&
+        data.action in ['CREATED', 'UPDATED', 'STAGE_CHANGED', 'MAF_UPDATED', 'EMD_UPDATED', 'DOCUMENT_UPLOADED', 'DELETED', 'ROLE_CHANGED'] &&
+        isValidId(data.actorUid) &&
+        data.actorUid == request.auth.uid &&
+        data.actorName is string &&
+        data.actorName.size() >= 1 &&
+        data.actorName.size() <= 100 &&
+        data.summary is string &&
+        data.summary.size() >= 1 &&
+        data.summary.size() <= 500 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidCompanyMember(data, companyId, memberUid) {
+      return data.keys().hasAll(['uid', 'companyId', 'role', 'isEnabled', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'companyId', 'role', 'isEnabled', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.uid == memberUid &&
+        isValidId(data.companyId) &&
+        data.companyId == companyId &&
+        data.role is string &&
+        data.role in ['owner', 'admin', 'manager', 'executive', 'finance', 'viewer'] &&
+        data.isEnabled is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // -------------------------------------------------------------------------
     // Collection Rules
     // -------------------------------------------------------------------------
@@ -842,23 +971,12 @@ service cloud.firestore {
     match /admins/{uid} {
       allow get: if isVerifiedUser() && isValidId(uid) && (request.auth.uid == uid || isAdmin());
       allow list: if false;
-      allow create: if isVerifiedUser() &&
-        isValidId(uid) &&
-        isValidAdminMarker(incoming(), uid) &&
-        incoming().createdAt == request.time &&
-        isBootstrappedAdmin();
-      allow update: if isVerifiedUser() &&
-        isValidId(uid) &&
-        isValidAdminMarker(incoming(), uid) &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['email']) &&
-        isBootstrappedAdmin();
-      allow delete: if isVerifiedUser() && isValidId(uid) && isBootstrappedAdmin();
+      allow create, update, delete: if false;
     }
 
     match /users/{userId} {
       allow get: if isVerifiedUser() && isValidId(userId) && (isOwner(userId) || isAdmin());
-      allow list: if isBootstrappedAdmin();
+      allow list: if isAdmin();
       allow create: if isVerifiedUser() &&
         isValidId(userId) &&
         isOwner(userId) &&
@@ -885,13 +1003,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(profileId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -949,13 +1064,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(settingId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1007,13 +1119,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(attachmentId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1070,13 +1179,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(tenderDocId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1198,13 +1304,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(emdDocId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1281,8 +1384,8 @@ service cloud.firestore {
       }
 
       match /emd_bg_tracker/{emdDocId} {
-        allow get: if isBootstrappedAdmin() && isValidId(userId) && isValidId(emdDocId);
-        allow list: if isBootstrappedAdmin();
+        allow get: if isVerifiedUser() && isValidId(userId) && isValidId(emdDocId) && (isOwner(userId) || isAdmin()) && hasValidParentUser(userId);
+        allow list: if isVerifiedUser() && (isAdmin() || (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid));
         allow create, update, delete: if false;
       }
 
@@ -1290,13 +1393,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(mafDocId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1361,13 +1461,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(oemDocId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1432,13 +1529,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1492,13 +1586,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(alertId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1571,13 +1662,10 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(configId) &&
-          (
-            isBootstrappedAdmin() ||
-            ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId))
-          );
+          ((isOwner(userId) || isAdmin()) && hasValidParentUser(userId));
         allow list: if isVerifiedUser() &&
           (
-            isBootstrappedAdmin() ||
+            isAdmin() ||
             (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid)
           );
         allow create: if isVerifiedUser() &&
@@ -1627,6 +1715,58 @@ service cloud.firestore {
           isValidId(configId) &&
           (isOwner(userId) || isAdmin()) &&
           hasValidParentUser(userId);
+      }
+
+      match /vaultDocuments/{docId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          (isAdmin() || (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid));
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isOwner(userId) &&
+          isValidVaultDocument(incoming(), userId, docId) &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidVaultDocument(incoming(), userId, docId) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+      }
+
+      match /auditLogs/{logId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(logId) &&
+          (isOwner(userId) || isAdmin()) &&
+          hasValidParentUser(userId);
+        allow list: if isVerifiedUser() &&
+          (isAdmin() || (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid));
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(logId) &&
+          isOwner(userId) &&
+          isValidAuditLogEntry(incoming(), userId, logId) &&
+          incoming().createdAt == request.time &&
+          hasValidParentUser(userId);
+        allow update, delete: if false;
       }
 
       match /workspaces/{tenantId} {
@@ -2418,7 +2558,7 @@ service cloud.firestore {
         isValidId(secondaryUserId) &&
         (isAdmin() || existing().ownerUid == request.auth.uid);
       allow list: if isVerifiedUser() &&
-        (isBootstrappedAdmin() || resource.data.ownerUid == request.auth.uid);
+        (isAdmin() || resource.data.ownerUid == request.auth.uid);
       allow create: if isVerifiedUser() &&
         isValidId(secondaryUserId) &&
         isValidSecondaryUserRecord(incoming(), secondaryUserId) &&
@@ -2467,70 +2607,132 @@ service cloud.firestore {
         isAdmin();
     }
 
-    // Legacy top-level collections: strictly read-only for Bootstrapped Primary Admin recovery
+    // Multi-tenant company isolation rules
+    match /companies/{companyId} {
+      allow get: if isCompanyMember(companyId) || isAdmin();
+      allow list: if false;
+      allow create, update, delete: if false;
+
+      match /members/{memberUid} {
+        allow get: if isValidId(companyId) &&
+          isValidId(memberUid) &&
+          (isCompanyMember(companyId) || isAdmin());
+        allow list: if isCompanyAdmin(companyId) || isAdmin();
+        allow create: if isValidId(companyId) &&
+          isValidId(memberUid) &&
+          isValidCompanyMember(incoming(), companyId, memberUid) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (isCompanyAdmin(companyId) || isAdmin());
+        allow update: if isValidId(companyId) &&
+          isValidId(memberUid) &&
+          isValidCompanyMember(incoming(), companyId, memberUid) &&
+          incoming().uid == existing().uid &&
+          incoming().companyId == existing().companyId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (isCompanyAdmin(companyId) || isAdmin());
+        allow delete: if isValidId(companyId) &&
+          isValidId(memberUid) &&
+          (isCompanyAdmin(companyId) || isAdmin());
+      }
+
+      match /vaultDocuments/{docId} {
+        allow get: if isValidId(companyId) && isValidId(docId) && (isCompanyMember(companyId) || isAdmin());
+        allow list: if isCompanyMember(companyId) && resource.data.ownerUid == companyId;
+        allow create: if isValidId(companyId) &&
+          isValidId(docId) &&
+          isCompanyWriter(companyId) &&
+          isValidVaultDocument(incoming(), companyId, docId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isValidId(companyId) &&
+          isValidId(docId) &&
+          isCompanyWriter(companyId) &&
+          isValidVaultDocument(incoming(), companyId, docId) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time;
+        allow delete: if isValidId(companyId) && isValidId(docId) && (isCompanyAdmin(companyId) || isAdmin());
+      }
+
+      match /auditLogs/{logId} {
+        allow get: if isValidId(companyId) && isValidId(logId) && (isCompanyMember(companyId) || isAdmin());
+        allow list: if isCompanyMember(companyId) && resource.data.ownerUid == companyId;
+        allow create: if isValidId(companyId) &&
+          isValidId(logId) &&
+          isCompanyMember(companyId) &&
+          isValidAuditLogEntry(incoming(), companyId, logId) &&
+          incoming().createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+    // Legacy top-level collections: strictly read-only for explicit Admins in /admins/{uid}
     match /tenders/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /emdRecords/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /emd_bg_tracker/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /maf_tracker/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /attachmentFiles/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /settings/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /profile/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /sheetConfig/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /emailConfig/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /emailAlerts/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
 
     match /oemDetails/{docId} {
-      allow get: if isBootstrappedAdmin() && isValidId(docId);
-      allow list: if isBootstrappedAdmin();
+      allow get: if isAdmin() && isValidId(docId);
+      allow list: if isAdmin();
       allow create, update, delete: if false;
     }
   }

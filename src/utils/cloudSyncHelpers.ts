@@ -303,7 +303,7 @@ export function buildCloudPreferencesPayload<TTime>(
   serverTimeToken: TTime,
   existingCreatedAt?: unknown,
 ): Record<string, unknown> {
-  const safePin = /^\d{4}$/.test(prefs.adminPin) ? prefs.adminPin : '1234';
+  const safePin = /^\d{4,6}$/.test(prefs.adminPin) ? prefs.adminPin : '';
   return {
     ownerUid: sanitizeDocId(ownerUid),
     adminPin: safePin,
@@ -772,17 +772,19 @@ export function isLegacyDocExcludedFromAdmin(
   data: Record<string, unknown>,
   knownAdminUids: ReadonlySet<string>,
   excludedSecondaryOwnerUids: ReadonlySet<string>,
+  expectedAdminEmail?: string,
 ): boolean {
   const tenantId = typeof data.tenantId === 'string' ? data.tenantId.trim() : '';
-  if (tenantId && tenantId !== 'admin_vanshsales') {
+  if (tenantId) {
     return true;
   }
   const workspaceUserId = typeof data.userId === 'string' ? data.userId.trim() : '';
   if (workspaceUserId.startsWith('sec_')) {
     return true;
   }
+  const normalizedExpectedEmail = (expectedAdminEmail || '').trim().toLowerCase();
   const ownerEmail = typeof data.ownerEmail === 'string' ? data.ownerEmail.trim().toLowerCase() : '';
-  if (ownerEmail && ownerEmail !== 'vanshsaxena7498@gmail.com') {
+  if (ownerEmail && normalizedExpectedEmail && ownerEmail !== normalizedExpectedEmail) {
     return true;
   }
   const docOwner = typeof data.ownerUid === 'string' ? data.ownerUid.trim() : '';

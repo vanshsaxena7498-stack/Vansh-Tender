@@ -56,10 +56,7 @@ function isVerifiedUser(auth: AuthContext | null): auth is AuthContext {
 }
 
 function isAdmin(auth: AuthContext | null, admins: Set<string>): boolean {
-  return (
-    isVerifiedUser(auth) &&
-    (auth.token.email === 'vanshsaxena7498@gmail.com' || admins.has(auth.uid))
-  );
+  return isVerifiedUser(auth) && admins.has(auth.uid);
 }
 
 function hasExactKeys(data: Record<string, unknown>, required: string[], allowed: string[]): boolean {
@@ -264,13 +261,13 @@ test('Dirty Dozen adversarial payloads all evaluate to PERMISSION_DENIED', () =>
   // 2. Unverified Email Spoof
   const spoofAuth: AuthContext = {
     uid: 'u1',
-    token: { email: 'vanshsaxena7498@gmail.com', email_verified: false },
+    token: { email: 'admin@acmeinfra.example', email_verified: false },
   };
   assert.equal(isVerifiedUser(spoofAuth), false);
   assert.equal(isAdmin(spoofAuth, admins), false);
 
-  // 3. Privilege Escalation into /admins/{uid}
-  assert.equal(verifiedUser.token.email === 'vanshsaxena7498@gmail.com', false);
+  // 3. Privilege Escalation into /admins/{uid} (client writes are always denied)
+  assert.equal(admins.has(verifiedUser.uid), false);
 
   // 4. Shadow / Ghost Field Injection (also verify optional BID/RA fields are valid while unknown keys are denied)
   const validWithBidRa = {
@@ -671,26 +668,24 @@ test('SecondaryUserRecord enforces presence enum, isEnabled lock, and blocks non
   assert.equal(changed.every((k) => ownerUpdatableKeys.has(k)), false);
 });
 
-test('Bootstrapped Admin can list/read sibling Admin UIDs & legacy collections read-only while non-admin users are denied', () => {
-  const isBootstrappedAdmin = (auth: AuthContext | null): boolean =>
-    isVerifiedUser(auth) && auth.token.email === 'vanshsaxena7498@gmail.com';
-
+test('Explicit /admins/{uid} role check and subcollection listing strictly exclude non-admins and unverified tokens', () => {
+  const admins = new Set(['uid_verified_admin']);
   const adminAuth: AuthContext = {
-    uid: 'JdizphoE56bNDu7OPtS4WZxrb0H2',
-    token: { email: 'vanshsaxena7498@gmail.com', email_verified: true },
+    uid: 'uid_verified_admin',
+    token: { email: 'owner@acmeinfra.example', email_verified: true },
   };
   const unverifiedAdmin: AuthContext = {
-    uid: 'JdizphoE56bNDu7OPtS4WZxrb0H2',
-    token: { email: 'vanshsaxena7498@gmail.com', email_verified: false },
+    uid: 'uid_verified_admin',
+    token: { email: 'owner@acmeinfra.example', email_verified: false },
   };
-  const secondaryAuth: AuthContext = {
-    uid: 'sec_uid_niyan',
-    token: { email: 'info.niyantrana@gmail.com', email_verified: true },
+  const memberAuth: AuthContext = {
+    uid: 'usr_member_1',
+    token: { email: 'member@acmeinfra.example', email_verified: true },
   };
 
-  assert.equal(isBootstrappedAdmin(adminAuth), true);
-  assert.equal(isBootstrappedAdmin(unverifiedAdmin), false);
-  assert.equal(isBootstrappedAdmin(secondaryAuth), false);
+  assert.equal(isAdmin(adminAuth, admins), true);
+  assert.equal(isAdmin(unverifiedAdmin, admins), false);
+  assert.equal(isAdmin(memberAuth, admins), false);
 
   const canListUserSubcollection = (
     auth: AuthContext | null,
@@ -698,24 +693,12 @@ test('Bootstrapped Admin can list/read sibling Admin UIDs & legacy collections r
     docOwnerUid: string,
   ): boolean =>
     isVerifiedUser(auth) &&
-    (isBootstrappedAdmin(auth) || (auth.uid === userId && docOwnerUid === auth.uid));
+    (isAdmin(auth, admins) || (auth.uid === userId && docOwnerUid === auth.uid));
 
-  assert.equal(
-    canListUserSubcollection(adminAuth, '4uQty7KjogbYUmjY1ZxnJMtn7rj1', '4uQty7KjogbYUmjY1ZxnJMtn7rj1'),
-    true,
-  );
-  assert.equal(
-    canListUserSubcollection(secondaryAuth, '4uQty7KjogbYUmjY1ZxnJMtn7rj1', '4uQty7KjogbYUmjY1ZxnJMtn7rj1'),
-    false,
-  );
-  assert.equal(
-    canListUserSubcollection(secondaryAuth, 'sec_uid_niyan', 'victimUid'),
-    false,
-  );
-  assert.equal(
-    canListUserSubcollection(secondaryAuth, 'sec_uid_niyan', 'sec_uid_niyan'),
-    true,
-  );
+  assert.equal(canListUserSubcollection(adminAuth, 'usr_member_1', 'usr_member_1'), true);
+  assert.equal(canListUserSubcollection(memberAuth, 'other_uid', 'other_uid'), false);
+  assert.equal(canListUserSubcollection(memberAuth, 'usr_member_1', 'victimUid'), false);
+  assert.equal(canListUserSubcollection(memberAuth, 'usr_member_1', 'usr_member_1'), true);
 });
 
 function isValidOemRecord(
@@ -900,6 +883,24 @@ test('Firestore update rules allow safe repair of legacy non-Timestamp createdAt
     false,
   );
 });
+
+test('UserPreferences allows empty or 4-6 digit adminPin, and VaultDocument + AuditLogEntry invariants reject unsafe URLs & tampering', () => {
+  const isValidPin = (pin: unknown) =>
+    typeof pin === 'string' && (pin === '' || /^[0-9]{4,6}$/.test(pin));
+  assert.equal(isValidPin(''), true);
+  assert.equal(isValidPin('4829'), true);
+  assert.equal(isValidPin('482910'), true);
+  assert.equal(isValidPin('123'), false);
+  assert.equal(isValidPin('12ab'), false);
+
+  const isValidVaultUrl = (url: unknown) =>
+    typeof url === 'string' && url.length <= 2000 && (url === '' || /^https:\/\/.*/.test(url));
+  assert.equal(isValidVaultUrl(''), true);
+  assert.equal(isValidVaultUrl('https://storage.example.com/udyam.pdf'), true);
+  assert.equal(isValidVaultUrl('javascript:alert(1)'), false);
+  assert.equal(isValidVaultUrl('http://insecure.example/cert.pdf'), false);
+});
+
 
 
 

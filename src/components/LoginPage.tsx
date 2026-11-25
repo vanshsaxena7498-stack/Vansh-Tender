@@ -28,24 +28,13 @@ import {
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
 import type { CrmUserSession } from '../types/crm';
-import {
-  ADMIN_RECOVERY_EMAIL,
-  findUserByIdentifier,
-  getAllStoredCredentialTokens,
-  getStoredCredentialToken,
-  registerSecondaryUserAccount,
-  saveResetPasswordCredential,
-  syncAuthenticatedUserFromServer,
-  VALID_LOGIN_USERNAME,
-  validateLoginCredentials,
-} from '../utils/authCredentials';
 import { safeReadJsonResponse } from '../utils/httpHelpers';
 
 interface LoginPageProps {
   onLoginSuccess: (
     session: CrmUserSession,
     rememberMe: boolean,
-    serverMeta?: { credentialToken?: string; adminSessionToken?: string },
+    serverMeta?: { sessionToken?: string },
   ) => void;
   disabledNotice?: string | null;
   onDismissDisabledNotice?: () => void;
@@ -100,17 +89,32 @@ export function LoginPage({
   disabledNotice = null,
   onDismissDisabledNotice,
 }: LoginPageProps) {
-  const [authView, setAuthView] = useState<'login' | 'reset' | 'signup'>('login');
+  const [authView, setAuthView] = useState<'login' | 'setup' | 'reset' | 'signup'>('login');
+  const [needsInitialSetup, setNeedsInitialSetup] = useState(false);
+  const [bootstrapChecked, setBootstrapChecked] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [rememberMe, setRememberMe] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [disabledModalMessage, setDisabledModalMessage] = useState<string | null>(
     disabledNotice ?? null,
   );
+
+  // First-time Company & Owner Setup state
+  const [setupCompanyName, setSetupCompanyName] = useState('');
+  const [setupGstin, setSetupGstin] = useState('');
+  const [setupUdyamNumber, setSetupUdyamNumber] = useState('');
+  const [setupUsername, setSetupUsername] = useState('');
+  const [setupEmail, setSetupEmail] = useState('');
+  const [setupPassword, setSetupPassword] = useState('');
+  const [setupConfirmPassword, setSetupConfirmPassword] = useState('');
+  const [showSetupPassword, setShowSetupPassword] = useState(false);
+  const [setupLoading, setSetupLoading] = useState(false);
+  const [setupError, setSetupError] = useState('');
 
   useEffect(() => {
     if (disabledNotice) {
@@ -118,18 +122,42 @@ export function LoginPage({
     }
   }, [disabledNotice]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const checkBootstrap = async () => {
+      try {
+        const res = await fetch('/api/auth/bootstrap-status');
+        const parsed = await safeReadJsonResponse<{ ok?: boolean; needsSetup?: boolean }>(res);
+        if (!cancelled && parsed.ok && parsed.data?.ok) {
+          const needed = Boolean(parsed.data.needsSetup);
+          setNeedsInitialSetup(needed);
+          if (needed) {
+            setAuthView('setup');
+          }
+        }
+      } catch {
+        // Non-fatal: keep login screen accessible
+      } finally {
+        if (!cancelled) setBootstrapChecked(true);
+      }
+    };
+    void checkBootstrap();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const handleDismissDisabledModal = () => {
     setDisabledModalMessage(null);
     onDismissDisabledNotice?.();
   };
 
-  // Forgot Password / Reset Password flow (per-user identifier -> attached Gmail OTP -> New Password)
+  // Forgot Password / Reset Password flow (server identifier -> email OTP or Google -> New Password)
   const [resetMode, setResetMode] = useState<'request' | 'verify_otp' | 'set_password'>('request');
   const [resetIdentifier, setResetIdentifier] = useState('');
   const [resetTargetUser, setResetTargetUser] = useState<{
     userId: string;
     username: string;
-    targetEmail: string;
     maskedEmail: string;
   } | null>(null);
   const [resetAuthMethod, setResetAuthMethod] = useState<'otp' | 'google'>('otp');
@@ -145,8 +173,11 @@ export function LoginPage({
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [showNewPassword, setShowNewPassword] = useState(false);
 
-  // Create New Secondary User flow (Gmail OTP -> User ID & Password -> Successful ID Creation)
+  // Create New Workspace / Team Member flow
   const [signupStep, setSignupStep] = useState<'email' | 'verify_otp' | 'credentials' | 'success'>('email');
+  const [signupWorkspaceMode, setSignupWorkspaceMode] = useState<'new_company' | 'join_invite'>('new_company');
+  const [signupCompanyName, setSignupCompanyName] = useState('');
+  const [signupInviteCode, setSignupInviteCode] = useState('');
   const [signupEmail, setSignupEmail] = useState('');
   const [signupOtp, setSignupOtp] = useState('');
   const [signupOtpToken, setSignupOtpToken] = useState('');
@@ -176,6 +207,124 @@ export function LoginPage({
     return () => window.clearTimeout(timer);
   }, [authView, signupStep, createdUsernameLabel]);
 
+  const handleSetupAdminSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    const cleanCompany = setupCompanyName.trim();
+    const cleanUsername = setupUsername.trim();
+    const cleanEmail = setupEmail.trim().toLowerCase();
+
+    if (cleanCompany.length < 2) {
+      setSetupError('Please enter your Company / Firm Legal Name.');
+      return;
+    }
+    if (!/^[a-zA-Z0-9_.-]{3,40}$/.test(cleanUsername)) {
+      setSetupError(
+        'Owner User ID must be 3 to 40 characters (letters, numbers, "_", ".", or "-").',
+      );
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setSetupError('Please enter a valid Owner Email ID.');
+      return;
+    }
+    if (setupPassword.length < 8) {
+      setSetupError('Owner password must be at least 8 characters.');
+      return;
+    }
+    if (setupPassword !== setupConfirmPassword) {
+      setSetupError('Password and Confirm Password do not match.');
+      return;
+    }
+
+    setSetupLoading(true);
+    setSetupError('');
+    try {
+      const res = await fetch('/api/auth/setup-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          companyName: cleanCompany,
+          gstin: setupGstin.trim().toUpperCase(),
+          udyamNumber: setupUdyamNumber.trim().toUpperCase(),
+          username: cleanUsername,
+          email: cleanEmail,
+          password: setupPassword,
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        sessionToken?: string;
+        user?: CrmUserSession;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (!res.ok || !data?.ok || !data.user) {
+        setSetupError(
+          data?.error || parsed.errorMessage || 'Could not initialize company workspace.',
+        );
+        return;
+      }
+      setNeedsInitialSetup(false);
+      onLoginSuccess(data.user, true, { sessionToken: data.sessionToken });
+    } catch {
+      setSetupError('Unable to reach authentication server. Please retry.');
+    } finally {
+      setSetupLoading(false);
+    }
+  };
+
+  const handleGoogleContinue = async (options?: {
+    companyName?: string;
+    inviteCode?: string;
+  }) => {
+    setGoogleSubmitting(true);
+    setErrorMsg('');
+    setSetupError('');
+    setSignupError('');
+    try {
+      const credential = await signInWithPopup(auth, googleProvider);
+      const firebaseIdToken = await credential.user.getIdToken();
+      const res = await fetch('/api/auth/firebase-exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          firebaseIdToken,
+          ...(options?.companyName?.trim() ? { companyName: options.companyName.trim() } : {}),
+          ...(options?.inviteCode?.trim() ? { inviteCode: options.inviteCode.trim() } : {}),
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        code?: string;
+        sessionToken?: string;
+        user?: CrmUserSession;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (res.status === 403 && data?.code === 'ACCOUNT_DISABLED') {
+        setDisabledModalMessage(
+          data.error ||
+            'Your CRM ID has been disabled by your Company Administrator. Please contact your administrator to regain access.',
+        );
+        return;
+      }
+      if (!res.ok || !data?.ok || !data.user) {
+        setErrorMsg(
+          data?.error || parsed.errorMessage || 'Google authentication failed. Please try again.',
+        );
+        return;
+      }
+      setNeedsInitialSetup(false);
+      onLoginSuccess(data.user, rememberMe, { sessionToken: data.sessionToken });
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Google Sign-In was cancelled or failed.',
+      );
+    } finally {
+      setGoogleSubmitting(false);
+    }
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const trimmedUser = username.trim();
@@ -192,8 +341,6 @@ export function LoginPage({
     setErrorMsg('');
     setSuccessMsg('');
     try {
-      const credentialToken = getStoredCredentialToken(trimmedUser);
-      const clientCredentialTokens = getAllStoredCredentialTokens();
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,8 +348,6 @@ export function LoginPage({
           username: trimmedUser,
           identifier: trimmedUser,
           password,
-          ...(credentialToken ? { credentialToken } : {}),
-          ...(clientCredentialTokens.length > 0 ? { clientCredentialTokens } : {}),
         }),
       });
       const parsed = await safeReadJsonResponse<{
@@ -210,81 +355,40 @@ export function LoginPage({
         code?: string;
         username?: string;
         user?: CrmUserSession;
-        credentialToken?: string;
-        adminSessionToken?: string;
+        sessionToken?: string;
         error?: string;
       }>(res);
       const data = parsed.data;
 
-      if (res.status === 404 || !data) {
-        const localCheck = validateLoginCredentials(trimmedUser, password);
-        if (localCheck.ok && localCheck.user) {
-          onLoginSuccess(localCheck.user, rememberMe);
-        } else if (localCheck.code === 'ACCOUNT_DISABLED') {
-          setDisabledModalMessage(
-            localCheck.error ||
-              'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
-          );
-        } else {
-          setErrorMsg(
-            localCheck.error ||
-              'Invalid User ID or password. Please check your credentials and try again.',
-          );
-        }
-        return;
-      }
-
-      if (res.status === 403 || data.code === 'ACCOUNT_DISABLED') {
+      if (res.status === 403 || data?.code === 'ACCOUNT_DISABLED') {
         setDisabledModalMessage(
-          data.error ||
-            'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+          data?.error ||
+            'Your CRM ID has been disabled by your Company Administrator. Please contact your administrator to regain access.',
         );
         return;
       }
 
-      if (!res.ok || !data.ok) {
+      if (!res.ok || !data?.ok || !data.user) {
         setErrorMsg(
-          data.error || 'Invalid User ID or password. Please check your credentials and try again.',
+          data?.error ||
+            parsed.errorMessage ||
+            'Invalid User ID or password. Please check your credentials and try again.',
         );
         return;
       }
 
-      const resolvedUser: CrmUserSession = data.user || {
-        userId: 'admin_vanshsales',
-        username: data.username || VALID_LOGIN_USERNAME,
-        email: ADMIN_RECOVERY_EMAIL,
-        role: 'admin',
-      };
-      if (resolvedUser.role === 'secondary' && resolvedUser.isEnabled === false) {
+      if (data.user.isEnabled === false) {
         setDisabledModalMessage(
-          'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+          'Your CRM ID has been disabled by your Company Administrator. Please contact your administrator to regain access.',
         );
         return;
       }
-      syncAuthenticatedUserFromServer({
-        ...resolvedUser,
-        password,
-        credentialToken: data.credentialToken,
-        byocProjectId: resolvedUser.byocProjectId,
-      });
-      onLoginSuccess(resolvedUser, rememberMe, {
-        credentialToken: data.credentialToken,
-        adminSessionToken: data.adminSessionToken,
+
+      onLoginSuccess(data.user, rememberMe, {
+        sessionToken: data.sessionToken,
       });
     } catch {
-      const localCheck = validateLoginCredentials(trimmedUser, password);
-      if (localCheck.ok && localCheck.user) {
-        onLoginSuccess(localCheck.user, rememberMe);
-      } else if (localCheck.code === 'ACCOUNT_DISABLED') {
-        setDisabledModalMessage(
-          localCheck.error ||
-            'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
-        );
-      } else {
-        setErrorMsg(
-          localCheck.error || 'Unable to reach authentication server. Please retry.',
-        );
-      }
+      setErrorMsg('Unable to reach authentication server. Please retry.');
     } finally {
       setSubmitting(false);
     }
@@ -292,20 +396,10 @@ export function LoginPage({
 
   const openForgotPasswordFlow = () => {
     const initialId = username.trim();
-    const localMatch = initialId ? findUserByIdentifier(initialId) : null;
     setAuthView('reset');
     setResetMode('request');
     setResetIdentifier(initialId);
-    setResetTargetUser(
-      localMatch
-        ? {
-            userId: localMatch.userId,
-            username: localMatch.username,
-            targetEmail: localMatch.email,
-            maskedEmail: localMatch.email,
-          }
-        : null,
-    );
+    setResetTargetUser(null);
     setResetAuthMethod('otp');
     setErrorMsg('');
     setSuccessMsg('');
@@ -323,6 +417,9 @@ export function LoginPage({
   const openCreateUserFlow = () => {
     setAuthView('signup');
     setSignupStep('email');
+    setSignupWorkspaceMode('new_company');
+    setSignupCompanyName('');
+    setSignupInviteCode('');
     setSignupEmail('');
     setSignupOtp('');
     setSignupOtpToken('');
@@ -349,14 +446,10 @@ export function LoginPage({
     setResetNotice('');
     setSmtpUnconfiguredNotice(false);
     try {
-      const clientCredentialTokens = getAllStoredCredentialTokens();
       const res = await fetch('/api/auth/forgot-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          identifier,
-          ...(clientCredentialTokens.length > 0 ? { clientCredentialTokens } : {}),
-        }),
+        body: JSON.stringify({ identifier }),
       });
       const parsed = await safeReadJsonResponse<{
         ok?: boolean;
@@ -364,30 +457,12 @@ export function LoginPage({
         providerConfigured?: boolean;
         userId?: string;
         username?: string;
-        targetEmail?: string;
         maskedEmail?: string;
-        recipient?: string;
         otpToken?: string;
         message?: string;
         error?: string;
       }>(res);
       const data = parsed.data;
-
-      if (res.status === 404 && !data) {
-        const localMatch = findUserByIdentifier(identifier);
-        if (localMatch) {
-          setResetTargetUser({
-            userId: localMatch.userId,
-            username: localMatch.username,
-            targetEmail: localMatch.email,
-            maskedEmail: localMatch.email,
-          });
-        }
-        setResetError(
-          'Password reset API endpoint (/api/auth/forgot-password) is unavailable on this host. Please redeploy or use "Verify with Google" below.',
-        );
-        return;
-      }
 
       if (!res.ok || !data?.ok) {
         setResetError(
@@ -398,14 +473,13 @@ export function LoginPage({
         return;
       }
 
-      const resolvedEmail = data.targetEmail || data.recipient || '';
+      const maskedEmail = data.maskedEmail || 'your registered email';
       const resolvedUsername = data.username || identifier;
       const resolvedUserId = data.userId || '';
       setResetTargetUser({
         userId: resolvedUserId,
         username: resolvedUsername,
-        targetEmail: resolvedEmail,
-        maskedEmail: data.maskedEmail || resolvedEmail,
+        maskedEmail,
       });
 
       if (data.otpToken) {
@@ -415,13 +489,13 @@ export function LoginPage({
         setResetAuthMethod('otp');
         setOtpInput('');
         setVerifiedToken('');
-        setResetNotice(data.message || `6-digit reset code sent to ${resolvedEmail}.`);
+        setResetNotice(data.message || `6-digit reset code sent to ${maskedEmail}.`);
         setResetMode('verify_otp');
       } else {
         setSmtpUnconfiguredNotice(true);
         setResetNotice(
           data.message ||
-            `SMTP/Resend email credentials are not configured yet. Verify via Google (${resolvedEmail}) below to reset immediately.`,
+            `Email gateway is not configured yet. Verify via Google (${maskedEmail}) below to reset immediately.`,
         );
       }
     } catch {
@@ -434,9 +508,9 @@ export function LoginPage({
   const handleVerifyResetCode = async (e: FormEvent) => {
     e.preventDefault();
     const cleanedOtp = otpInput.trim();
-    const targetEmail = resetTargetUser?.targetEmail || 'your registered Gmail';
+    const maskedEmail = resetTargetUser?.maskedEmail || 'your registered email';
     if (!/^\d{6}$/.test(cleanedOtp)) {
-      setResetError(`Please enter the 6-digit verification code sent to ${targetEmail}.`);
+      setResetError(`Please enter the 6-digit verification code sent to ${maskedEmail}.`);
       return;
     }
 
@@ -458,24 +532,25 @@ export function LoginPage({
         verifiedToken?: string;
         userId?: string;
         username?: string;
-        targetEmail?: string;
+        maskedEmail?: string;
         message?: string;
         error?: string;
       }>(res);
       const data = parsed.data;
       if (!res.ok || !data?.ok) {
         setResetError(
-          data?.error || parsed.errorMessage || 'Invalid 6-digit verification code. Please try again.',
+          data?.error ||
+            parsed.errorMessage ||
+            'Invalid 6-digit verification code. Please try again.',
         );
         return;
       }
       setVerifiedToken(data.verifiedToken || '');
-      if (data.userId && data.username && data.targetEmail) {
+      if (data.userId && data.username && data.maskedEmail) {
         setResetTargetUser({
           userId: data.userId,
           username: data.username,
-          targetEmail: data.targetEmail,
-          maskedEmail: data.targetEmail,
+          maskedEmail: data.maskedEmail,
         });
       }
       setResetAuthMethod('otp');
@@ -491,20 +566,9 @@ export function LoginPage({
   };
 
   const handleVerifyGoogleForReset = async () => {
-    const localMatch = findUserByIdentifier(resetIdentifier.trim());
-    const targetInfo =
-      resetTargetUser ||
-      (localMatch
-        ? {
-            userId: localMatch.userId,
-            username: localMatch.username,
-            targetEmail: localMatch.email,
-            maskedEmail: localMatch.email,
-          }
-        : null);
-
-    if (!targetInfo?.targetEmail) {
-      setResetError('Enter your User ID or registered Gmail address and click "Send Reset Code" first.');
+    const identifier = resetIdentifier.trim();
+    if (!resetTargetUser?.userId && !identifier) {
+      setResetError('Enter your User ID or registered Gmail address first.');
       return;
     }
 
@@ -513,18 +577,45 @@ export function LoginPage({
     setResetNotice('');
     try {
       const credential = await signInWithPopup(auth, googleProvider);
-      const signedInEmail = (credential.user.email || '').toLowerCase();
-      if (!credential.user.emailVerified || signedInEmail !== targetInfo.targetEmail.toLowerCase()) {
+      const idToken = await credential.user.getIdToken();
+      const res = await fetch('/api/auth/reset/verify-google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: resetTargetUser?.userId,
+          identifier: resetTargetUser?.username || identifier,
+          firebaseIdToken: idToken,
+        }),
+      });
+      const parsed = await safeReadJsonResponse<{
+        ok?: boolean;
+        verifiedToken?: string;
+        userId?: string;
+        username?: string;
+        maskedEmail?: string;
+        message?: string;
+        error?: string;
+      }>(res);
+      const data = parsed.data;
+      if (!res.ok || !data?.ok || !data.verifiedToken) {
         setResetError(
-          `Signed in as ${credential.user.email || 'unknown account'}. Please sign in with ${targetInfo.targetEmail} to reset "${targetInfo.username}".`,
+          data?.error ||
+            parsed.errorMessage ||
+            'Signed-in Google account does not match the registered email for this CRM account.',
         );
         return;
       }
-      const idToken = await credential.user.getIdToken();
-      setResetTargetUser(targetInfo);
+      setResetTargetUser({
+        userId: data.userId || resetTargetUser?.userId || '',
+        username: data.username || resetTargetUser?.username || identifier,
+        maskedEmail: data.maskedEmail || resetTargetUser?.maskedEmail || 'verified Google account',
+      });
       setGoogleIdToken(idToken);
+      setVerifiedToken(data.verifiedToken);
       setResetAuthMethod('google');
-      setResetNotice(`Verified ${targetInfo.targetEmail}. Enter your new CRM password below.`);
+      setResetNotice(
+        data.message || 'Google ownership verified. Enter your new CRM password below.',
+      );
       setResetMode('set_password');
     } catch (err) {
       setResetError(
@@ -538,13 +629,13 @@ export function LoginPage({
   const handleConfirmResetPassword = async (e: FormEvent) => {
     e.preventDefault();
     setResetError('');
-    const targetEmail = resetTargetUser?.targetEmail || 'your registered Gmail';
+    const maskedEmail = resetTargetUser?.maskedEmail || 'your registered email';
     if (resetAuthMethod === 'otp' && !verifiedToken && otpInput.trim().length !== 6) {
-      setResetError(`Please enter the 6-digit verification code sent to ${targetEmail}.`);
+      setResetError(`Please enter the 6-digit verification code sent to ${maskedEmail}.`);
       return;
     }
-    if (newPassword.length < 6) {
-      setResetError('New password must be at least 6 characters.');
+    if (newPassword.length < 8) {
+      setResetError('New password must be at least 8 characters.');
       return;
     }
     if (newPassword !== confirmNewPassword) {
@@ -554,7 +645,6 @@ export function LoginPage({
 
     setResetLoading(true);
     try {
-      const clientCredentialTokens = getAllStoredCredentialTokens();
       const res = await fetch('/api/auth/reset-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -565,8 +655,8 @@ export function LoginPage({
                 userId: resetTargetUser?.userId,
                 identifier: resetTargetUser?.username || resetIdentifier.trim(),
                 firebaseIdToken: googleIdToken,
+                verifiedToken,
                 newPassword,
-                clientCredentialTokens,
               }
             : {
                 mode: 'otp',
@@ -576,7 +666,6 @@ export function LoginPage({
                 otpToken,
                 verifiedToken,
                 newPassword,
-                clientCredentialTokens,
               },
         ),
       });
@@ -584,7 +673,6 @@ export function LoginPage({
         ok?: boolean;
         username?: string;
         user?: CrmUserSession;
-        credentialToken?: string;
         message?: string;
         error?: string;
       }>(res);
@@ -594,14 +682,7 @@ export function LoginPage({
         return;
       }
 
-      const finalUsername = data.username || resetTargetUser?.username || VALID_LOGIN_USERNAME;
-      // Persist updated credential cleanly without touching or clearing any local CRM data
-      saveResetPasswordCredential(finalUsername, newPassword, data.credentialToken, {
-        userId: data.user?.userId || resetTargetUser?.userId,
-        email: data.user?.email || resetTargetUser?.targetEmail,
-        role: data.user?.role,
-      });
-
+      const finalUsername = data.username || resetTargetUser?.username || resetIdentifier.trim();
       setAuthView('login');
       setResetMode('request');
       setResetTargetUser(null);
@@ -628,7 +709,7 @@ export function LoginPage({
     if (e) e.preventDefault();
     const cleanEmail = signupEmail.trim().toLowerCase();
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      setSignupError('Please enter a valid Gmail address.');
+      setSignupError('Please enter a valid email address.');
       return;
     }
 
@@ -639,10 +720,7 @@ export function LoginPage({
       const res = await fetch('/api/auth/signup/send-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: cleanEmail,
-          clientCredentialTokens: getAllStoredCredentialTokens(),
-        }),
+        body: JSON.stringify({ email: cleanEmail }),
       });
       const parsed = await safeReadJsonResponse<{
         ok?: boolean;
@@ -654,7 +732,9 @@ export function LoginPage({
       const data = parsed.data;
       if (!res.ok || !data?.ok) {
         setSignupError(
-          data?.error || parsed.errorMessage || `Could not send verification OTP to ${cleanEmail}.`,
+          data?.error ||
+            parsed.errorMessage ||
+            `Could not send verification OTP to ${cleanEmail}.`,
         );
         return;
       }
@@ -664,7 +744,7 @@ export function LoginPage({
       setSignupNotice(data.message || `6-digit verification OTP sent to ${cleanEmail}.`);
       setSignupStep('verify_otp');
     } catch {
-      setSignupError('Network error while sending Gmail verification OTP.');
+      setSignupError('Network error while sending email verification OTP.');
     } finally {
       setSignupLoading(false);
     }
@@ -699,17 +779,19 @@ export function LoginPage({
       const data = parsed.data;
       if (!res.ok || !data?.ok || !data.verifiedToken) {
         setSignupError(
-          data?.error || parsed.errorMessage || 'Invalid 6-digit OTP. Please check your Gmail inbox.',
+          data?.error ||
+            parsed.errorMessage ||
+            'Invalid 6-digit OTP. Please check your email inbox.',
         );
         return;
       }
       setSignupVerifiedToken(data.verifiedToken);
       setSignupNotice(
-        data.message || 'Gmail verified successfully! Choose your User ID and Password below.',
+        data.message || 'Email verified successfully! Choose your User ID and Password below.',
       );
       setSignupStep('credentials');
     } catch {
-      setSignupError('Network error while verifying Gmail OTP.');
+      setSignupError('Network error while verifying email OTP.');
     } finally {
       setSignupLoading(false);
     }
@@ -724,8 +806,16 @@ export function LoginPage({
       );
       return;
     }
-    if (signupPassword.length < 6) {
-      setSignupError('Password must be at least 6 characters.');
+    if (signupWorkspaceMode === 'new_company' && signupCompanyName.trim().length < 2) {
+      setSignupError('Please enter your Company / Organization Name.');
+      return;
+    }
+    if (signupWorkspaceMode === 'join_invite' && !signupInviteCode.trim()) {
+      setSignupError('Please enter the Team Invite Code issued by your Company Admin.');
+      return;
+    }
+    if (signupPassword.length < 8) {
+      setSignupError('Password must be at least 8 characters.');
       return;
     }
     if (signupPassword !== signupConfirmPassword) {
@@ -744,13 +834,14 @@ export function LoginPage({
           username: cleanUsername,
           password: signupPassword,
           verifiedToken: signupVerifiedToken,
-          clientCredentialTokens: getAllStoredCredentialTokens(),
+          ...(signupWorkspaceMode === 'new_company'
+            ? { companyName: signupCompanyName.trim() }
+            : { inviteCode: signupInviteCode.trim() }),
         }),
       });
       const parsed = await safeReadJsonResponse<{
         ok?: boolean;
         user?: CrmUserSession;
-        credentialToken?: string;
         message?: string;
         error?: string;
       }>(res);
@@ -760,18 +851,9 @@ export function LoginPage({
         return;
       }
 
-      registerSecondaryUserAccount({
-        userId: data.user.userId,
-        username: data.user.username,
-        email: data.user.email,
-        password: signupPassword,
-        credentialToken: data.credentialToken,
-        createdAt: data.user.createdAt,
-      });
-
       setCreatedUsernameLabel(data.user.username);
       setSignupNotice(
-        data.message || 'Successful ID Creation! Returning to the Login screen...',
+        data.message || 'Successful Account Creation! Returning to the Login screen...',
       );
       setSignupStep('success');
     } catch (err) {
@@ -1094,16 +1176,209 @@ export function LoginPage({
                 </p>
               </div>
 
-              {authView === 'login' ? (
+              {authView === 'setup' ? (
+                <div className="pt-5 space-y-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700">
+                      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                      First-Time Workspace Setup
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setAuthView('login')}
+                      className="text-xs font-medium text-[#1665D8] hover:underline cursor-pointer"
+                    >
+                      Already configured? Sign In
+                    </button>
+                  </div>
+
+                  <div className="text-center">
+                    <h2 className="font-display text-lg font-bold text-[#0B1E47]">
+                      Register Your Company &amp; Owner
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Create the primary Workspace Owner account with zero default passwords
+                    </p>
+                  </div>
+
+                  {setupError && (
+                    <div
+                      role="alert"
+                      className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs font-medium text-red-700"
+                    >
+                      {setupError}
+                    </div>
+                  )}
+
+                  <form onSubmit={handleSetupAdminSubmit} className="space-y-3">
+                    <div>
+                      <label htmlFor="setup-company-name" className="block text-xs font-medium text-slate-700 mb-1">
+                        Company / Firm Name *
+                      </label>
+                      <input
+                        id="setup-company-name"
+                        type="text"
+                        required
+                        autoFocus
+                        value={setupCompanyName}
+                        onChange={(e) => setSetupCompanyName(e.target.value)}
+                        placeholder="e.g. Apex Infra & Tech Systems Pvt. Ltd."
+                        className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3.5 py-2 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label htmlFor="setup-gstin" className="block text-[11px] font-medium text-slate-700 mb-1">
+                          GSTIN (Optional)
+                        </label>
+                        <input
+                          id="setup-gstin"
+                          type="text"
+                          value={setupGstin}
+                          onChange={(e) => setSetupGstin(e.target.value)}
+                          placeholder="07AAACA1234A1Z5"
+                          className="font-mono-num w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3 py-2 text-xs text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="setup-udyam" className="block text-[11px] font-medium text-slate-700 mb-1">
+                          Udyam / MSME (Opt.)
+                        </label>
+                        <input
+                          id="setup-udyam"
+                          type="text"
+                          value={setupUdyamNumber}
+                          onChange={(e) => setSetupUdyamNumber(e.target.value)}
+                          placeholder="UDYAM-DL-01-..."
+                          className="font-mono-num w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3 py-2 text-xs text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label htmlFor="setup-username" className="block text-xs font-medium text-slate-700 mb-1">
+                          Owner User ID *
+                        </label>
+                        <input
+                          id="setup-username"
+                          type="text"
+                          required
+                          value={setupUsername}
+                          onChange={(e) => setSetupUsername(e.target.value)}
+                          placeholder="e.g. OwnerAdmin"
+                          className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3 py-2 text-xs text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="setup-email" className="block text-xs font-medium text-slate-700 mb-1">
+                          Owner Email *
+                        </label>
+                        <input
+                          id="setup-email"
+                          type="email"
+                          required
+                          value={setupEmail}
+                          onChange={(e) => setSetupEmail(e.target.value)}
+                          placeholder="owner@company.in"
+                          className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3 py-2 text-xs text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label htmlFor="setup-password" className="block text-xs font-medium text-slate-700 mb-1">
+                        Password (min 8 characters) *
+                      </label>
+                      <div className="relative">
+                        <Lock
+                          className="h-4 w-4 text-[#1E3A8A]/70 absolute left-3 top-1/2 -translate-y-1/2"
+                          aria-hidden="true"
+                        />
+                        <input
+                          id="setup-password"
+                          type={showSetupPassword ? 'text' : 'password'}
+                          required
+                          minLength={8}
+                          value={setupPassword}
+                          onChange={(e) => setSetupPassword(e.target.value)}
+                          placeholder="Strong password (8+ chars)"
+                          className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-9 pr-9 py-2 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowSetupPassword((prev) => !prev)}
+                          aria-label={showSetupPassword ? 'Hide password' : 'Show password'}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded text-slate-500 hover:text-slate-800"
+                        >
+                          {showSetupPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label htmlFor="setup-confirm-password" className="block text-xs font-medium text-slate-700 mb-1">
+                        Confirm Password *
+                      </label>
+                      <input
+                        id="setup-confirm-password"
+                        type={showSetupPassword ? 'text' : 'password'}
+                        required
+                        minLength={8}
+                        value={setupConfirmPassword}
+                        onChange={(e) => setSetupConfirmPassword(e.target.value)}
+                        placeholder="Re-enter password"
+                        className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3.5 py-2 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={setupLoading}
+                      data-testid="setup-admin-submit-btn"
+                      className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
+                    >
+                      <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+                      <span>{setupLoading ? 'Creating Workspace...' : 'Create Company & Owner Account'}</span>
+                    </button>
+                  </form>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleGoogleContinue()}
+                    disabled={googleSubmitting}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 disabled:opacity-60 text-slate-800 text-xs font-semibold cursor-pointer"
+                  >
+                    <ShieldCheck className="h-4 w-4 text-emerald-600" aria-hidden="true" />
+                    <span>{googleSubmitting ? 'Connecting Google...' : 'Or Start Workspace with Google'}</span>
+                  </button>
+                </div>
+              ) : authView === 'login' ? (
                 <>
                   <div className="pt-5 pb-4 text-center">
                     <h2 className="font-display text-xl font-bold text-[#0B1E47]">
                       Login to Your Account
                     </h2>
                     <p className="text-xs text-slate-500 mt-1">
-                      Enter your User ID or Gmail credentials to continue
+                      {!bootstrapChecked
+                        ? 'Checking workspace status...'
+                        : 'Enter your User ID or work email credentials to continue'}
                     </p>
                   </div>
+
+                  {needsInitialSetup && (
+                    <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-xs text-blue-900 flex items-center justify-between gap-2">
+                      <span>No workspace owner exists yet.</span>
+                      <button
+                        type="button"
+                        onClick={() => setAuthView('setup')}
+                        className="font-semibold text-[#0F5BD8] hover:underline shrink-0 cursor-pointer"
+                      >
+                        Run First-Time Setup
+                      </button>
+                    </div>
+                  )}
 
                   <form onSubmit={handleSubmit} className="space-y-4">
                     {successMsg && (
@@ -1143,7 +1418,7 @@ export function LoginPage({
                             setUsername(e.target.value);
                             if (errorMsg) setErrorMsg('');
                           }}
-                          placeholder="User ID / Gmail ID"
+                          placeholder="User ID / Work Email"
                           className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8] focus:border-[#1665D8]"
                         />
                       </div>
@@ -1207,18 +1482,29 @@ export function LoginPage({
 
                     <button
                       type="submit"
-                      disabled={submitting}
+                      disabled={submitting || googleSubmitting}
                       className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-md shadow-blue-900/20 transition-all cursor-pointer"
                     >
                       <ArrowRightCircle className="h-4 w-4" aria-hidden="true" />
                       <span>{submitting ? 'Signing In...' : 'Login'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => void handleGoogleContinue()}
+                      disabled={submitting || googleSubmitting}
+                      data-testid="google-sso-login-btn"
+                      className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60 text-slate-800 text-xs sm:text-sm font-semibold transition-colors cursor-pointer"
+                    >
+                      <ShieldCheck className="h-4 w-4 text-emerald-600 shrink-0" aria-hidden="true" />
+                      <span>{googleSubmitting ? 'Signing in with Google...' : 'Continue with Google'}</span>
                     </button>
                   </form>
 
                   <div className="flex items-center gap-3 my-4">
                     <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
                     <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                      NEW TEAM MEMBER?
+                      NEW WORKSPACE OR INVITE?
                     </span>
                     <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
                   </div>
@@ -1230,7 +1516,7 @@ export function LoginPage({
                     className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-blue-200 bg-blue-50/70 hover:bg-blue-100/80 text-[#0F49B8] text-xs sm:text-sm font-semibold transition-colors cursor-pointer"
                   >
                     <UserPlus className="h-4 w-4 shrink-0" aria-hidden="true" />
-                    <span>Create New User</span>
+                    <span>Register Company / Join Team</span>
                   </button>
 
                   <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 bg-[#F8FAFC] px-4 py-3">
@@ -1242,7 +1528,7 @@ export function LoginPage({
                         Isolated &amp; Encrypted Access
                       </p>
                       <p className="text-[11px] text-slate-500">
-                        Each user gets a private workspace · Gmail OTP verified
+                        Company-isolated workspaces · Bcrypt &amp; signed session auth
                       </p>
                     </div>
                   </div>
@@ -1259,7 +1545,7 @@ export function LoginPage({
                       <span>Back to Login</span>
                     </button>
                     <span className="text-[11px] font-semibold text-blue-700">
-                      New Secondary User
+                      Workspace Onboarding
                     </span>
                   </div>
 
@@ -1406,7 +1692,76 @@ export function LoginPage({
                   )}
 
                   {signupStep === 'credentials' && (
-                    <form onSubmit={handleCompleteSignup} className="space-y-3.5">
+                    <form onSubmit={handleCompleteSignup} className="space-y-3">
+                      <div className="grid grid-cols-2 gap-2 rounded-lg bg-slate-100 p-1">
+                        <button
+                          type="button"
+                          onClick={() => setSignupWorkspaceMode('new_company')}
+                          className={`py-1.5 px-2 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                            signupWorkspaceMode === 'new_company'
+                              ? 'bg-white text-[#0B1E47] shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          New Company
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSignupWorkspaceMode('join_invite')}
+                          className={`py-1.5 px-2 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                            signupWorkspaceMode === 'join_invite'
+                              ? 'bg-white text-[#0B1E47] shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Join via Invite
+                        </button>
+                      </div>
+
+                      {signupWorkspaceMode === 'new_company' ? (
+                        <div>
+                          <label
+                            htmlFor="signup-company-name"
+                            className="block text-xs font-medium text-slate-700 mb-1"
+                          >
+                            Company / Organization Name *
+                          </label>
+                          <input
+                            id="signup-company-name"
+                            type="text"
+                            required
+                            value={signupCompanyName}
+                            onChange={(e) => {
+                              setSignupCompanyName(e.target.value);
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="e.g. Bharat Tech Solutions"
+                            className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3.5 py-2 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                      ) : (
+                        <div>
+                          <label
+                            htmlFor="signup-invite-code"
+                            className="block text-xs font-medium text-slate-700 mb-1"
+                          >
+                            Team Invite Code *
+                          </label>
+                          <input
+                            id="signup-invite-code"
+                            type="text"
+                            required
+                            value={signupInviteCode}
+                            onChange={(e) => {
+                              setSignupInviteCode(e.target.value);
+                              if (signupError) setSignupError('');
+                            }}
+                            placeholder="Paste invite code from your admin"
+                            className="font-mono-num w-full rounded-lg border border-slate-300 bg-[#F8FAFC] px-3.5 py-2 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
+                          />
+                        </div>
+                      )}
+
                       <div>
                         <label
                           htmlFor="signup-username"
@@ -1440,7 +1795,7 @@ export function LoginPage({
                           htmlFor="signup-password"
                           className="block text-xs font-medium text-slate-700 mb-1"
                         >
-                          Create Password (min 6 characters) *
+                          Create Password (min 8 characters) *
                         </label>
                         <div className="relative">
                           <Lock
@@ -1451,13 +1806,13 @@ export function LoginPage({
                             id="signup-password"
                             type={showSignupPassword ? 'text' : 'password'}
                             required
-                            minLength={6}
+                            minLength={8}
                             value={signupPassword}
                             onChange={(e) => {
                               setSignupPassword(e.target.value);
                               if (signupError) setSignupError('');
                             }}
-                            placeholder="Enter password"
+                            placeholder="Enter password (8+ chars)"
                             className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-10 py-2.5 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
                           />
                           <button
@@ -1491,7 +1846,7 @@ export function LoginPage({
                             id="signup-confirm-password"
                             type={showSignupPassword ? 'text' : 'password'}
                             required
-                            minLength={6}
+                            minLength={8}
                             value={signupConfirmPassword}
                             onChange={(e) => {
                               setSignupConfirmPassword(e.target.value);
@@ -1509,7 +1864,7 @@ export function LoginPage({
                         className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-gradient-to-r from-[#0F5BD8] to-[#0A46AD] hover:from-[#0C4EC0] hover:to-[#083B94] disabled:opacity-60 text-white text-sm font-semibold shadow-sm cursor-pointer"
                       >
                         <UserPlus className="h-4 w-4" aria-hidden="true" />
-                        <span>{signupLoading ? 'Creating Account...' : 'Create User ID'}</span>
+                        <span>{signupLoading ? 'Creating Account...' : 'Complete Registration'}</span>
                       </button>
                     </form>
                   )}
@@ -1567,15 +1922,15 @@ export function LoginPage({
                       Reset CRM Password
                     </h2>
                     <p className="text-xs text-slate-500 mt-1">
-                      {resetTargetUser?.targetEmail ? (
+                      {resetTargetUser?.maskedEmail ? (
                         <>
                           Verification mail target:{' '}
                           <span className="font-semibold text-slate-700">
-                            {resetTargetUser.targetEmail}
+                            {resetTargetUser.maskedEmail}
                           </span>
                         </>
                       ) : (
-                        'Enter your User ID or registered Gmail to send an OTP to your email'
+                        'Enter your User ID or registered email to verify ownership'
                       )}
                     </p>
                   </div>
@@ -1609,7 +1964,7 @@ export function LoginPage({
                           htmlFor="reset-identifier"
                           className="block text-xs font-medium text-slate-700 mb-1"
                         >
-                          User ID or Registered Gmail ID *
+                          User ID or Registered Email ID *
                         </label>
                         <div className="relative">
                           <User
@@ -1622,24 +1977,11 @@ export function LoginPage({
                             autoFocus
                             value={resetIdentifier}
                             onChange={(e) => {
-                              const nextVal = e.target.value;
-                              setResetIdentifier(nextVal);
-                              const local = nextVal.trim()
-                                ? findUserByIdentifier(nextVal.trim())
-                                : null;
-                              setResetTargetUser(
-                                local
-                                  ? {
-                                      userId: local.userId,
-                                      username: local.username,
-                                      targetEmail: local.email,
-                                      maskedEmail: local.email,
-                                    }
-                                  : null,
-                              );
+                              setResetIdentifier(e.target.value);
+                              setResetTargetUser(null);
                               if (resetError) setResetError('');
                             }}
-                            placeholder="Enter User ID or Gmail (e.g. VanshSales or your@gmail.com)"
+                            placeholder="Enter User ID or registered email"
                             className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
                           />
                         </div>
@@ -1655,13 +1997,13 @@ export function LoginPage({
                         <span>
                           {resetLoading
                             ? 'Sending Reset Code...'
-                            : resetTargetUser?.targetEmail
-                              ? `Send Reset Code to ${resetTargetUser.targetEmail}`
+                            : resetTargetUser?.maskedEmail
+                              ? `Send Reset Code to ${resetTargetUser.maskedEmail}`
                               : 'Send Reset Code'}
                         </span>
                       </button>
 
-                      {resetTargetUser?.targetEmail && (
+                      {resetIdentifier.trim().length > 0 && (
                         <>
                           <div className="flex items-center gap-3">
                             <span className="h-px flex-1 bg-slate-200" aria-hidden="true" />
@@ -1681,7 +2023,11 @@ export function LoginPage({
                               className="h-4 w-4 text-emerald-600 shrink-0"
                               aria-hidden="true"
                             />
-                            <span>Verify with Google ({resetTargetUser.targetEmail})</span>
+                            <span>
+                              {resetTargetUser?.maskedEmail
+                                ? `Verify with Google (${resetTargetUser.maskedEmail})`
+                                : 'Verify Ownership with Google'}
+                            </span>
                           </button>
                         </>
                       )}
@@ -1696,7 +2042,7 @@ export function LoginPage({
                           className="block text-xs font-medium text-slate-700 mb-1"
                         >
                           6-Digit Verification Code (Check{' '}
-                          {resetTargetUser?.targetEmail || 'your Gmail'})
+                          {resetTargetUser?.maskedEmail || 'your registered email'})
                         </label>
                         <div className="relative">
                           <KeyRound
@@ -1736,7 +2082,7 @@ export function LoginPage({
                         disabled={resetLoading}
                         className="w-full text-center text-xs font-medium text-[#1665D8] hover:underline cursor-pointer"
                       >
-                        Resend Verification Code to {resetTargetUser?.targetEmail || 'your Gmail'}
+                        Resend Verification Code to {resetTargetUser?.maskedEmail || 'your email'}
                       </button>
                     </form>
                   )}
@@ -1748,7 +2094,7 @@ export function LoginPage({
                           htmlFor="reset-new-password"
                           className="block text-xs font-medium text-slate-700 mb-1"
                         >
-                          New Password (min 6 characters)
+                          New Password (min 8 characters)
                         </label>
                         <div className="relative">
                           <Lock
@@ -1759,11 +2105,11 @@ export function LoginPage({
                             id="reset-new-password"
                             type={showNewPassword ? 'text' : 'password'}
                             required
-                            minLength={6}
+                            minLength={8}
                             autoFocus
                             value={newPassword}
                             onChange={(e) => setNewPassword(e.target.value)}
-                            placeholder="Enter new password"
+                            placeholder="Enter new password (8+ chars)"
                             className="w-full rounded-lg border border-slate-300 bg-[#F8FAFC] pl-10 pr-10 py-2.5 text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1665D8]"
                           />
                           <button
@@ -1797,7 +2143,7 @@ export function LoginPage({
                             id="reset-confirm-password"
                             type={showNewPassword ? 'text' : 'password'}
                             required
-                            minLength={6}
+                            minLength={8}
                             value={confirmNewPassword}
                             onChange={(e) => setConfirmNewPassword(e.target.value)}
                             placeholder="Re-enter new password"
@@ -1891,7 +2237,7 @@ export function LoginPage({
             <div className="p-5 space-y-4">
               <p className="text-sm text-slate-700 leading-relaxed">{disabledModalMessage}</p>
               <div className="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600">
-                Only the Primary Administrator (<span className="font-semibold text-slate-800">VanshSales</span>) can re-enable this secondary CRM user ID from Admin Settings.
+                Only <span className="font-semibold text-slate-800">your Company Administrator</span> can re-enable this CRM user ID from Workspace Settings.
               </div>
               <div className="flex justify-end pt-1">
                 <button

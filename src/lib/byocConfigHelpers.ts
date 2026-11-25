@@ -1,5 +1,5 @@
 import firebaseConfig from '../../firebase-applet-config.json' with { type: 'json' };
-import type { ByocFirebaseConfig } from '../types/crm';
+import type { ByocFirebaseConfig, CrmUserRole } from '../types/crm';
 
 export const CENTRAL_FIREBASE_PROJECT_ID = firebaseConfig.projectId;
 export const CENTRAL_FIRESTORE_DATABASE_ID = firebaseConfig.firestoreDatabaseId;
@@ -148,30 +148,28 @@ export function buildByocConsoleUrl(
 }
 
 export function assertIsolatedTargetDescriptor<
-  T extends { projectId: string; isByoc: boolean; role: 'admin' | 'secondary' },
+  T extends { projectId: string; isByoc: boolean; role: CrmUserRole },
 >(opts: {
-  role?: 'admin' | 'secondary';
+  role?: CrmUserRole;
   workspaceTenantId?: string | null;
   target?: T | null;
   adminFallback: T;
 }): T {
   const safeTenant =
-    typeof opts.workspaceTenantId === 'string' &&
-    opts.workspaceTenantId.trim() !== '' &&
-    opts.workspaceTenantId.trim() !== 'admin_vanshsales'
+    typeof opts.workspaceTenantId === 'string' && opts.workspaceTenantId.trim() !== ''
       ? opts.workspaceTenantId.trim()
       : null;
-  const inferredRole = opts.role ?? opts.target?.role ?? (safeTenant ? 'secondary' : 'admin');
+  const inferredRole: CrmUserRole = opts.role ?? opts.target?.role ?? (safeTenant ? 'secondary' : 'admin');
 
   if (inferredRole === 'secondary' || safeTenant) {
     if (!opts.target || !opts.target.isByoc) {
       throw new Error(
-        'BYOC_NOT_CONFIGURED: Secondary user cloud storage requires your own verified Firebase project. Admin primary cloud is strictly isolated.',
+        'BYOC_NOT_CONFIGURED: Secondary user cloud storage requires your own verified Firebase project. Primary company cloud is strictly isolated.',
       );
     }
     if (opts.target.projectId.toLowerCase() === CENTRAL_FIREBASE_PROJECT_ID.toLowerCase()) {
       throw new Error(
-        'BYOC_PROJECT_CONFLICT: Secondary users cannot read or write to the primary Admin Firebase project.',
+        'BYOC_PROJECT_CONFLICT: Secondary users cannot read or write to the primary company Firebase project.',
       );
     }
     return opts.target;

@@ -52,7 +52,12 @@ import type {
   Tender,
 } from '../types/crm';
 import { compressProfilePhotoDataUrl } from '../utils/attachments';
-import { computeEffectivePresenceStatus } from '../utils/authCredentials';
+import {
+  computeEffectivePresenceStatus,
+  isWorkspaceAdminRole,
+  normalizeCrmRole,
+  ROLE_LABELS,
+} from '../utils/authCredentials';
 import { formatSlotLabel, isValidNotificationEmail } from '../utils/emailAlerts';
 import { buildCsvContent, downloadTextFile, formatDateTime } from '../utils/formatters';
 import {
@@ -148,6 +153,8 @@ export function SettingsTab({
   togglingUserId = null,
 }: SettingsTabProps) {
   const isSecondary = currentUser?.role === 'secondary';
+  const isWorkspaceAdmin = isWorkspaceAdminRole(currentUser?.role);
+  const normalizedRole = normalizeCrmRole(currentUser?.role);
   const [firmName, setFirmName] = useState(profile.firmName);
   const [gstin, setGstin] = useState(profile.gstin);
   const [udyamNumber, setUdyamNumber] = useState(profile.udyamNumber);
@@ -1272,18 +1279,17 @@ export function SettingsTab({
               <span className="text-slate-500 dark:text-slate-400">Account Role &amp; Workspace</span>
               <span
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${
-                  currentUser?.role === 'secondary'
-                    ? 'bg-blue-50 dark:bg-blue-950/50 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
-                    : 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                  isWorkspaceAdmin
+                    ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-blue-50 dark:bg-blue-950/50 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
                 }`}
               >
-                {currentUser?.role === 'secondary'
-                  ? 'Secondary User (Isolated)'
-                  : 'Primary Admin'}
+                {ROLE_LABELS[normalizedRole]}
+                {currentUser?.companyName ? ` · ${currentUser.companyName}` : ''}
               </span>
             </div>
             <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-500 dark:text-slate-400">Registered Gmail</span>
+              <span className="text-slate-500 dark:text-slate-400">Registered Email</span>
               <span className="font-mono-num text-slate-700 dark:text-slate-300 truncate max-w-[200px]">
                 {currentUser?.email || '—'}
               </span>
@@ -1295,8 +1301,8 @@ export function SettingsTab({
               </span>
             </div>
             <p className="text-slate-600 dark:text-slate-400 leading-relaxed pt-1">
-              {currentUser?.role === 'secondary'
-                ? 'Your secondary CRM workspace is isolated from Primary Admin data. Page refreshes stay signed in for up to 15 minutes, while closing the tab or exceeding 15 minutes logs out automatically.'
+              {isSecondary
+                ? 'Your secondary CRM workspace is isolated from other company accounts. Page refreshes stay signed in for up to 15 minutes, while closing the tab or exceeding 15 minutes logs out automatically.'
                 : 'Page refreshes stay signed in within the current tab for up to 15 minutes. After 15 minutes of login time, closing the tab, or clicking Log Out, you will be signed out automatically.'}
             </p>
           </div>
@@ -1315,7 +1321,7 @@ export function SettingsTab({
       </section>
 
       {/* Admin-Only Secondary Users Directory */}
-      {currentUser?.role === 'admin' && (
+      {isWorkspaceAdmin && (
         <section
           data-testid="admin-secondary-users-section"
           className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
@@ -1950,7 +1956,7 @@ export function SettingsTab({
           <Database className="h-5 w-5 text-[#1E3A8A] dark:text-blue-400" aria-hidden="true" />
           <div>
             <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
-              {currentUser?.role === 'admin'
+              {isWorkspaceAdmin
                 ? 'Data Backup, CSV Reports & Demo Reset'
                 : 'Data Backup & CSV Reports'}
             </h2>
@@ -2010,7 +2016,7 @@ export function SettingsTab({
           </button>
 
           <div className="ml-auto flex flex-wrap items-center gap-3">
-            {currentUser?.role === 'admin' && (
+            {isWorkspaceAdmin && (
               <button
                 type="button"
                 onClick={() => setConfirmAction('reset')}

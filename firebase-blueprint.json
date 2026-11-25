@@ -65,9 +65,9 @@
         },
         "adminPin": {
           "type": "string",
-          "minLength": 4,
-          "maxLength": 4,
-          "pattern": "^[0-9]{4}$"
+          "minLength": 0,
+          "maxLength": 6,
+          "pattern": "^(|[0-9]{4,6})$"
         },
         "darkMode": {
           "type": "boolean"
@@ -997,6 +997,181 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "VaultDocument": {
+      "title": "VaultDocument",
+      "description": "Company compliance document (MSME/Udyam, GST, ISO, PAN, Turnover CA Cert, DSC) with expiry tracking.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "docType": {
+          "type": "string",
+          "enum": ["MSME / Udyam", "GST Certificate", "ISO Certificate", "PAN Card", "Turnover CA Cert", "DSC Token", "Other"],
+          "maxLength": 40
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "documentNumber": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "issuedDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "expiryDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "fileName": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "fileUrl": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "remarks": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "id",
+        "docType",
+        "title",
+        "documentNumber",
+        "issuedDate",
+        "expiryDate",
+        "fileName",
+        "fileUrl",
+        "remarks",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AuditLogEntry": {
+      "title": "AuditLogEntry",
+      "description": "Immutable append-only activity & audit log record for tenders and workspace operations.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "entityType": {
+          "type": "string",
+          "enum": ["tender", "emd", "maf", "oem", "vault", "team", "company"],
+          "maxLength": 24
+        },
+        "entityId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "action": {
+          "type": "string",
+          "enum": ["CREATED", "UPDATED", "STAGE_CHANGED", "MAF_UPDATED", "EMD_UPDATED", "DOCUMENT_UPLOADED", "DELETED", "ROLE_CHANGED"],
+          "maxLength": 32
+        },
+        "actorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "actorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "id",
+        "entityType",
+        "entityId",
+        "action",
+        "actorUid",
+        "actorName",
+        "summary",
+        "createdAt"
+      ]
+    },
+    "CompanyMember": {
+      "title": "CompanyMember",
+      "description": "Multi-tenant company member role assignment keyed by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "companyId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["owner", "admin", "manager", "executive", "finance", "viewer"],
+          "maxLength": 24
+        },
+        "isEnabled": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "companyId", "role", "isEnabled", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -1004,7 +1179,7 @@
       "schema": {
         "$ref": "#/entities/AdminMarker"
       },
-      "description": "Bootstrapped and explicit admin role markers."
+      "description": "Server-provisioned explicit admin role markers."
     },
     "/users/{userId}": {
       "schema": {
@@ -1150,71 +1325,101 @@
       },
       "description": "Isolated Google Apps Script Webhook configuration for a secondary CRM workspace."
     },
+    "/users/{userId}/vaultDocuments/{docId}": {
+      "schema": {
+        "$ref": "#/entities/VaultDocument"
+      },
+      "description": "Company compliance vault documents with expiry tracking."
+    },
+    "/users/{userId}/auditLogs/{logId}": {
+      "schema": {
+        "$ref": "#/entities/AuditLogEntry"
+      },
+      "description": "Immutable append-only activity audit logs."
+    },
+    "/companies/{companyId}/members/{memberUid}": {
+      "schema": {
+        "$ref": "#/entities/CompanyMember"
+      },
+      "description": "Multi-tenant company RBAC membership records."
+    },
+    "/companies/{companyId}/vaultDocuments/{docId}": {
+      "schema": {
+        "$ref": "#/entities/VaultDocument"
+      },
+      "description": "Multi-tenant compliance vault documents."
+    },
+    "/companies/{companyId}/auditLogs/{logId}": {
+      "schema": {
+        "$ref": "#/entities/AuditLogEntry"
+      },
+      "description": "Multi-tenant immutable append-only audit logs."
+    },
     "/tenders/{docId}": {
       "schema": {
         "$ref": "#/entities/Tender"
       },
-      "description": "Legacy top-level tenders collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level tenders collection (strictly read-only recovery for explicit Admins)."
     },
     "/emdRecords/{docId}": {
       "schema": {
         "$ref": "#/entities/EmdBgRecord"
       },
-      "description": "Legacy top-level EMD/BG collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level EMD/BG collection (strictly read-only recovery for explicit Admins)."
     },
     "/emd_bg_tracker/{docId}": {
       "schema": {
         "$ref": "#/entities/EmdBgRecord"
       },
-      "description": "Legacy top-level EMD/BG tracker collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level EMD/BG tracker collection (strictly read-only recovery for explicit Admins)."
     },
     "/maf_tracker/{docId}": {
       "schema": {
         "$ref": "#/entities/MafTracker"
       },
-      "description": "Legacy top-level MAF tracker collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level MAF tracker collection (strictly read-only recovery for explicit Admins)."
     },
     "/attachmentFiles/{docId}": {
       "schema": {
         "$ref": "#/entities/AttachmentFile"
       },
-      "description": "Legacy top-level attachment files collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level attachment files collection (strictly read-only recovery for explicit Admins)."
     },
     "/settings/{docId}": {
       "schema": {
         "$ref": "#/entities/UserPreferences"
       },
-      "description": "Legacy top-level settings collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level settings collection (strictly read-only recovery for explicit Admins)."
     },
     "/profile/{docId}": {
       "schema": {
         "$ref": "#/entities/FirmProfile"
       },
-      "description": "Legacy top-level firm profile collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level firm profile collection (strictly read-only recovery for explicit Admins)."
     },
     "/sheetConfig/{docId}": {
       "schema": {
         "$ref": "#/entities/GoogleSheetConfig"
       },
-      "description": "Legacy top-level Google Sheet config collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level Google Sheet config collection (strictly read-only recovery for explicit Admins)."
     },
     "/emailConfig/{docId}": {
       "schema": {
         "$ref": "#/entities/EmailAlertConfig"
       },
-      "description": "Legacy top-level email alert config collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level email alert config collection (strictly read-only recovery for explicit Admins)."
     },
     "/emailAlerts/{docId}": {
       "schema": {
         "$ref": "#/entities/EmailAlertLog"
       },
-      "description": "Legacy top-level email alert logs collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level email alert logs collection (strictly read-only recovery for explicit Admins)."
     },
     "/oemDetails/{docId}": {
       "schema": {
         "$ref": "#/entities/OemDetail"
       },
-      "description": "Legacy top-level OEM details collection (strictly read-only recovery for Bootstrapped Admin)."
+      "description": "Legacy top-level OEM details collection (strictly read-only recovery for explicit Admins)."
     }
   }
 }

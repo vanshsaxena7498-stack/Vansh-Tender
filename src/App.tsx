@@ -46,10 +46,16 @@ import {
   type ByocCloudContext,
 } from './lib/byocFirebase';
 import { auth, firebaseConfig, googleProvider } from './lib/firebase';
+import {
+  clearInMemorySessionToken,
+  buildAuthorizedHeaders,
+  setInMemorySessionToken,
+} from './lib/apiClient';
 import type {
   ByocConnectionState,
   ByocFirebaseConfig,
   CrmBackupPayload,
+  CrmUserRole,
   CrmUserSession,
   EmailAlertLog,
   EmailAlertSettings,
@@ -71,18 +77,9 @@ import type {
   UserPreferences,
 } from './types/crm';
 import {
-  ADMIN_RECOVERY_EMAIL,
-  ADMIN_USER_ID,
   buildEmptySecondaryWorkspace,
   deduplicateSecondaryUsers,
-  getAllStoredCredentialTokens,
-  getStoredCredentialToken,
-  listSecondaryUsers,
-  loadSecondaryWorkspaceSnapshot,
-  recordUserLoginActivity,
-  saveResetPasswordCredential,
-  saveSecondaryWorkspaceSnapshot,
-  setSecondaryUserEnabled,
+  isWorkspaceAdminRole,
   type SecondaryWorkspaceSnapshot,
 } from './utils/authCredentials';
 import {
@@ -254,20 +251,22 @@ export default function App() {
   const initialTabBoot = useMemo(() => {
     const loaded = loadValidPerTabCrmSession();
     if (loaded.status !== 'valid') {
+      clearInMemorySessionToken();
       return {
         valid: null,
         expiredSession: loaded.status === 'expired' ? loaded.expiredSession : null,
-        secondarySnapshot: null as SecondaryWorkspaceSnapshot | null,
+        workspaceSnapshot: null as SecondaryWorkspaceSnapshot | null,
         byocConfig: null as ByocFirebaseConfig | null,
       };
     }
 
-    const { session } = loaded.data;
-    let secondarySnapshot: SecondaryWorkspaceSnapshot | null = null;
+    const { session, sessionToken: bootToken } = loaded.data;
+    if (bootToken) {
+      setInMemorySessionToken(bootToken);
+    }
+    const workspaceSnapshot = buildEmptySecondaryWorkspace(session);
     let initialByoc: ByocFirebaseConfig | null = null;
     if (session.role === 'secondary') {
-      secondarySnapshot =
-        loadSecondaryWorkspaceSnapshot(session.userId) ?? buildEmptySecondaryWorkspace(session);
       initialByoc =
         (session.byocConfig && validateByocFirebaseConfig(session.byocConfig).valid
           ? session.byocConfig
@@ -276,41 +275,39 @@ export default function App() {
     return {
       valid: loaded.data,
       expiredSession: null as CrmUserSession | null,
-      secondarySnapshot,
+      workspaceSnapshot,
       byocConfig: initialByoc,
     };
   }, []);
 
-  const initialSecSnap = initialTabBoot.secondarySnapshot;
-  const initialSheetCfg = initialSecSnap?.sheetSettings ?? DEFAULT_GOOGLE_SHEET_SETTINGS;
+  const initialBootSnap = initialTabBoot.workspaceSnapshot;
+  const initialSheetCfg = initialBootSnap?.sheetSettings ?? DEFAULT_GOOGLE_SHEET_SETTINGS;
 
-  const [tenders, setTenders] = useState<Tender[]>(
-    initialSecSnap ? initialSecSnap.tenders : SEED_TENDERS,
-  );
-  const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>(
-    initialSecSnap ? initialSecSnap.emdRecords : SEED_EMD_RECORDS,
-  );
-  const [mafTrackers, setMafTrackers] = useState<MafTrackerRecord[]>(
-    initialSecSnap ? initialSecSnap.mafTrackers : SEED_MAF_TRACKERS,
-  );
-  const [oemRecords, setOemRecords] = useState<OemRecord[]>(
-    initialSecSnap ? (initialSecSnap.oemRecords ?? []) : SEED_OEM_DETAILS,
-  );
+  const [tenders, setTenders] = useState<Tender[]>([]);
+  const [emdRecords, setEmdRecords] = useState<EmdBgRecord[]>([]);
+  const [mafTrackers, setMafTrackers] = useState<MafTrackerRecord[]>([]);
+  const [oemRecords, setOemRecords] = useState<OemRecord[]>([]);
   const [firmProfile, setFirmProfile] = useState<FirmProfile>(
-    initialSecSnap ? initialSecSnap.firmProfile : DEFAULT_FIRM_PROFILE,
+    initialBootSnap
+      ? initialBootSnap.firmProfile
+      : {
+          firmName: 'Corporate Tender Desk',
+          gstin: '',
+          udyamNumber: '',
+          adminName: 'Workspace Admin',
+          adminPhotoUrl: '',
+        },
   );
   const [adminPin, setAdminPin] = useState<string>(
-    initialSecSnap ? initialSecSnap.preferences.adminPin : '1234',
+    initialBootSnap ? initialBootSnap.preferences.adminPin : '',
   );
   const [darkMode, setDarkMode] = useState<boolean>(
-    initialSecSnap ? initialSecSnap.preferences.darkMode : false,
+    initialBootSnap ? initialBootSnap.preferences.darkMode : false,
   );
   const [emailSettings, setEmailSettings] = useState<EmailAlertSettings>(
-    initialSecSnap ? initialSecSnap.emailSettings : DEFAULT_EMAIL_ALERT_SETTINGS,
+    initialBootSnap ? initialBootSnap.emailSettings : DEFAULT_EMAIL_ALERT_SETTINGS,
   );
-  const [emailLogs, setEmailLogs] = useState<EmailAlertLog[]>(
-    initialSecSnap ? initialSecSnap.emailLogs : [],
-  );
+  const [emailLogs, setEmailLogs] = useState<EmailAlertLog[]>([]);
   const [emailGatewayInfo, setEmailGatewayInfo] = useState<{
     automatedConfigured: boolean;
     provider: string;
@@ -328,8 +325,8 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<CrmUserSession | null>(
     initialTabBoot.valid?.session ?? null,
   );
-  const [adminSessionToken, setAdminSessionToken] = useState(
-    initialTabBoot.valid?.adminSessionToken ?? '',
+  const [sessionToken, setSessionToken] = useState(
+    initialTabBoot.valid?.sessionToken ?? '',
   );
   const [sessionLoginAtMs, setSessionLoginAtMs] = useState<number | null>(
     initialTabBoot.valid?.loginAtMs ?? null,
@@ -427,7 +424,7 @@ export default function App() {
   const localWorkspaceClearedRef = useRef<boolean>(false);
   const adminOfflineSnapshotRef = useRef<SecondaryWorkspaceSnapshot | null>(null);
   const adminSupplementalRef = useRef<CloudWorkspaceDataset>(createEmptyCloudDataset());
-  const activeRoleRef = useRef<'admin' | 'secondary' | null>(
+  const activeRoleRef = useRef<CrmUserRole | null>(
     initialTabBoot.valid?.session.role ?? null,
   );
   const activeCrmUserIdRef = useRef<string | null>(
@@ -493,6 +490,7 @@ export default function App() {
     activeCloudTarget,
     byocConfig,
     currentUser,
+    sessionToken,
     workspaceTenantId,
   });
   useEffect(() => {
@@ -512,6 +510,7 @@ export default function App() {
       activeCloudTarget,
       byocConfig,
       currentUser,
+      sessionToken,
       workspaceTenantId,
     };
   }, [
@@ -530,6 +529,7 @@ export default function App() {
     activeCloudTarget,
     byocConfig,
     currentUser,
+    sessionToken,
     workspaceTenantId,
   ]);
 
@@ -560,17 +560,11 @@ export default function App() {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
-  // Notify backend once if a restored tab session already passed its 15-minute ceiling
+  // Expired tab sessions are already cleared by loadValidPerTabCrmSession on boot
   useEffect(() => {
-    if (!initialTabBoot.expiredSession) return;
-    void fetch('/api/auth/logout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId: initialTabBoot.expiredSession.userId,
-        identifier: initialTabBoot.expiredSession.username,
-      }),
-    }).catch(() => {});
+    if (initialTabBoot.expiredSession) {
+      clearInMemorySessionToken();
+    }
   }, [initialTabBoot.expiredSession]);
 
   // Persist active tab across page refreshes within the same tab without extending loginAtMs
@@ -897,36 +891,7 @@ export default function App() {
     }, 60);
   };
 
-  // Persist isolated secondary user workspace offline without affecting Admin or clearing localStorage
-  useEffect(() => {
-    if (!isAuthenticated || currentUser?.role !== 'secondary') return;
-    saveSecondaryWorkspaceSnapshot(currentUser.userId, {
-      firmProfile,
-      preferences: { adminPin, darkMode },
-      tenders,
-      emdRecords,
-      mafTrackers,
-      oemRecords,
-      emailSettings,
-      emailLogs,
-      sheetSettings,
-      updatedAt: new Date().toISOString(),
-    });
-  }, [
-    isAuthenticated,
-    currentUser?.userId,
-    currentUser?.role,
-    firmProfile,
-    adminPin,
-    darkMode,
-    tenders,
-    emdRecords,
-    mafTrackers,
-    oemRecords,
-    emailSettings,
-    emailLogs,
-    sheetSettings,
-  ]);
+  // Cloud persistence happens via Firestore & BYOC Cloud sync (no sensitive browser snapshot caches)
 
   // Initial Firestore load/seed + real-time Firestore subscription when authenticated
   useEffect(() => {
@@ -947,20 +912,9 @@ export default function App() {
     let unsubCloud: (() => void) | null = null;
 
     const initializeFirestoreSession = async () => {
-      // Secondary users MUST ONLY use BYOC (never central Admin Firebase project or Admin Google account)
+      // Secondary users MUST ONLY use BYOC (never central app Firebase project)
       if (currentUser.role === 'secondary') {
         if (!targetRef.isByoc || targetRef.projectId.toLowerCase() === firebaseConfig.projectId.toLowerCase()) {
-          return;
-        }
-        if ((activeCloudUser.email || '').trim().toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase()) {
-          await signOutByocGoogle(currentUser.userId).catch(() => {});
-          clearCloudSessionCache();
-          if (!cancelled) {
-            setCloudFeedback({
-              type: 'err',
-              msg: 'Admin Google account cannot be linked to a secondary user workspace. Please sign in with your own Google account.',
-            });
-          }
           return;
         }
       }
@@ -989,7 +943,7 @@ export default function App() {
             cloud.oemRecords.length === 0;
 
           if (cloudIsEmpty) {
-            if (currentUser.role === 'admin') {
+            if (isWorkspaceAdminRole(currentUser.role)) {
               // On an empty primary UID doc, check legacy Admin fallback once before seeding
               const adminWorkspace = await fetchAdminCloudWorkspaceWithFallback(activeCloudUser);
               if (cancelled) return null;
@@ -1233,7 +1187,7 @@ export default function App() {
         }
 
         // Non-blocking background Admin legacy fallback scan (throttled via delta manifest TTL)
-        const isAdminSession = currentUser.role === 'admin';
+        const isAdminSession = isWorkspaceAdminRole(currentUser.role);
         if (isAdminSession) {
           const scopeKey = buildDeltaSyncScopeKey({
             projectId: targetRef.projectId,
@@ -1688,7 +1642,7 @@ export default function App() {
     void runCloudTask(async (user, target) => {
       await ensureUserRootDocument(user, tenantId, userSession, target, { forceServerCheck: true });
       let cloud: CloudWorkspaceDataset;
-      if (userSession?.role === 'admin') {
+      if (isWorkspaceAdminRole(userSession?.role)) {
         const primary = await fetchAllFromCloud(user.uid, null, target, {
           includeAttachments: false,
           forceFull: true,
@@ -1762,39 +1716,36 @@ export default function App() {
     : null;
 
   const refreshSecondaryUsers = async () => {
-    if (stateRef.current.currentUser?.role !== 'admin') {
+    const activeUser = stateRef.current.currentUser;
+    if (!isWorkspaceAdminRole(activeUser?.role)) {
       setSecondaryUsers([]);
       return;
     }
 
-    const collected: SecondaryUserSummary[] = [...listSecondaryUsers()];
+    const collected: SecondaryUserSummary[] = [];
+    const activeToken = stateRef.current.sessionToken;
     const fbUser = stateRef.current.firebaseUser;
-    const isAdminGoogle =
-      Boolean(fbUser) &&
-      (fbUser?.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase();
-    const firebaseIdToken = isAdminGoogle && fbUser ? await fbUser.getIdToken().catch(() => '') : '';
 
-    if (adminSessionToken || firebaseIdToken) {
+    if (activeToken) {
       try {
-        const res = await fetch('/api/auth/secondary-users', {
-          headers: {
-            ...(adminSessionToken ? { 'x-crm-admin-token': adminSessionToken } : {}),
-            ...(firebaseIdToken ? { 'x-firebase-id-token': firebaseIdToken } : {}),
-          },
+        const res = await fetch('/api/company/team', {
+          headers: buildAuthorizedHeaders({}, activeToken),
         });
         const parsed = await safeReadJsonResponse<{
           ok?: boolean;
+          members?: SecondaryUserSummary[];
           users?: SecondaryUserSummary[];
         }>(res);
-        if (parsed.ok && Array.isArray(parsed.data?.users)) {
-          collected.push(...parsed.data.users);
+        const list = parsed.data?.members ?? parsed.data?.users;
+        if (parsed.ok && Array.isArray(list)) {
+          collected.push(...list.filter((u) => u.userId !== activeUser?.userId));
         }
       } catch {
-        // Non-fatal fallback to local + cloud lists
+        // Non-fatal fallback
       }
     }
 
-    if (isAdminGoogle && fbUser) {
+    if (fbUser) {
       try {
         const cloudUsers = await fetchSecondaryUsersFromCloud(fbUser);
         collected.push(...cloudUsers);
@@ -1807,16 +1758,16 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!isAuthenticated || currentUser?.role !== 'admin') {
+    if (!isAuthenticated || !isWorkspaceAdminRole(currentUser?.role)) {
       setSecondaryUsers([]);
       return;
     }
     void refreshSecondaryUsers();
-  }, [isAuthenticated, currentUser?.role, adminSessionToken, firebaseUser?.uid]);
+  }, [isAuthenticated, currentUser?.role, sessionToken, firebaseUser?.uid]);
 
-  // Live 25s presence refresh for Admin when inspecting Secondary Users directory
+  // Live 25s presence refresh for Workspace Admins inspecting Team / Secondary Users directory
   useEffect(() => {
-    if (!isAuthenticated || currentUser?.role !== 'admin' || activeTab !== 'settings') {
+    if (!isAuthenticated || !isWorkspaceAdminRole(currentUser?.role) || activeTab !== 'settings') {
       return;
     }
     void refreshSecondaryUsers();
@@ -1824,22 +1775,20 @@ export default function App() {
       void refreshSecondaryUsers();
     }, 25_000);
     return () => window.clearInterval(timer);
-  }, [isAuthenticated, currentUser?.role, activeTab, adminSessionToken, firebaseUser?.uid]);
+  }, [isAuthenticated, currentUser?.role, activeTab, sessionToken, firebaseUser?.uid]);
 
   const sendPresenceHeartbeat = async (explicitByocConfig?: ByocFirebaseConfig | null) => {
     const session = stateRef.current.currentUser;
-    if (!session) return;
+    const activeToken = stateRef.current.sessionToken;
+    if (!session || !activeToken) return;
     const effectiveCfg =
       explicitByocConfig !== undefined ? explicitByocConfig : stateRef.current.byocConfig;
     try {
       const res = await fetch('/api/auth/presence/heartbeat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }, activeToken),
         body: JSON.stringify({
           userId: session.userId,
-          identifier: session.username,
-          credentialToken: getStoredCredentialToken(session.username),
-          clientCredentialTokens: getAllStoredCredentialTokens(),
           byocProjectId: effectiveCfg?.projectId || session.byocProjectId || '',
           ...(effectiveCfg ? { byocConfig: effectiveCfg } : {}),
         }),
@@ -1851,13 +1800,15 @@ export default function App() {
         error?: string;
       }>(res);
       if (
-        session.role === 'secondary' &&
+        !isWorkspaceAdminRole(session.role) &&
         (res.status === 403 || parsed.data?.code === 'ACCOUNT_DISABLED' || parsed.data?.disabled)
       ) {
         handleLogout(
           parsed.data?.error ||
-            'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
+            'Your CRM ID has been disabled by your Company Administrator. Please contact the administrator to regain access.',
         );
+      } else if (res.status === 401) {
+        handleLogout('Your CRM session expired or was revoked. Please sign in again.');
       }
     } catch {
       // Non-fatal network hiccup; next 25s interval will retry
@@ -1878,7 +1829,10 @@ export default function App() {
         void deltaSchedulerRef.current.flush();
       }
       try {
+        const activeToken = stateRef.current.sessionToken;
+        if (!activeToken) return;
         const payload = JSON.stringify({
+          beaconToken: activeToken,
           userId: currentUser.userId,
           identifier: currentUser.username,
         });
@@ -1967,41 +1921,29 @@ export default function App() {
   };
 
   const handleToggleSecondaryUserStatus = async (targetUserId: string, enable: boolean) => {
-    if (stateRef.current.currentUser?.role !== 'admin') return;
+    if (!isWorkspaceAdminRole(stateRef.current.currentUser?.role)) return;
     const targetSummary = secondaryUsers.find(
       (u) => u.userId === targetUserId || (u.aliasUserIds ?? []).includes(targetUserId),
     );
     setTogglingSecondaryUserId(targetUserId);
     try {
       const fbUser = stateRef.current.firebaseUser;
-      const isAdminGoogle =
-        Boolean(fbUser) &&
-        (fbUser?.email || '').toLowerCase() === ADMIN_RECOVERY_EMAIL.toLowerCase();
-      const firebaseIdToken =
-        isAdminGoogle && fbUser ? await fbUser.getIdToken().catch(() => '') : '';
-
       const res = await fetch('/api/auth/secondary-users/status', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(adminSessionToken ? { 'x-crm-admin-token': adminSessionToken } : {}),
-          ...(firebaseIdToken ? { 'x-firebase-id-token': firebaseIdToken } : {}),
-        },
+        headers: buildAuthorizedHeaders(
+          { 'Content-Type': 'application/json' },
+          stateRef.current.sessionToken,
+        ),
         body: JSON.stringify({
           userId: targetUserId,
           username: targetSummary?.username,
           email: targetSummary?.email,
-          aliasUserIds: targetSummary?.aliasUserIds,
-          byocProjectId: targetSummary?.byocProjectId,
           isEnabled: enable,
-          ...(firebaseIdToken ? { firebaseIdToken } : {}),
-          clientCredentialTokens: getAllStoredCredentialTokens(),
         }),
       });
       const parsed = await safeReadJsonResponse<{
         ok?: boolean;
         user?: SecondaryUserSummary;
-        credentialToken?: string;
         message?: string;
         error?: string;
       }>(res);
@@ -2009,35 +1951,14 @@ export default function App() {
       if (!res.ok || !parsed.data?.ok) {
         showToast(
           'err',
-          parsed.data?.error || parsed.errorMessage || 'Could not update secondary user access.',
+          parsed.data?.error || parsed.errorMessage || 'Could not update team member access.',
         );
         return;
       }
 
       const nowIso = new Date().toISOString();
-      const updatedLocal = setSecondaryUserEnabled(targetUserId, enable, nowIso, {
-        username: targetSummary?.username,
-        email: targetSummary?.email,
-        aliasUserIds: targetSummary?.aliasUserIds,
-        byocProjectId: targetSummary?.byocProjectId,
-        createdAt: targetSummary?.createdAt,
-      });
-      if (parsed.data.credentialToken && (parsed.data.user || targetSummary)) {
-        const refUser = parsed.data.user || targetSummary!;
-        saveResetPasswordCredential(refUser.username, '', parsed.data.credentialToken, {
-          userId: refUser.userId,
-          email: refUser.email,
-          role: 'secondary',
-          isEnabled: enable,
-          disabledAt: enable ? undefined : nowIso,
-          presenceStatus: enable ? refUser.presenceStatus ?? 'not_active' : 'not_active',
-          byocProjectId: refUser.byocProjectId,
-        });
-      }
-
       const nextRecord: SecondaryUserSummary | null =
         parsed.data.user ||
-        updatedLocal ||
         (targetSummary
           ? {
               ...targetSummary,
@@ -2066,7 +1987,7 @@ export default function App() {
             ),
           ),
         );
-        if (isAdminGoogle && fbUser) {
+        if (fbUser) {
           void syncSecondaryUserToCloud(fbUser, nextRecord).catch(() => {
             // Non-fatal if central Firestore sync fails
           });
@@ -2081,7 +2002,7 @@ export default function App() {
             : `Disabled access for ${targetSummary?.username || targetUserId}.`),
       );
     } catch {
-      showToast('err', 'Network error while updating secondary user access.');
+      showToast('err', 'Network error while updating team member access.');
     } finally {
       setTogglingSecondaryUserId(null);
     }
@@ -2097,9 +2018,10 @@ export default function App() {
       activeCloudUser: curUser,
       activeCloudTarget: curTarget,
       currentUser: curSession,
+      sessionToken: activeToken,
       workspaceTenantId: tenantId,
     } = stateRef.current;
-    const activeTenantKey = curSession?.userId || ADMIN_USER_ID;
+    const activeTenantKey = curSession?.companyId || curSession?.userId || '';
     const slotKey =
       explicitSlotKey ||
       (slot === 'test' || slot === 'manual'
@@ -2135,7 +2057,7 @@ export default function App() {
     try {
       const res = await fetch('/api/notifications/email', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }, activeToken),
         body: JSON.stringify({
           tenantId: activeTenantKey,
           slotKey,
@@ -2208,12 +2130,15 @@ export default function App() {
 
   // Load initial server Email gateway capabilities & persisted logs on authentication
   useEffect(() => {
-    if (!isAuthenticated || !currentUser) return;
+    if (!isAuthenticated || !currentUser || !sessionToken) return;
     let cancelled = false;
     const loadEmailStatus = async () => {
       try {
         const res = await fetch(
-          `/api/notifications/email/status?tenantId=${encodeURIComponent(currentUser.userId || ADMIN_USER_ID)}`,
+          `/api/notifications/email/status?tenantId=${encodeURIComponent(currentUser.companyId || currentUser.userId)}`,
+          {
+            headers: buildAuthorizedHeaders({}, sessionToken),
+          },
         );
         const parsed = await safeReadJsonResponse<{
           provider?: string;
@@ -2237,7 +2162,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, currentUser?.userId]);
+  }, [isAuthenticated, currentUser?.userId, sessionToken]);
 
   // Twice-Daily Email Tender Alert Scheduler (11:00 AM IST & 4:00 PM IST for tenders due within 5 days)
   useEffect(() => {
@@ -2439,7 +2364,10 @@ export default function App() {
     try {
       const res = await fetch('/api/maf/extract-from-attachments', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthorizedHeaders(
+          { 'Content-Type': 'application/json' },
+          stateRef.current.sessionToken,
+        ),
         body: JSON.stringify({
           attachment1: {
             fileName: att1.fileName,
@@ -2558,7 +2486,10 @@ export default function App() {
     try {
       const res = await fetch('/api/sheet-sync', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthorizedHeaders(
+          { 'Content-Type': 'application/json' },
+          stateRef.current.sessionToken,
+        ),
         body: JSON.stringify({
           webhookUrl,
           payload,
@@ -3189,33 +3120,17 @@ export default function App() {
   const handleLoginSuccess = async (
     session: CrmUserSession,
     _rememberMe: boolean,
-    serverMeta?: { credentialToken?: string; adminSessionToken?: string },
+    serverMeta?: { sessionToken?: string },
   ) => {
     setDisabledNotice(null);
-    recordUserLoginActivity(session.username);
-
-    // Snapshot Admin offline workspace before switching to secondary workspace if needed
-    if (activeRoleRef.current === 'admin' || (!activeRoleRef.current && session.role === 'secondary')) {
-      adminOfflineSnapshotRef.current = {
-        firmProfile: stateRef.current.firmProfile,
-        preferences: {
-          adminPin: stateRef.current.adminPin,
-          darkMode: stateRef.current.darkMode,
-        },
-        tenders: stateRef.current.tenders,
-        emdRecords: stateRef.current.emdRecords,
-        mafTrackers: stateRef.current.mafTrackers,
-        oemRecords: stateRef.current.oemRecords,
-        emailSettings: stateRef.current.emailSettings,
-        emailLogs: stateRef.current.emailLogs,
-        sheetSettings: stateRef.current.sheetSettings,
-        updatedAt: new Date().toISOString(),
-      };
-    }
 
     const prevUserId = activeCrmUserIdRef.current;
     const isSwitchingCrmAccount = Boolean(prevUserId && prevUserId !== session.userId);
     const activeCentralFbUser = stateRef.current.firebaseUser;
+    const resolvedToken = (serverMeta?.sessionToken || '').trim();
+
+    setInMemorySessionToken(resolvedToken);
+    setSessionToken(resolvedToken);
 
     deltaSchedulerRef.current?.clear();
     failedDirtyRef.current = createEmptyDirtySnapshot();
@@ -3232,13 +3147,11 @@ export default function App() {
     setActiveTab('dashboard');
     setCloudFeedback(null);
 
-    // Always ensure secondary sessions do NOT hold central Admin Firebase auth
     if ((isSwitchingCrmAccount || session.role === 'secondary') && activeCentralFbUser) {
       await signOut(auth).catch(() => {});
     }
 
     if (session.role === 'secondary') {
-      // Dispose any prior secondary BYOC app instance before loading the new user
       if (isSwitchingCrmAccount && prevUserId) {
         await disposeByocContext(prevUserId).catch(() => {});
       }
@@ -3266,100 +3179,53 @@ export default function App() {
               message: 'Save your personal Firebase config to enable isolated BYOC cloud sync.',
             },
       );
-
-      const emptyOrSaved =
-        loadSecondaryWorkspaceSnapshot(session.userId) ?? buildEmptySecondaryWorkspace(session);
-
-      setFirmProfile(emptyOrSaved.firmProfile);
-      setAdminPin(emptyOrSaved.preferences.adminPin);
-      setDarkMode(emptyOrSaved.preferences.darkMode);
-      setTenders(emptyOrSaved.tenders);
-      setEmdRecords(emptyOrSaved.emdRecords);
-      setMafTrackers(emptyOrSaved.mafTrackers);
-      setOemRecords(emptyOrSaved.oemRecords ?? []);
-      setEmailSettings(emptyOrSaved.emailSettings);
-      setEmailLogs(emptyOrSaved.emailLogs);
-      setSheetSettings(emptyOrSaved.sheetSettings);
-      setSheetSyncStatus(
-        emptyOrSaved.sheetSettings.webhookUrl
-          ? emptyOrSaved.sheetSettings.lastSyncedAt
-            ? 'synced'
-            : 'idle'
-          : 'unconfigured',
-      );
-      setSheetSyncError(null);
-      stateRef.current = {
-        ...stateRef.current,
-        firmProfile: emptyOrSaved.firmProfile,
-        adminPin: emptyOrSaved.preferences.adminPin,
-        darkMode: emptyOrSaved.preferences.darkMode,
-        tenders: emptyOrSaved.tenders,
-        emdRecords: emptyOrSaved.emdRecords,
-        mafTrackers: emptyOrSaved.mafTrackers,
-        oemRecords: emptyOrSaved.oemRecords ?? [],
-        emailSettings: emptyOrSaved.emailSettings,
-        emailLogs: emptyOrSaved.emailLogs,
-        sheetSettings: emptyOrSaved.sheetSettings,
-        byocConfig: resolvedByocConfig,
-        activeCloudUser: null,
-        activeCloudTarget: null,
-        currentUser: session,
-        workspaceTenantId: session.userId,
-      };
-      setAdminSessionToken('');
     } else {
       await disposeByocContext().catch(() => {});
       setByocConfig(null);
       setByocContextState(null);
       setByocAuthUser(null);
       setByocAuthReady(true);
-
-      if (activeRoleRef.current === 'secondary' && adminOfflineSnapshotRef.current) {
-        const snap = adminOfflineSnapshotRef.current;
-        setFirmProfile(snap.firmProfile);
-        setAdminPin(snap.preferences.adminPin);
-        setDarkMode(snap.preferences.darkMode);
-        setTenders(snap.tenders);
-        setEmdRecords(snap.emdRecords);
-        setMafTrackers(snap.mafTrackers);
-        setOemRecords(snap.oemRecords ?? SEED_OEM_DETAILS);
-        setEmailSettings(snap.emailSettings);
-        setEmailLogs(snap.emailLogs);
-        setSheetSettings(snap.sheetSettings);
-        setSheetSyncStatus(
-          snap.sheetSettings.webhookUrl
-            ? snap.sheetSettings.lastSyncedAt
-              ? 'synced'
-              : 'idle'
-            : 'unconfigured',
-        );
-        setSheetSyncError(null);
-        stateRef.current = {
-          ...stateRef.current,
-          firmProfile: snap.firmProfile,
-          adminPin: snap.preferences.adminPin,
-          darkMode: snap.preferences.darkMode,
-          tenders: snap.tenders,
-          emdRecords: snap.emdRecords,
-          mafTrackers: snap.mafTrackers,
-          oemRecords: snap.oemRecords ?? SEED_OEM_DETAILS,
-          emailSettings: snap.emailSettings,
-          emailLogs: snap.emailLogs,
-          sheetSettings: snap.sheetSettings,
-          byocConfig: null,
-          currentUser: session,
-          workspaceTenantId: null,
-        };
-      }
-      setAdminSessionToken(serverMeta?.adminSessionToken || '');
     }
 
-    const resolvedAdminToken =
-      session.role === 'admin' ? serverMeta?.adminSessionToken || '' : '';
+    // Start cleanly without hardcoded mock seed data on real authenticated accounts;
+    // records load from Firestore / BYOC cloud or Backup Import.
+    const emptyWorkspace = buildEmptySecondaryWorkspace(session);
+    setFirmProfile(emptyWorkspace.firmProfile);
+    setAdminPin(emptyWorkspace.preferences.adminPin);
+    setDarkMode(emptyWorkspace.preferences.darkMode);
+    setTenders([]);
+    setEmdRecords([]);
+    setMafTrackers([]);
+    setOemRecords([]);
+    setEmailSettings(emptyWorkspace.emailSettings);
+    setEmailLogs([]);
+    setSheetSettings(emptyWorkspace.sheetSettings);
+    setSheetSyncStatus('unconfigured');
+    setSheetSyncError(null);
+    stateRef.current = {
+      ...stateRef.current,
+      firmProfile: emptyWorkspace.firmProfile,
+      adminPin: emptyWorkspace.preferences.adminPin,
+      darkMode: emptyWorkspace.preferences.darkMode,
+      tenders: [],
+      emdRecords: [],
+      mafTrackers: [],
+      oemRecords: [],
+      emailSettings: emptyWorkspace.emailSettings,
+      emailLogs: [],
+      sheetSettings: emptyWorkspace.sheetSettings,
+      byocConfig: session.role === 'secondary' ? loadByocConfig(session.userId) : null,
+      activeCloudUser: null,
+      activeCloudTarget: null,
+      currentUser: session,
+      sessionToken: resolvedToken,
+      workspaceTenantId: session.role === 'secondary' ? session.userId : null,
+    };
+
     const loginAtMs = Date.now();
     savePerTabCrmSession({
       session,
-      adminSessionToken: resolvedAdminToken,
+      sessionToken: resolvedToken,
       loginAtMs,
       activeTab: 'dashboard',
     });
@@ -3374,6 +3240,7 @@ export default function App() {
 
   const handleLogout = (forceDisabledMessage?: string) => {
     const exitingSession = stateRef.current.currentUser;
+    const exitingToken = stateRef.current.sessionToken;
     if (deltaSchedulerRef.current?.hasPending()) {
       void deltaSchedulerRef.current.flush();
     } else {
@@ -3382,15 +3249,19 @@ export default function App() {
     failedDirtyRef.current = createEmptyDirtySnapshot();
     backgroundAttachmentTaskSeqRef.current += 1;
     clearPerTabCrmSession();
+    clearInMemorySessionToken();
     if (exitingSession) {
-      void fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: exitingSession.userId,
-          identifier: exitingSession.username,
-        }),
-      }).catch(() => {});
+      if (exitingToken) {
+        void fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }, exitingToken),
+          body: JSON.stringify({
+            beaconToken: exitingToken,
+            userId: exitingSession.userId,
+            identifier: exitingSession.username,
+          }),
+        }).catch(() => {});
+      }
       if (exitingSession.role === 'secondary') {
         void disposeByocContext(exitingSession.userId).catch(() => {});
       }
@@ -3413,7 +3284,7 @@ export default function App() {
     setByocConfig(null);
     setByocContextState(null);
     setByocAuthUser(null);
-    setAdminSessionToken('');
+    setSessionToken('');
     setCloudFeedback(null);
     setIsAuthenticated(false);
     setMobileMenuOpen(false);
@@ -3500,7 +3371,7 @@ export default function App() {
   };
 
   const handleResetDemoData = () => {
-    if (stateRef.current.currentUser?.role !== 'admin') return;
+    if (!isWorkspaceAdminRole(stateRef.current.currentUser?.role)) return;
     localWorkspaceClearedRef.current = false;
     adminSupplementalRef.current = createEmptyCloudDataset();
     stateRef.current.firmProfile = DEFAULT_FIRM_PROFILE;

@@ -183,3 +183,24 @@ export async function compressProfilePhotoDataUrl(file: File): Promise<string> {
   }
   return compressed.dataUrl;
 }
+
+const SAFE_DATA_MIME_RE =
+  /^data:(application\/pdf|image\/(?:png|jpeg|jpg|webp|gif)|text\/(?:plain|csv)|application\/(?:vnd\.openxmlformats-officedocument\.[a-z0-9.-]+|vnd\.ms-excel|msword|octet-stream));base64,[a-zA-Z0-9+/=\s]+$/i;
+
+export function isSafeAttachmentHref(rawUrl?: string | null): boolean {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return false;
+  if (SAFE_DATA_MIME_RE.test(trimmed)) return true;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+export function sanitizeAttachmentHref(rawUrl?: string | null): string {
+  const trimmed = (rawUrl || '').trim();
+  return isSafeAttachmentHref(trimmed) ? trimmed : '#blocked-unsafe-url';
+}
+

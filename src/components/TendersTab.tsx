@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Download, FileText, Plus, Search } from 'lucide-react';
 import type { EmdBgRecord, Tender, TenderStage } from '../types/crm';
+import { isSafeAttachmentHref } from '../utils/attachments';
 import {
   buildCsvContent,
   downloadTextFile,
@@ -452,22 +453,35 @@ export function TendersTab({
                   Attached Documents ({previewTender.attachments.length})
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {previewTender.attachments.map((att) => (
-                    <a
-                      key={att.id}
-                      href={att.dataUrl}
-                      download={att.fileName}
-                      className="flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
-                    >
-                      <FileText className="h-3.5 w-3.5 text-[#1E3A8A] dark:text-blue-400 shrink-0" />
-                      <div className="min-w-0">
-                        <p className="font-medium truncate">{att.fileName}</p>
-                        <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                          {att.slotLabel}
-                        </p>
+                  {previewTender.attachments.map((att) =>
+                    isSafeAttachmentHref(att.dataUrl) ? (
+                      <a
+                        key={att.id}
+                        href={att.dataUrl}
+                        download={att.fileName}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
+                      >
+                        <FileText className="h-3.5 w-3.5 text-[#1E3A8A] dark:text-blue-400 shrink-0" />
+                        <div className="min-w-0">
+                          <p className="font-medium truncate">{att.fileName}</p>
+                          <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                            {att.slotLabel}
+                          </p>
+                        </div>
+                      </a>
+                    ) : (
+                      <div
+                        key={att.id}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg border border-rose-200 dark:border-rose-900/50 bg-rose-50 dark:bg-rose-950/30 text-xs text-rose-700 dark:text-rose-300"
+                      >
+                        <FileText className="h-3.5 w-3.5 shrink-0" />
+                        <div className="min-w-0">
+                          <p className="font-medium truncate">{att.fileName}</p>
+                          <p className="text-[10px]">Unsafe attachment blocked</p>
+                        </div>
                       </div>
-                    </a>
-                  ))}
+                    ),
+                  )}
                 </div>
               </div>
             )}

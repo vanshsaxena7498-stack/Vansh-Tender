@@ -47,7 +47,7 @@ const SAMPLE_TENDER: Tender = {
 };
 
 test('isValidNotificationEmail validates email addresses cleanly', () => {
-  assert.equal(isValidNotificationEmail('vanshsaxena7498@gmail.com'), true);
+  assert.equal(isValidNotificationEmail('alerts@acmeinfra.example'), true);
   assert.equal(isValidNotificationEmail('invalid-email'), false);
 });
 

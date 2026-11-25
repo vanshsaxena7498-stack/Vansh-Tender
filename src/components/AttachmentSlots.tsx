@@ -3,6 +3,7 @@ import { Download, FileText, Paperclip, Plus, Trash2, Upload } from 'lucide-reac
 import type { AttachmentItem } from '../types/crm';
 import {
   formatFileSize,
+  isSafeAttachmentHref,
   readAttachmentForFirestore,
   type AttachmentSlotState,
 } from '../utils/attachments';
@@ -157,15 +158,21 @@ export function AttachmentSlots({ title, slots, onChange }: AttachmentSlotsProps
                 {file && (
                   <>
                     {file.dataUrl ? (
-                      <a
-                        href={file.dataUrl}
-                        download={file.fileName}
-                        aria-label={`Download ${file.fileName}`}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
-                      >
-                        <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                        <span>Download</span>
-                      </a>
+                      isSafeAttachmentHref(file.dataUrl) ? (
+                        <a
+                          href={file.dataUrl}
+                          download={file.fileName}
+                          aria-label={`Download ${file.fileName}`}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                        >
+                          <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>Download</span>
+                        </a>
+                      ) : (
+                        <span className="text-[11px] text-rose-600 dark:text-rose-400 px-2">
+                          Unsafe attachment blocked
+                        </span>
+                      )
                     ) : (
                       <span className="text-[11px] text-slate-400 px-2">Syncing file…</span>
                     )}

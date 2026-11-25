@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import type { CrmUserSession, FirmProfile, TabKey } from '../types/crm';
+import { isWorkspaceAdminRole, normalizeCrmRole, ROLE_LABELS } from '../utils/authCredentials';
 
 interface SidebarProps {
   activeTab: TabKey;
@@ -123,7 +124,7 @@ export function Sidebar({
               <span className="flex items-center gap-2.5 min-w-0">
                 <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
                 <span className="truncate">
-                  {item.key === 'settings' && currentUser?.role === 'secondary'
+                  {item.key === 'settings' && !isWorkspaceAdminRole(currentUser?.role)
                     ? 'Workspace Settings'
                     : item.label}
                 </span>
@@ -144,14 +145,14 @@ export function Sidebar({
 
       <div className="px-4 py-4 border-t border-slate-800 text-xs text-slate-400 space-y-2.5">
         <div className="space-y-1">
-          <p className="font-medium text-slate-200 truncate" title={firmProfile.firmName}>
-            {firmProfile.firmName}
+          <p className="font-medium text-slate-200 truncate" title={currentUser?.companyName || firmProfile.firmName}>
+            {currentUser?.companyName || firmProfile.firmName}
           </p>
           <p className="font-mono-num text-slate-400 truncate">
             GSTIN: {firmProfile.gstin || 'Not Set'}
           </p>
           <p className="text-slate-500 truncate">
-            {currentUser?.role === 'secondary' ? 'Secondary User' : 'Primary Admin'}:{' '}
+            {ROLE_LABELS[normalizeCrmRole(currentUser?.role)]}:{' '}
             {firmProfile.adminName || currentUser?.username || 'Tender Desk'}
           </p>
         </div>

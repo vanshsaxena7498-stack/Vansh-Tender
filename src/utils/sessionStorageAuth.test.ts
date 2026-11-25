@@ -35,18 +35,22 @@ function createMemoryStorage(): Storage {
   };
 }
 
-const ADMIN_SESSION: CrmUserSession = {
-  userId: 'admin_vanshsales',
-  username: 'VanshSales',
-  email: 'vanshsaxena7498@gmail.com',
-  role: 'admin',
+const OWNER_SESSION: CrmUserSession = {
+  userId: 'own_aarav',
+  username: 'AaravAdmin',
+  email: 'aarav@acmeinfra.example',
+  role: 'owner',
+  companyId: 'cmp_acme',
+  companyName: 'Acme Infra Pvt Ltd',
 };
 
-const SECONDARY_SESSION: CrmUserSession = {
-  userId: 'sec_niyan',
-  username: 'Niyan',
-  email: 'info.niyantrana@gmail.com',
-  role: 'secondary',
+const MEMBER_SESSION: CrmUserSession = {
+  userId: 'usr_priya',
+  username: 'PriyaOps',
+  email: 'priya@acmeinfra.example',
+  role: 'executive',
+  companyId: 'cmp_acme',
+  companyName: 'Acme Infra Pvt Ltd',
 };
 
 test('savePerTabCrmSession & loadValidPerTabCrmSession survive reload within 15 minutes', () => {
@@ -55,8 +59,8 @@ test('savePerTabCrmSession & loadValidPerTabCrmSession survive reload within 15 
 
   savePerTabCrmSession(
     {
-      session: ADMIN_SESSION,
-      adminSessionToken: 'hmac-token-123',
+      session: OWNER_SESSION,
+      sessionToken: 'hmac-token-123',
       loginAtMs: t0,
       activeTab: 'dashboard',
     },
@@ -67,8 +71,8 @@ test('savePerTabCrmSession & loadValidPerTabCrmSession survive reload within 15 
   const loaded0 = loadValidPerTabCrmSession(t0 + 10_000, tabStorage);
   assert.equal(loaded0.status, 'valid');
   if (loaded0.status === 'valid') {
-    assert.equal(loaded0.data.session.username, 'VanshSales');
-    assert.equal(loaded0.data.adminSessionToken, 'hmac-token-123');
+    assert.equal(loaded0.data.session.username, 'AaravAdmin');
+    assert.equal(loaded0.data.sessionToken, 'hmac-token-123');
     assert.equal(loaded0.data.loginAtMs, t0);
     assert.equal(loaded0.data.activeTab, 'dashboard');
   }
@@ -85,7 +89,8 @@ test('loadValidPerTabCrmSession expires and clears storage when elapsed > 15 min
 
   savePerTabCrmSession(
     {
-      session: SECONDARY_SESSION,
+      session: MEMBER_SESSION,
+      sessionToken: 'tok-member',
       loginAtMs: t0,
       activeTab: 'tenders',
     },
@@ -95,7 +100,7 @@ test('loadValidPerTabCrmSession expires and clears storage when elapsed > 15 min
   const expired = loadValidPerTabCrmSession(t0 + CRM_SESSION_MAX_AGE_MS + 1, tabStorage);
   assert.equal(expired.status, 'expired');
   if (expired.status === 'expired') {
-    assert.equal(expired.expiredSession.userId, 'sec_niyan');
+    assert.equal(expired.expiredSession.userId, 'usr_priya');
     assert.equal(expired.loginAtMs, t0);
   }
 
@@ -110,8 +115,8 @@ test('updatePerTabActiveTab persists active tab across reload without extending 
 
   savePerTabCrmSession(
     {
-      session: ADMIN_SESSION,
-      adminSessionToken: 'tok-1',
+      session: OWNER_SESSION,
+      sessionToken: 'tok-1',
       loginAtMs: t0,
       activeTab: 'dashboard',
     },
@@ -124,6 +129,7 @@ test('updatePerTabActiveTab persists active tab across reload without extending 
   if (loaded.status === 'valid') {
     assert.equal(loaded.data.activeTab, 'bidra');
     assert.equal(loaded.data.loginAtMs, t0);
+    assert.equal(loaded.data.sessionToken, 'tok-1');
   }
 
   // Corrupt tab value falls back safely to dashboard
@@ -142,7 +148,7 @@ test('isolated new tab has empty sessionStorage and clearPerTabCrmSession + corr
   const tab2Storage = createMemoryStorage(); // simulates closing tab 1 and opening tab 2
   const t0 = 1_700_000_000_000;
 
-  savePerTabCrmSession({ session: ADMIN_SESSION, loginAtMs: t0 }, tab1Storage);
+  savePerTabCrmSession({ session: OWNER_SESSION, loginAtMs: t0 }, tab1Storage);
   assert.equal(loadValidPerTabCrmSession(t0 + 5_000, tab2Storage).status, 'none');
 
   clearPerTabCrmSession(tab1Storage);

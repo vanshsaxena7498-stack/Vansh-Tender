@@ -44,8 +44,8 @@ export function recordEmailDispatchFailure(
 
 export const DEFAULT_EMAIL_ALERT_SETTINGS: EmailAlertSettings = {
   enabled: true,
-  recipientName: 'Vansh',
-  recipientEmail: 'vanshsaxena7498@gmail.com',
+  recipientName: '',
+  recipientEmail: '',
 };
 
 export interface PendingEmailDispatch {
@@ -131,14 +131,14 @@ export function formatSlotLabel(slot: EmailReminderSlot | 'manual' | 'test'): st
 export function buildTenderEmailMessage(
   tender: Tender,
   slot: EmailReminderSlot | 'manual' | 'test',
-  recipientName: string = DEFAULT_EMAIL_ALERT_SETTINGS.recipientName,
+  recipientName: string = 'Tender Desk Team',
   now: Date = new Date(),
 ): {
   subject: string;
   text: string;
   html: string;
 } {
-  const safeRecipient = recipientName.trim() || DEFAULT_EMAIL_ALERT_SETTINGS.recipientName;
+  const safeRecipient = recipientName.trim() || 'Tender Desk Team';
   const hoursLeft = getHoursRemaining(tender.submissionDueDate, now);
   const countdown = formatEmailCountdown(hoursLeft);
   const dueDisplay = formatDateTime(tender.submissionDueDate);

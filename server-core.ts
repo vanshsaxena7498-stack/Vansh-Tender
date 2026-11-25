@@ -1,7 +1,4 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import express, { type NextFunction, type Request, type Response, type Router } from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import nodemailer from 'nodemailer';
@@ -26,128 +23,50 @@ import {
   withTimeout,
 } from './src/utils/geminiRetry.ts';
 import { parsePlainTextSpecItems } from './src/utils/mafAutoGenerate.ts';
+import {
+  authenticateSessionToken,
+  bootstrapEnvAdminIfConfigured,
+  computeServerPresenceStatus,
+  currentMonthKey,
+  extractBearerTokenFromRequest,
+  hashOtpSecret,
+  hashPasswordBcrypt,
+  hasServerPermission,
+  IS_VERCEL,
+  isValidAppsScriptUrl,
+  isWorkspaceAdminRole,
+  loadServerState,
+  normalizeServerRole,
+  PLAN_QUOTAS,
+  safeFetchAppsScript,
+  sanitizeServerUserForClient,
+  saveServerState,
+  signSessionToken,
+  signSignedToken,
+  slugifyCompanyId,
+  slugifyUserId,
+  verifyFirebaseIdToken,
+  verifyOtpSecret,
+  verifySignedToken,
+  verifyUserPassword,
+  type CompanyInviteRecord,
+  type CompanyPlanTier,
+  type CompanyServerRecord,
+  type CrmServerUserRecord,
+  type PendingOtpRecord,
+  type ServerEmailAlertLogEntry,
+  type ServerPermission,
+  type SessionTokenPayload,
+  type TeamRole,
+} from './server-auth.ts';
 
-const ADMIN_USER_ID = 'admin_vanshsales';
-const ADMIN_USERNAME = 'VanshSales';
-const DEFAULT_ADMIN_PASSWORD = process.env.CRM_INITIAL_PASSWORD || 'Vansh@2027';
-const RECOVERY_EMAIL = 'vanshsaxena7498@gmail.com';
-const DEFAULT_EMAIL_RECIPIENT_NAME = 'Vansh';
-
-const IS_VERCEL = Boolean(process.env.VERCEL);
-const DATA_DIR = IS_VERCEL
-  ? path.join(os.tmpdir(), 'vansh-crm-data')
-  : path.resolve(process.cwd(), '.data');
-const STATE_FILE = path.join(DATA_DIR, 'crm-server-state.json');
-
-type CrmUserRole = 'admin' | 'secondary';
-
-interface PasswordRecord {
-  salt: string;
-  hash: string;
-  updatedAt: string;
-}
-
-const SERVER_PRESENCE_TTL_MS = 90_000;
-
-interface CrmServerUserRecord {
-  userId: string;
-  username: string;
-  email: string;
-  role: CrmUserRole;
-  salt: string;
-  hash: string;
-  createdAt: string;
-  updatedAt: string;
-  lastLoginAt?: string;
-  isActive: boolean;
-  isEnabled?: boolean;
-  disabledAt?: string;
-  presenceStatus?: 'active' | 'not_active';
-  lastHeartbeatAt?: string;
-  lastLogoutAt?: string;
-  byocProjectId?: string;
-  byocConfig?: Record<string, unknown> | null;
-}
-
-interface PendingOtpRecord {
-  purpose?: 'signup' | 'reset';
-  userId?: string;
-  username?: string;
-  email?: string;
-  salt: string;
-  otpHash: string;
-  expiresAt: number;
-  attempts: number;
-  requestedAt: string;
-}
-
-export interface ServerEmailAlertLogEntry {
-  id: string;
-  tenantId?: string;
-  slotKey: string;
-  tenderRefId: string;
-  tenderId: string;
-  slot: 'slot_11am' | 'slot_4pm' | 'manual' | 'test';
-  recipientName: string;
-  recipientEmail: string;
-  dueDateIso: string;
-  status: 'sent' | 'failed';
-  provider: string;
-  subject: string;
-  message: string;
-  errorDetail?: string;
-  createdAt: string;
-}
-
-interface PersistedServerState {
-  passwordRecord: PasswordRecord;
-  pendingOtp: PendingOtpRecord | null;
-  users: Record<string, CrmServerUserRecord>;
-  pendingOtps: Record<string, PendingOtpRecord>;
-  emailLogs: ServerEmailAlertLogEntry[];
-}
-
-function getHmacSecret(): string {
-  return (
-    process.env.CRM_TOKEN_SECRET ||
-    process.env.SMTP_PASS ||
-    process.env.RESEND_API_KEY ||
-    'vansh-tender-software-otp-hmac-v1'
-  );
-}
-
-function signSignedToken<T extends object>(payload: T): string {
-  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const sig = crypto.createHmac('sha256', getHmacSecret()).update(encoded).digest('base64url');
-  return `${encoded}.${sig}`;
-}
-
-function verifySignedToken<T>(token: string): T | null {
-  const parts = token.split('.');
-  if (parts.length !== 2) return null;
-  const [encoded, providedSig] = parts;
-  if (!encoded || !providedSig) return null;
-  const expectedSig = crypto
-    .createHmac('sha256', getHmacSecret())
-    .update(encoded)
-    .digest('base64url');
-  const providedBuf = Buffer.from(providedSig);
-  const expectedBuf = Buffer.from(expectedSig);
-  if (providedBuf.length !== expectedBuf.length) return null;
-  if (!crypto.timingSafeEqual(providedBuf, expectedBuf)) return null;
-  try {
-    return JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as T;
-  } catch {
-    return null;
-  }
-}
+export type { ServerEmailAlertLogEntry };
 
 interface ResetOtpTokenPayload {
   kind?: string;
-  userId?: string;
-  username?: string;
-  email?: string;
-  salt: string;
+  userId: string;
+  username: string;
+  email: string;
   otpHash: string;
   expiresAt: number;
 }
@@ -160,17 +79,18 @@ function verifyOtpToken(token: string): ResetOtpTokenPayload | null {
   const parsed = verifySignedToken<Partial<ResetOtpTokenPayload>>(token);
   if (
     parsed &&
-    (!parsed.kind || parsed.kind === 'reset_otp') &&
-    typeof parsed.salt === 'string' &&
+    parsed.kind === 'reset_otp' &&
+    typeof parsed.userId === 'string' &&
+    typeof parsed.username === 'string' &&
+    typeof parsed.email === 'string' &&
     typeof parsed.otpHash === 'string' &&
     typeof parsed.expiresAt === 'number'
   ) {
     return {
-      kind: parsed.kind || 'reset_otp',
-      userId: typeof parsed.userId === 'string' ? parsed.userId : ADMIN_USER_ID,
-      username: typeof parsed.username === 'string' ? parsed.username : ADMIN_USERNAME,
-      email: typeof parsed.email === 'string' ? parsed.email : RECOVERY_EMAIL,
-      salt: parsed.salt,
+      kind: 'reset_otp',
+      userId: parsed.userId,
+      username: parsed.username,
+      email: parsed.email,
       otpHash: parsed.otpHash,
       expiresAt: parsed.expiresAt,
     };
@@ -180,7 +100,6 @@ function verifyOtpToken(token: string): ResetOtpTokenPayload | null {
 
 function signSignupOtpToken(payload: {
   email: string;
-  salt: string;
   otpHash: string;
   expiresAt: number;
 }): string {
@@ -189,14 +108,12 @@ function signSignupOtpToken(payload: {
 
 function verifySignupOtpToken(token: string): {
   email: string;
-  salt: string;
   otpHash: string;
   expiresAt: number;
 } | null {
   const parsed = verifySignedToken<{
     kind?: string;
     email?: string;
-    salt?: string;
     otpHash?: string;
     expiresAt?: number;
   }>(token);
@@ -204,13 +121,11 @@ function verifySignupOtpToken(token: string): {
     parsed &&
     parsed.kind === 'signup_otp' &&
     typeof parsed.email === 'string' &&
-    typeof parsed.salt === 'string' &&
     typeof parsed.otpHash === 'string' &&
     typeof parsed.expiresAt === 'number'
   ) {
     return {
       email: parsed.email.toLowerCase(),
-      salt: parsed.salt,
       otpHash: parsed.otpHash,
       expiresAt: parsed.expiresAt,
     };
@@ -266,201 +181,19 @@ function verifyVerifiedResetToken(token: string): {
   if (
     parsed &&
     parsed.kind === 'otp_verified' &&
+    typeof parsed.userId === 'string' &&
+    typeof parsed.username === 'string' &&
+    typeof parsed.email === 'string' &&
     typeof parsed.expiresAt === 'number'
   ) {
     return {
-      userId: typeof parsed.userId === 'string' ? parsed.userId : ADMIN_USER_ID,
-      username: typeof parsed.username === 'string' ? parsed.username : ADMIN_USERNAME,
-      email: typeof parsed.email === 'string' ? parsed.email : RECOVERY_EMAIL,
+      userId: parsed.userId,
+      username: parsed.username,
+      email: parsed.email,
       expiresAt: parsed.expiresAt,
     };
   }
   return null;
-}
-
-function signUserCredentialToken(record: CrmServerUserRecord): string {
-  const isEnabled =
-    record.isEnabled !== undefined ? record.isEnabled !== false : record.isActive !== false;
-  return signSignedToken({
-    kind: 'crm_user_cred',
-    userId: record.userId,
-    username: record.username,
-    email: record.email,
-    role: record.role,
-    salt: record.salt,
-    hash: record.hash,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-    isActive: record.isActive,
-    isEnabled,
-    byocProjectId: record.byocProjectId,
-  });
-}
-
-function verifyUserCredentialToken(token: string): CrmServerUserRecord | null {
-  const parsed = verifySignedToken<Record<string, unknown>>(token);
-  if (!parsed) return null;
-  if (
-    parsed.kind === 'crm_user_cred' &&
-    typeof parsed.userId === 'string' &&
-    typeof parsed.username === 'string' &&
-    typeof parsed.email === 'string' &&
-    typeof parsed.salt === 'string' &&
-    typeof parsed.hash === 'string' &&
-    typeof parsed.updatedAt === 'string'
-  ) {
-    const isEnabled =
-      typeof parsed.isEnabled === 'boolean' ? parsed.isEnabled : parsed.isActive !== false;
-    return {
-      userId: parsed.userId,
-      username: parsed.username,
-      email: parsed.email.toLowerCase(),
-      role: parsed.role === 'admin' || parsed.userId === ADMIN_USER_ID ? 'admin' : 'secondary',
-      salt: parsed.salt,
-      hash: parsed.hash,
-      createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : parsed.updatedAt,
-      updatedAt: parsed.updatedAt,
-      isActive: isEnabled,
-      isEnabled,
-      byocProjectId: typeof parsed.byocProjectId === 'string' ? parsed.byocProjectId : undefined,
-    };
-  }
-  if (
-    parsed.kind === 'crm_pwd' &&
-    parsed.username === ADMIN_USERNAME &&
-    typeof parsed.salt === 'string' &&
-    typeof parsed.hash === 'string' &&
-    typeof parsed.updatedAt === 'string'
-  ) {
-    return {
-      userId: ADMIN_USER_ID,
-      username: ADMIN_USERNAME,
-      email: RECOVERY_EMAIL,
-      role: 'admin',
-      salt: parsed.salt,
-      hash: parsed.hash,
-      createdAt: '2026-01-01T00:00:00.000Z',
-      updatedAt: parsed.updatedAt,
-      isActive: true,
-    };
-  }
-  return null;
-}
-
-function signAdminSessionToken(adminUser: CrmServerUserRecord): string {
-  return signSignedToken({
-    kind: 'admin_session',
-    userId: adminUser.userId,
-    username: adminUser.username,
-    email: adminUser.email,
-    role: 'admin',
-    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  });
-}
-
-function verifyAdminSessionToken(token: string): boolean {
-  const parsed = verifySignedToken<{
-    kind?: string;
-    role?: string;
-    userId?: string;
-    expiresAt?: number;
-  }>(token);
-  return Boolean(
-    parsed &&
-      parsed.kind === 'admin_session' &&
-      parsed.role === 'admin' &&
-      parsed.userId === ADMIN_USER_ID &&
-      typeof parsed.expiresAt === 'number' &&
-      Date.now() < parsed.expiresAt,
-  );
-}
-
-function readCookieValue(cookieHeader: string | undefined, name: string): string {
-  if (!cookieHeader) return '';
-  for (const part of cookieHeader.split(';')) {
-    const idx = part.indexOf('=');
-    if (idx <= 0) continue;
-    const key = part.slice(0, idx).trim();
-    if (key === name) {
-      return decodeURIComponent(part.slice(idx + 1).trim());
-    }
-  }
-  return '';
-}
-
-function computeServerPresenceStatus(
-  user: CrmServerUserRecord,
-  nowMs = Date.now(),
-): 'active' | 'not_active' {
-  const enabled =
-    user.isEnabled !== undefined ? user.isEnabled !== false : user.isActive !== false;
-  if (!enabled) return 'not_active';
-  if (user.presenceStatus !== 'active') return 'not_active';
-  if (!user.lastHeartbeatAt) return 'not_active';
-  const hbMs = Date.parse(user.lastHeartbeatAt);
-  if (Number.isNaN(hbMs)) return 'not_active';
-  return nowMs - hbMs <= SERVER_PRESENCE_TTL_MS ? 'active' : 'not_active';
-}
-
-function sanitizeServerUserForClient(
-  user: CrmServerUserRecord,
-  aliasUserIds?: string[],
-) {
-  const isEnabled =
-    user.isEnabled !== undefined ? user.isEnabled !== false : user.isActive !== false;
-  const presenceStatus = computeServerPresenceStatus(user);
-  return {
-    userId: user.userId,
-    username: user.username,
-    email: user.email,
-    role: user.role,
-    createdAt: user.createdAt,
-    lastLoginAt: user.lastLoginAt,
-    isActive: isEnabled && presenceStatus === 'active',
-    isEnabled,
-    disabledAt: user.disabledAt,
-    presenceStatus,
-    lastHeartbeatAt: user.lastHeartbeatAt,
-    lastLogoutAt: user.lastLogoutAt,
-    byocProjectId: user.byocProjectId,
-    byocConfig: user.byocConfig ?? null,
-    ...(aliasUserIds && aliasUserIds.length > 0 ? { aliasUserIds } : {}),
-  };
-}
-
-function deduplicateServerSecondaryUsers(users: CrmServerUserRecord[]) {
-  const byEmail = new Map<
-    string,
-    { canonical: CrmServerUserRecord; aliases: Set<string> }
-  >();
-  const recencyScore = (u: CrmServerUserRecord) =>
-    [u.disabledAt, u.lastHeartbeatAt, u.lastLoginAt, u.lastLogoutAt, u.updatedAt, u.createdAt]
-      .filter((v): v is string => typeof v === 'string' && v.length > 0)
-      .sort()
-      .pop() || '';
-
-  for (const user of users) {
-    if (user.role !== 'secondary') continue;
-    const normEmail = (user.email || '').trim().toLowerCase();
-    const key = normEmail || user.userId.toLowerCase();
-    const existing = byEmail.get(key);
-    if (!existing) {
-      byEmail.set(key, { canonical: user, aliases: new Set([user.userId]) });
-      continue;
-    }
-    existing.aliases.add(user.userId);
-    if (recencyScore(user) >= recencyScore(existing.canonical)) {
-      existing.canonical = user;
-    }
-  }
-
-  return Array.from(byEmail.values())
-    .sort((a, b) =>
-      (b.canonical.createdAt || '').localeCompare(a.canonical.createdAt || ''),
-    )
-    .map(({ canonical, aliases }) =>
-      sanitizeServerUserForClient(canonical, Array.from(aliases)),
-    );
 }
 
 function maskEmailAddress(email: string): string {
@@ -472,119 +205,6 @@ function maskEmailAddress(email: string): string {
   const visibleStart = local.slice(0, Math.min(2, local.length));
   const visibleEnd = local.length > 3 ? local.slice(-1) : '';
   return `${visibleStart}***${visibleEnd}@${domain}`;
-}
-
-function hashSecret(secret: string, salt?: string): { salt: string; hash: string } {
-  const actualSalt = salt || crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(secret, actualSalt, 64).toString('hex');
-  return { salt: actualSalt, hash: derived };
-}
-
-function verifyHashedSecret(secret: string, salt: string, expectedHash: string): boolean {
-  const derived = crypto.scryptSync(secret, salt, 64);
-  const expectedBuf = Buffer.from(expectedHash, 'hex');
-  if (derived.length !== expectedBuf.length) return false;
-  return crypto.timingSafeEqual(derived, expectedBuf);
-}
-
-function createInitialState(): PersistedServerState {
-  const { salt, hash } = hashSecret(DEFAULT_ADMIN_PASSWORD);
-  const adminUpdatedAt = '1970-01-01T00:00:00.000Z';
-  const adminUser: CrmServerUserRecord = {
-    userId: ADMIN_USER_ID,
-    username: ADMIN_USERNAME,
-    email: RECOVERY_EMAIL,
-    role: 'admin',
-    salt,
-    hash,
-    createdAt: '2026-01-01T00:00:00.000Z',
-    updatedAt: adminUpdatedAt,
-    isActive: true,
-  };
-  return {
-    passwordRecord: {
-      salt,
-      hash,
-      updatedAt: adminUpdatedAt,
-    },
-    pendingOtp: null,
-    users: {
-      [ADMIN_USER_ID]: adminUser,
-    },
-    pendingOtps: {},
-    emailLogs: [],
-  };
-}
-
-function loadServerState(): PersistedServerState {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, 'utf8');
-      const parsed = JSON.parse(raw) as Partial<PersistedServerState>;
-      if (parsed.passwordRecord?.salt && parsed.passwordRecord?.hash) {
-        const users: Record<string, CrmServerUserRecord> =
-          parsed.users && typeof parsed.users === 'object' ? { ...parsed.users } : {};
-        if (!users[ADMIN_USER_ID]) {
-          users[ADMIN_USER_ID] = {
-            userId: ADMIN_USER_ID,
-            username: ADMIN_USERNAME,
-            email: RECOVERY_EMAIL,
-            role: 'admin',
-            salt: parsed.passwordRecord.salt,
-            hash: parsed.passwordRecord.hash,
-            createdAt: '2026-01-01T00:00:00.000Z',
-            updatedAt: parsed.passwordRecord.updatedAt,
-            isActive: true,
-          };
-        }
-        return {
-          passwordRecord: parsed.passwordRecord,
-          pendingOtp: parsed.pendingOtp ?? null,
-          users,
-          pendingOtps:
-            parsed.pendingOtps && typeof parsed.pendingOtps === 'object' ? parsed.pendingOtps : {},
-          emailLogs: Array.isArray(parsed.emailLogs) ? parsed.emailLogs.slice(0, 200) : [],
-        };
-      }
-    }
-  } catch {
-    // Reinitialize state cleanly if corrupted
-  }
-  const initial = createInitialState();
-  saveServerState(initial);
-  return initial;
-}
-
-function saveServerState(state: PersistedServerState): void {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Failed to persist server auth state:', err);
-  }
-}
-
-function readFirebaseApiKey(): string {
-  if (process.env.VITE_FIREBASE_API_KEY) {
-    return process.env.VITE_FIREBASE_API_KEY;
-  }
-  const candidatePaths = [
-    path.resolve(process.cwd(), 'firebase-applet-config.json'),
-    path.resolve(process.cwd(), '..', 'firebase-applet-config.json'),
-  ];
-  for (const configPath of candidatePaths) {
-    try {
-      if (fs.existsSync(configPath)) {
-        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { apiKey?: string };
-        if (parsed.apiKey) return parsed.apiKey;
-      }
-    } catch {
-      // Try next path
-    }
-  }
-  return '';
 }
 
 function isValidEmailAddress(raw: string): boolean {
@@ -712,11 +332,11 @@ async function sendSignupOtpEmail(
   provider: 'resend' | 'smtp' | 'none';
   error?: string;
 }> {
-  const subject = 'Vansh Tender Software — New User Gmail Verification Code';
+  const subject = 'Vansh Tender Software — Email Verification Code';
   const textBody = [
     'Hello,',
     '',
-    'Use the 6-digit verification code below to verify your Gmail and create your CRM account:',
+    'Use the 6-digit verification code below to verify your email and create your CRM workspace account:',
     '',
     `Verification Code: ${otpCode}`,
     '',
@@ -729,12 +349,12 @@ async function sendSignupOtpEmail(
   const htmlBody = `
     <div style="font-family:Segoe UI,Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;background:#ffffff;color:#0f172a;">
       <h2 style="margin:0 0 8px;color:#0B1E47;">Vansh Tender Software</h2>
-      <p style="margin:0 0 16px;font-size:14px;color:#475569;">New User Gmail Verification for <strong>${targetEmail}</strong></p>
+      <p style="margin:0 0 16px;font-size:14px;color:#475569;">Email Verification for <strong>${targetEmail}</strong></p>
       <div style="padding:16px;border-radius:10px;background:#eff6ff;border:1px solid #bfdbfe;text-align:center;margin-bottom:16px;">
         <p style="margin:0 0 6px;font-size:12px;color:#1e3a8a;text-transform:uppercase;letter-spacing:1px;">Sign-Up OTP Code</p>
         <p style="margin:0;font-size:28px;font-weight:700;letter-spacing:6px;color:#0B1E47;font-family:monospace;">${otpCode}</p>
       </div>
-      <p style="margin:0;font-size:13px;color:#475569;">Enter this code in the CRM sign-up form to set up your User ID and Password. Expires in <strong>15 minutes</strong>.</p>
+      <p style="margin:0;font-size:13px;color:#475569;">Enter this code in the CRM sign-up form to set up your account. Expires in <strong>15 minutes</strong>.</p>
     </div>
   `;
 
@@ -755,9 +375,8 @@ async function sendRecoveryOtpEmail(
   error?: string;
 }> {
   const subject = 'Vansh Tender Software — Password Reset Verification Code';
-  const greetingName = target.username === ADMIN_USERNAME ? 'Vansh' : target.username;
   const textBody = [
-    `Hello ${greetingName},`,
+    `Hello ${target.username},`,
     '',
     `We received a password reset request for your Vansh Tender Software CRM account (User ID: ${target.username}).`,
     '',
@@ -789,55 +408,21 @@ async function sendRecoveryOtpEmail(
   });
 }
 
-async function verifyGoogleIdTokenForEmail(
-  idToken: string,
-  expectedEmail: string,
-): Promise<{
-  ok: boolean;
-  email?: string;
-  error?: string;
-}> {
-  const apiKey = readFirebaseApiKey();
-  if (!apiKey) {
-    return { ok: false, error: 'Firebase Web API key not found on server.' };
-  }
-  const resp = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ idToken }),
-    },
-  );
-  const rawBody = await resp.text();
-  if (!resp.ok) {
-    return { ok: false, error: 'Google token verification failed.' };
-  }
-  let data: { users?: Array<{ email?: string; emailVerified?: boolean }> } = {};
-  try {
-    data = JSON.parse(rawBody) as { users?: Array<{ email?: string; emailVerified?: boolean }> };
-  } catch {
-    return { ok: false, error: 'Invalid JSON received from Google identity service.' };
-  }
-  const user = data.users?.[0];
-  if (!user || !user.emailVerified) {
-    return { ok: false, error: 'Google account email is not verified.' };
-  }
-  if ((user.email || '').toLowerCase() !== expectedEmail.toLowerCase()) {
-    return {
-      ok: false,
-      error: `Only the registered email (${expectedEmail}) is authorized to reset this account password.`,
-    };
-  }
-  return { ok: true, email: user.email };
-}
-
 export function createApiRouter(): Router {
   const router = express.Router();
-  let state = loadServerState();
-  const otpRateBuckets = new Map<string, number[]>();
+  let state = bootstrapEnvAdminIfConfigured(loadServerState());
+  const rateBuckets = new Map<string, number[]>();
 
-  function checkOtpRateLimit(req: Request, bucketKey: string, maxRequests = 15, windowMs = 60_000): boolean {
+  function hasAnyWorkspaceAdmin(): boolean {
+    return Object.values(state.users).some((u) => isWorkspaceAdminRole(u.role));
+  }
+
+  function checkRateLimit(
+    req: Request,
+    bucketKey: string,
+    maxRequests = 15,
+    windowMs = 60_000,
+  ): boolean {
     const ip =
       (typeof req.headers['x-forwarded-for'] === 'string'
         ? req.headers['x-forwarded-for'].split(',')[0]?.trim()
@@ -847,78 +432,30 @@ export function createApiRouter(): Router {
       'local';
     const key = `${bucketKey}:${ip}`;
     const now = Date.now();
-    const recent = (otpRateBuckets.get(key) || []).filter((ts) => now - ts < windowMs);
+    const recent = (rateBuckets.get(key) || []).filter((ts) => now - ts < windowMs);
     if (recent.length >= maxRequests) {
-      otpRateBuckets.set(key, recent);
+      rateBuckets.set(key, recent);
       return false;
     }
     recent.push(now);
-    otpRateBuckets.set(key, recent);
-    if (otpRateBuckets.size > 500) {
-      for (const [k, list] of otpRateBuckets.entries()) {
+    rateBuckets.set(key, recent);
+    if (rateBuckets.size > 500) {
+      for (const [k, list] of rateBuckets.entries()) {
         if (list.every((ts) => now - ts >= windowMs)) {
-          otpRateBuckets.delete(k);
+          rateBuckets.delete(k);
         }
       }
     }
     return true;
   }
 
-  function buildUserPool(req: Request, body?: Record<string, unknown>): Map<string, CrmServerUserRecord> {
-    const pool = new Map<string, CrmServerUserRecord>();
-    for (const user of Object.values(state.users || {})) {
-      pool.set(user.userId, user);
-    }
-    if (!pool.has(ADMIN_USER_ID)) {
-      pool.set(ADMIN_USER_ID, {
-        userId: ADMIN_USER_ID,
-        username: ADMIN_USERNAME,
-        email: RECOVERY_EMAIL,
-        role: 'admin',
-        salt: state.passwordRecord.salt,
-        hash: state.passwordRecord.hash,
-        createdAt: '2026-01-01T00:00:00.000Z',
-        updatedAt: state.passwordRecord.updatedAt,
-        isActive: true,
-      });
-    }
-
-    const candidateTokens: string[] = [];
-    const cookieToken = readCookieValue(req.headers.cookie, 'vansh_crm_pwd');
-    if (cookieToken) candidateTokens.push(cookieToken);
-    if (body && typeof body.credentialToken === 'string' && body.credentialToken) {
-      candidateTokens.push(body.credentialToken);
-    }
-    if (body && Array.isArray(body.clientCredentialTokens)) {
-      for (const tok of body.clientCredentialTokens) {
-        if (typeof tok === 'string' && tok) candidateTokens.push(tok);
-      }
-    }
-
-    for (const token of candidateTokens) {
-      const verified = verifyUserCredentialToken(token);
-      if (!verified) continue;
-      const current = pool.get(verified.userId);
-      if (!current || verified.updatedAt >= current.updatedAt) {
-        pool.set(verified.userId, {
-          ...verified,
-          lastLoginAt: current?.lastLoginAt,
-        });
-      }
-    }
-
-    return pool;
-  }
-
-  function findUserInPool(
-    pool: Map<string, CrmServerUserRecord>,
-    identifier: string,
-  ): CrmServerUserRecord | null {
+  function findUserInState(identifier: string, companyId?: string): CrmServerUserRecord | null {
     const trimmed = identifier.trim();
     if (!trimmed) return null;
     const lower = trimmed.toLowerCase();
     let best: CrmServerUserRecord | null = null;
-    for (const user of pool.values()) {
+    for (const user of Object.values(state.users)) {
+      if (companyId && user.companyId !== companyId) continue;
       if (
         user.userId.toLowerCase() === lower ||
         user.username.toLowerCase() === lower ||
@@ -936,206 +473,527 @@ export function createApiRouter(): Router {
     return best;
   }
 
-  function findLatestSecondaryByEmail(
-    pool: Map<string, CrmServerUserRecord>,
-    email: string,
-  ): CrmServerUserRecord | null {
-    const norm = email.trim().toLowerCase();
-    if (!norm) return null;
-    let latest: CrmServerUserRecord | null = null;
-    for (const user of pool.values()) {
-      if (user.role !== 'secondary') continue;
-      if ((user.email || '').trim().toLowerCase() !== norm) continue;
-      if (!latest || (user.updatedAt || '') >= (latest.updatedAt || '')) {
-        latest = user;
-      }
-    }
-    return latest;
+  function getCompanySummary(companyId: string): CompanyServerRecord | null {
+    const comp = state.companies[companyId];
+    if (!comp) return null;
+    const monthKey = currentMonthKey();
+    const usage =
+      comp.usage?.monthKey === monthKey
+        ? comp.usage
+        : { monthKey, aiScansUsed: 0 };
+    return { ...comp, usage };
   }
 
-  async function isAdminAuthorizedRequest(
-    req: Request,
-    body?: Record<string, unknown>,
-  ): Promise<boolean> {
-    const adminToken =
-      typeof req.headers['x-crm-admin-token'] === 'string'
-        ? req.headers['x-crm-admin-token'].trim()
-        : '';
-    if (adminToken && verifyAdminSessionToken(adminToken)) {
-      return true;
+  function ensureAiQuotaAvailable(companyId: string, res: Response): boolean {
+    const comp = getCompanySummary(companyId);
+    if (!comp) return true;
+    const limit = PLAN_QUOTAS[comp.plan || 'starter'].maxAiScansPerMonth;
+    if (comp.usage.aiScansUsed >= limit) {
+      res.status(429).json({
+        ok: false,
+        success: false,
+        retryable: false,
+        code: 'PLAN_QUOTA_EXCEEDED',
+        error: `Monthly AI scan quota (${limit}) reached for ${PLAN_QUOTAS[comp.plan].label} plan. Upgrade your plan in Company & Plan Settings to continue.`,
+      });
+      return false;
     }
-    const headerFbToken =
-      typeof req.headers['x-firebase-id-token'] === 'string'
-        ? req.headers['x-firebase-id-token'].trim()
-        : '';
-    const bodyFbToken =
-      body && typeof body.firebaseIdToken === 'string' ? body.firebaseIdToken.trim() : '';
-    const firebaseIdToken = headerFbToken || bodyFbToken;
-    if (!firebaseIdToken) return false;
-    const verified = await verifyGoogleIdTokenForEmail(firebaseIdToken, RECOVERY_EMAIL);
-    return verified.ok;
+    return true;
+  }
+
+  function checkAndIncrementAiQuota(
+    companyId: string,
+    res: Response,
+  ): { allowed: boolean } {
+    if (!ensureAiQuotaAvailable(companyId, res)) {
+      return { allowed: false };
+    }
+    const comp = getCompanySummary(companyId);
+    if (!comp) return { allowed: true };
+    const nextUsage = {
+      monthKey: comp.usage.monthKey,
+      aiScansUsed: comp.usage.aiScansUsed + 1,
+    };
+    state = {
+      ...state,
+      companies: {
+        ...state.companies,
+        [companyId]: {
+          ...comp,
+          usage: nextUsage,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    };
+    saveServerState(state);
+    return { allowed: true };
+  }
+
+  function requireAuth(
+    req: Request,
+    res: Response,
+    bodyToken?: unknown,
+  ): SessionTokenPayload | null {
+    const token = extractBearerTokenFromRequest(req, bodyToken);
+    if (!token) {
+      res.status(401).json({
+        ok: false,
+        error: 'Authentication required. Please sign in to continue.',
+      });
+      return null;
+    }
+    const session = authenticateSessionToken(token, state);
+    if (!session) {
+      res.status(401).json({
+        ok: false,
+        error: 'Session expired, invalid, or revoked. Please sign in again.',
+      });
+      return null;
+    }
+    return session;
+  }
+
+  function requirePermission(
+    caller: SessionTokenPayload,
+    permission: ServerPermission,
+    res: Response,
+  ): boolean {
+    if (!hasServerPermission(caller.role, permission)) {
+      res.status(403).json({
+        ok: false,
+        error: `Insufficient permissions (${caller.role}) for action "${permission}".`,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  function listCompanyTeamUsers(companyId: string) {
+    return Object.values(state.users)
+      .filter((u) => u.companyId === companyId)
+      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+      .map((u) => sanitizeServerUserForClient(u, state.companies[companyId]?.companyName));
   }
 
   router.get('/health', (_req: Request, res: Response) => {
     res.json({
       ok: true,
       emailProvider: detectEmailProvider(),
-      recoveryEmail: maskEmailAddress(RECOVERY_EMAIL),
+      needsSetup: !hasAnyWorkspaceAdmin(),
       runtime: IS_VERCEL ? 'vercel-serverless' : 'node-express',
     });
   });
 
-  router.post('/auth/login', (req: Request, res: Response) => {
-    const body = (req.body || {}) as {
-      username?: unknown;
-      identifier?: unknown;
-      password?: unknown;
-      credentialToken?: unknown;
-      clientCredentialTokens?: unknown;
-    };
-    const identifier =
-      typeof body.identifier === 'string' && body.identifier.trim()
-        ? body.identifier.trim()
-        : typeof body.username === 'string'
-          ? body.username.trim()
-          : '';
-    const password = typeof body.password === 'string' ? body.password : '';
-
-    if (!identifier) {
-      res.status(400).json({ ok: false, error: 'Please enter your User ID or Email ID.' });
-      return;
-    }
-    if (!password) {
-      res.status(400).json({ ok: false, error: 'Please enter your Password.' });
-      return;
-    }
-
-    const pool = buildUserPool(req, body as Record<string, unknown>);
-    const matched = findUserInPool(pool, identifier);
-
-    const isEmailInput = identifier.includes('@');
-    const usernameMatches =
-      matched &&
-      (isEmailInput ||
-        identifier === matched.username ||
-        identifier === matched.userId);
-
-    if (
-      !matched ||
-      !usernameMatches ||
-      !verifyHashedSecret(password, matched.salt, matched.hash)
-    ) {
-      res.status(401).json({
-        ok: false,
-        code: 'INVALID_CREDENTIALS',
-        error: 'Invalid User ID or password. Please check your credentials and try again.',
-      });
-      return;
-    }
-
-    const latestSameEmail =
-      matched.role === 'secondary' ? findLatestSecondaryByEmail(pool, matched.email) : null;
-    const accountEnabled =
-      matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
-    const latestEmailEnabled =
-      latestSameEmail && latestSameEmail.isEnabled !== undefined
-        ? latestSameEmail.isEnabled !== false
-        : latestSameEmail
-          ? latestSameEmail.isActive !== false
-          : true;
-    if ((!accountEnabled || !latestEmailEnabled) && matched.role !== 'admin') {
-      res.status(403).json({
-        ok: false,
-        code: 'ACCOUNT_DISABLED',
-        error:
-          'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Please contact the administrator to regain access.',
-      });
-      return;
-    }
-
-    const nowIso = new Date().toISOString();
-    const updatedUser: CrmServerUserRecord = {
-      ...matched,
-      lastLoginAt: nowIso,
-      isActive: true,
-      isEnabled: true,
-      presenceStatus: 'active',
-      lastHeartbeatAt: nowIso,
-    };
-
-    state = {
-      ...state,
-      users: {
-        ...state.users,
-        [updatedUser.userId]: updatedUser,
-      },
-      ...(updatedUser.role === 'admin'
-        ? {
-            passwordRecord: {
-              salt: updatedUser.salt,
-              hash: updatedUser.hash,
-              updatedAt: updatedUser.updatedAt,
-            },
-          }
-        : {}),
-    };
-    saveServerState(state);
-
-    const credentialToken = signUserCredentialToken(updatedUser);
-    const adminSessionToken =
-      updatedUser.role === 'admin' ? signAdminSessionToken(updatedUser) : undefined;
-
+  router.get('/auth/bootstrap-status', (_req: Request, res: Response) => {
     res.json({
       ok: true,
-      username: updatedUser.username,
-      user: sanitizeServerUserForClient(updatedUser),
-      credentialToken,
-      ...(adminSessionToken ? { adminSessionToken } : {}),
+      needsSetup: !hasAnyWorkspaceAdmin(),
     });
+  });
+
+  router.post('/auth/setup-admin', async (req: Request, res: Response) => {
+    try {
+      if (!checkRateLimit(req, 'setup-admin', 10, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many setup attempts. Please wait a minute.' });
+        return;
+      }
+      if (hasAnyWorkspaceAdmin()) {
+        res.status(409).json({
+          ok: false,
+          error: 'Initial workspace owner is already registered. Please log in or create a new company workspace.',
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as {
+        companyName?: unknown;
+        username?: unknown;
+        email?: unknown;
+        password?: unknown;
+        gstin?: unknown;
+        udyamNumber?: unknown;
+      };
+      const companyName = typeof body.companyName === 'string' ? body.companyName.trim() : '';
+      const username = typeof body.username === 'string' ? body.username.trim() : '';
+      const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const password = typeof body.password === 'string' ? body.password : '';
+      const gstin = typeof body.gstin === 'string' ? body.gstin.trim().toUpperCase() : '';
+      const udyamNumber = typeof body.udyamNumber === 'string' ? body.udyamNumber.trim().toUpperCase() : '';
+
+      if (companyName.length < 2 || companyName.length > 120) {
+        res.status(400).json({ ok: false, error: 'Company / Firm Name must be 2 to 120 characters.' });
+        return;
+      }
+      if (!/^[a-zA-Z0-9_.-]{3,40}$/.test(username)) {
+        res.status(400).json({
+          ok: false,
+          error: 'User ID must be 3 to 40 characters (letters, numbers, "_", ".", or "-").',
+        });
+        return;
+      }
+      if (!email || !isValidEmailAddress(email)) {
+        res.status(400).json({ ok: false, error: 'A valid business Email ID is required.' });
+        return;
+      }
+      if (password.length < 8 || password.length > 128) {
+        res.status(400).json({ ok: false, error: 'Password must be 8 to 128 characters.' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const companyId = slugifyCompanyId(companyName);
+      const userId = slugifyUserId('own', username);
+      const passwordHash = await hashPasswordBcrypt(password);
+
+      const company: CompanyServerRecord = {
+        companyId,
+        companyName,
+        ...(gstin ? { gstin } : {}),
+        ...(udyamNumber ? { udyamNumber } : {}),
+        plan: 'professional',
+        ownerUserId: userId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        usage: { monthKey: currentMonthKey(), aiScansUsed: 0 },
+      };
+
+      const ownerUser: CrmServerUserRecord = {
+        userId,
+        username,
+        email,
+        role: 'owner',
+        companyId,
+        companyName,
+        passwordHash,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        lastLoginAt: nowIso,
+        isActive: true,
+        isEnabled: true,
+        presenceStatus: 'active',
+        lastHeartbeatAt: nowIso,
+      };
+
+      state = {
+        ...state,
+        companies: { ...state.companies, [companyId]: company },
+        users: { ...state.users, [userId]: ownerUser },
+      };
+      saveServerState(state);
+
+      const sessionToken = signSessionToken(ownerUser, companyName);
+      res.status(201).json({
+        ok: true,
+        sessionToken,
+        user: sanitizeServerUserForClient(ownerUser, companyName),
+        company: getCompanySummary(companyId),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unable to register initial workspace.',
+      });
+    }
+  });
+
+  router.post('/auth/firebase-exchange', async (req: Request, res: Response) => {
+    try {
+      if (!checkRateLimit(req, 'firebase-exchange', 20, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many authentication requests.' });
+        return;
+      }
+      const body = (req.body || {}) as {
+        firebaseIdToken?: unknown;
+        companyName?: unknown;
+        inviteCode?: unknown;
+      };
+      const idToken = typeof body.firebaseIdToken === 'string' ? body.firebaseIdToken.trim() : '';
+      if (!idToken) {
+        res.status(400).json({ ok: false, error: 'Firebase ID token is required.' });
+        return;
+      }
+      const verified = await verifyFirebaseIdToken(idToken);
+      if (!verified.ok || !verified.email) {
+        res.status(401).json({ ok: false, error: verified.error || 'Invalid Google/Firebase token.' });
+        return;
+      }
+
+      const email = verified.email.toLowerCase();
+      const nowIso = new Date().toISOString();
+      let matched = findUserInState(email);
+
+      if (matched) {
+        const enabled =
+          matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
+        if (!enabled) {
+          res.status(403).json({
+            ok: false,
+            code: 'ACCOUNT_DISABLED',
+            error: 'This CRM workspace account has been disabled by your company administrator.',
+          });
+          return;
+        }
+        matched = {
+          ...matched,
+          lastLoginAt: nowIso,
+          isActive: true,
+          presenceStatus: 'active',
+          lastHeartbeatAt: nowIso,
+          updatedAt: nowIso,
+        };
+        state = { ...state, users: { ...state.users, [matched.userId]: matched } };
+        saveServerState(state);
+        const company = getCompanySummary(matched.companyId);
+        const sessionToken = signSessionToken(matched, company?.companyName || matched.companyName || 'Workspace');
+        res.json({
+          ok: true,
+          sessionToken,
+          user: sanitizeServerUserForClient(matched, company?.companyName),
+          company,
+        });
+        return;
+      }
+
+      const inviteCode = typeof body.inviteCode === 'string' ? body.inviteCode.trim() : '';
+      const requestedCompanyName =
+        typeof body.companyName === 'string' ? body.companyName.trim() : '';
+
+      let targetCompanyId = '';
+      let targetCompanyName = '';
+      let assignedRole: TeamRole = 'owner';
+
+      if (inviteCode) {
+        const invite = state.invites[inviteCode];
+        if (!invite || invite.usedAt || Date.now() > invite.expiresAt) {
+          res.status(403).json({ ok: false, error: 'Invite code is invalid or expired.' });
+          return;
+        }
+        if (invite.email && invite.email.toLowerCase() !== email) {
+          res.status(403).json({
+            ok: false,
+            error: `Invite code is issued exclusively for ${invite.email}.`,
+          });
+          return;
+        }
+        targetCompanyId = invite.companyId;
+        targetCompanyName = invite.companyName;
+        assignedRole = invite.role;
+      } else {
+        targetCompanyName =
+          requestedCompanyName || `${verified.displayName || email.split('@')[0]}'s Workspace`;
+        targetCompanyId = slugifyCompanyId(targetCompanyName);
+        assignedRole = 'owner';
+      }
+
+      const baseSlug = (verified.displayName || email.split('@')[0] || 'member')
+        .replace(/[^a-zA-Z0-9_.-]+/g, '')
+        .slice(0, 32);
+      const userId = slugifyUserId('usr', baseSlug || 'member');
+      const newUser: CrmServerUserRecord = {
+        userId,
+        username: baseSlug || email.split('@')[0],
+        email,
+        role: assignedRole,
+        companyId: targetCompanyId,
+        companyName: targetCompanyName,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        lastLoginAt: nowIso,
+        isActive: true,
+        isEnabled: true,
+        presenceStatus: 'active',
+        lastHeartbeatAt: nowIso,
+      };
+
+      const nextCompanies = { ...state.companies };
+      if (!nextCompanies[targetCompanyId]) {
+        nextCompanies[targetCompanyId] = {
+          companyId: targetCompanyId,
+          companyName: targetCompanyName,
+          plan: 'starter',
+          ownerUserId: userId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          usage: { monthKey: currentMonthKey(), aiScansUsed: 0 },
+        };
+      }
+      const nextInvites = { ...state.invites };
+      if (inviteCode && nextInvites[inviteCode]) {
+        nextInvites[inviteCode] = {
+          ...nextInvites[inviteCode],
+          usedAt: nowIso,
+          usedByUserId: userId,
+        };
+      }
+
+      state = {
+        ...state,
+        companies: nextCompanies,
+        invites: nextInvites,
+        users: { ...state.users, [userId]: newUser },
+      };
+      saveServerState(state);
+
+      const sessionToken = signSessionToken(newUser, targetCompanyName);
+      res.json({
+        ok: true,
+        sessionToken,
+        user: sanitizeServerUserForClient(newUser, targetCompanyName),
+        company: getCompanySummary(targetCompanyId),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unable to exchange Firebase session.',
+      });
+    }
+  });
+
+  router.post('/auth/login', async (req: Request, res: Response) => {
+    try {
+      if (!checkRateLimit(req, 'login', 20, 60_000)) {
+        res.status(429).json({
+          ok: false,
+          error: 'Too many login attempts. Please wait a minute and try again.',
+        });
+        return;
+      }
+      const body = (req.body || {}) as {
+        username?: unknown;
+        identifier?: unknown;
+        password?: unknown;
+      };
+      const identifier =
+        typeof body.identifier === 'string' && body.identifier.trim()
+          ? body.identifier.trim()
+          : typeof body.username === 'string'
+            ? body.username.trim()
+            : '';
+      const password = typeof body.password === 'string' ? body.password : '';
+
+      if (!identifier) {
+        res.status(400).json({ ok: false, error: 'Please enter your User ID or Email ID.' });
+        return;
+      }
+      if (!password) {
+        res.status(400).json({ ok: false, error: 'Please enter your Password.' });
+        return;
+      }
+
+      const matched = findUserInState(identifier);
+      const isEmailInput = identifier.includes('@');
+      const usernameMatches =
+        matched &&
+        (isEmailInput ||
+          identifier.toLowerCase() === matched.username.toLowerCase() ||
+          identifier === matched.userId);
+
+      if (!matched || !usernameMatches) {
+        res.status(401).json({
+          ok: false,
+          code: 'INVALID_CREDENTIALS',
+          error: 'Invalid User ID or password. Please check your credentials and try again.',
+        });
+        return;
+      }
+
+      const pwResult = await verifyUserPassword(password, matched);
+      if (!pwResult.valid) {
+        res.status(401).json({
+          ok: false,
+          code: 'INVALID_CREDENTIALS',
+          error: 'Invalid User ID or password. Please check your credentials and try again.',
+        });
+        return;
+      }
+
+      const accountEnabled =
+        matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
+      if (!accountEnabled && normalizeServerRole(matched.role) !== 'owner') {
+        res.status(403).json({
+          ok: false,
+          code: 'ACCOUNT_DISABLED',
+          error:
+            'Your CRM ID has been disabled by your Company Administrator. Please contact your administrator to regain access.',
+        });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const updatedPasswordHash = pwResult.needsRehash
+        ? await hashPasswordBcrypt(password)
+        : matched.passwordHash;
+      const updatedUser: CrmServerUserRecord = {
+        ...matched,
+        role: normalizeServerRole(matched.role),
+        passwordHash: updatedPasswordHash,
+        salt: undefined,
+        hash: undefined,
+        lastLoginAt: nowIso,
+        isActive: true,
+        isEnabled: true,
+        presenceStatus: 'active',
+        lastHeartbeatAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      state = {
+        ...state,
+        users: {
+          ...state.users,
+          [updatedUser.userId]: updatedUser,
+        },
+      };
+      saveServerState(state);
+
+      const company = getCompanySummary(updatedUser.companyId);
+      const companyName = company?.companyName || updatedUser.companyName || 'Workspace';
+      const sessionToken = signSessionToken(updatedUser, companyName);
+
+      res.json({
+        ok: true,
+        username: updatedUser.username,
+        sessionToken,
+        user: sanitizeServerUserForClient(updatedUser, companyName),
+        company,
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unable to sign in.',
+      });
+    }
   });
 
   router.post('/auth/presence/heartbeat', (req: Request, res: Response) => {
     const body = (req.body || {}) as {
       userId?: unknown;
-      identifier?: unknown;
-      credentialToken?: unknown;
-      clientCredentialTokens?: unknown;
       byocProjectId?: unknown;
       byocConfig?: unknown;
     };
-    const identifier =
-      (typeof body.userId === 'string' && body.userId.trim()) ||
-      (typeof body.identifier === 'string' && body.identifier.trim()) ||
-      '';
-    if (!identifier) {
-      res.status(400).json({ ok: false, error: 'userId is required.' });
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+
+    const requestedId = typeof body.userId === 'string' ? body.userId.trim() : '';
+    if (requestedId && requestedId !== caller.userId) {
+      res.status(403).json({ ok: false, error: 'Cannot send heartbeat for another user.' });
       return;
     }
 
-    const pool = buildUserPool(req, body as Record<string, unknown>);
-    const matched = pool.get(identifier) || findUserInPool(pool, identifier);
+    const matched = state.users[caller.userId];
     if (!matched) {
       res.status(404).json({ ok: false, error: 'User session not found.' });
       return;
     }
 
-    const latestSameEmail =
-      matched.role === 'secondary' ? findLatestSecondaryByEmail(pool, matched.email) : null;
     const isEnabled =
       matched.isEnabled !== undefined ? matched.isEnabled !== false : matched.isActive !== false;
-    const latestEmailEnabled =
-      latestSameEmail && latestSameEmail.isEnabled !== undefined
-        ? latestSameEmail.isEnabled !== false
-        : latestSameEmail
-          ? latestSameEmail.isActive !== false
-          : true;
-    if ((!isEnabled || !latestEmailEnabled) && matched.role !== 'admin') {
+    if (!isEnabled && normalizeServerRole(matched.role) !== 'owner') {
       res.status(403).json({
         ok: false,
         code: 'ACCOUNT_DISABLED',
         disabled: true,
-        error:
-          'Your CRM ID has been disabled by the Primary Administrator (VanshSales). Session terminated.',
+        error: 'Your CRM ID has been disabled by your Company Administrator. Session terminated.',
       });
       return;
     }
@@ -1168,9 +1026,11 @@ export function createApiRouter(): Router {
     };
     saveServerState(state);
 
+    const company = getCompanySummary(updatedUser.companyId);
     res.json({
       ok: true,
-      user: sanitizeServerUserForClient(updatedUser),
+      user: sanitizeServerUserForClient(updatedUser, company?.companyName),
+      company,
       presenceStatus: 'active',
       isEnabled: true,
       lastHeartbeatAt: nowIso,
@@ -1192,87 +1052,72 @@ export function createApiRouter(): Router {
         body = req.body as Record<string, unknown>;
       }
 
-      const identifier =
-        (typeof body.userId === 'string' && body.userId.trim()) ||
-        (typeof body.identifier === 'string' && body.identifier.trim()) ||
-        '';
-      if (!identifier) {
-        res.json({ ok: true });
+      const token = extractBearerTokenFromRequest(req, body.beaconToken);
+      const session = token ? authenticateSessionToken(token, state) : null;
+      if (!session) {
+        res.status(401).json({ ok: false, error: 'Valid session token is required to log out.' });
         return;
       }
 
-      const pool = buildUserPool(req, body);
-      const matched = pool.get(identifier) || findUserInPool(pool, identifier);
+      const nextRevoked = { ...state.revokedSessions, [session.sid]: session.exp };
+      const matched = state.users[session.userId];
+      const nowIso = new Date().toISOString();
+      const nextUsers = { ...state.users };
       if (matched) {
-        const nowIso = new Date().toISOString();
-        const updatedUser: CrmServerUserRecord = {
+        nextUsers[matched.userId] = {
           ...matched,
           presenceStatus: 'not_active',
           isActive: false,
           lastLogoutAt: nowIso,
           updatedAt: nowIso,
         };
-        state = {
-          ...state,
-          users: {
-            ...state.users,
-            [updatedUser.userId]: updatedUser,
-          },
-        };
-        saveServerState(state);
       }
+      state = {
+        ...state,
+        revokedSessions: nextRevoked,
+        users: nextUsers,
+      };
+      saveServerState(state);
+
       res.json({ ok: true, presenceStatus: 'not_active' });
     },
   );
 
   router.post('/auth/signup/send-otp', async (req: Request, res: Response) => {
     try {
-      if (!checkOtpRateLimit(req, 'signup-otp')) {
+      if (!checkRateLimit(req, 'signup-otp', 10, 60_000)) {
         res.status(429).json({
           ok: false,
           error: 'Too many OTP requests. Please wait a minute before requesting another code.',
         });
         return;
       }
-      const body = (req.body || {}) as {
-        email?: unknown;
-        clientCredentialTokens?: unknown;
-      };
+      const body = (req.body || {}) as { email?: unknown };
       const targetEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
 
       if (!targetEmail || !isValidEmailAddress(targetEmail)) {
         res.status(400).json({
           ok: false,
-          error: 'Please enter a valid Gmail / email address to receive your verification OTP.',
+          error: 'Please enter a valid Email address to receive your verification OTP.',
         });
         return;
       }
 
-      if (targetEmail === RECOVERY_EMAIL.toLowerCase()) {
-        res.status(409).json({
-          ok: false,
-          error: 'This Gmail is reserved for the primary Admin account. Please use a different Gmail address.',
-        });
-        return;
-      }
-
-      const pool = buildUserPool(req, body as Record<string, unknown>);
-      const existingByEmail = findUserInPool(pool, targetEmail);
+      const existingByEmail = findUserInState(targetEmail);
       if (existingByEmail) {
         res.status(409).json({
           ok: false,
-          error: `An account (${existingByEmail.username}) is already registered with ${targetEmail}. Please sign in or use Forgot Password.`,
+          error: 'An account is already registered with this email address. Please sign in or use Forgot Password.',
         });
         return;
       }
 
       const otpCode = String(crypto.randomInt(100000, 1000000));
-      const { salt, hash } = hashSecret(otpCode);
+      const otpHash = hashOtpSecret(otpCode);
       const expiresAt = Date.now() + 15 * 60 * 1000;
       const otpToken = signSignupOtpToken({
         email: targetEmail,
-        salt,
-        otpHash: hash,
+        otpHash,
         expiresAt,
       });
 
@@ -1283,8 +1128,7 @@ export function createApiRouter(): Router {
           [`signup:${targetEmail}`]: {
             purpose: 'signup',
             email: targetEmail,
-            salt,
-            otpHash: hash,
+            otpHash,
             expiresAt,
             attempts: 0,
             requestedAt: new Date().toISOString(),
@@ -1313,7 +1157,7 @@ export function createApiRouter(): Router {
           providerConfigured: false,
           recipient: targetEmail,
           error:
-            'Email gateway (SMTP_USER/SMTP_PASS or RESEND_API_KEY) is not configured on the server to send Gmail verification OTPs.',
+            'Email gateway (SMTP_USER/SMTP_PASS or RESEND_API_KEY) is not configured on the server to send email verification OTPs.',
         });
         return;
       }
@@ -1338,6 +1182,10 @@ export function createApiRouter(): Router {
 
   router.post('/auth/signup/verify-otp', (req: Request, res: Response) => {
     try {
+      if (!checkRateLimit(req, 'signup-verify', 15, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many OTP verification attempts.' });
+        return;
+      }
       const body = (req.body || {}) as {
         email?: unknown;
         otp?: unknown;
@@ -1347,7 +1195,7 @@ export function createApiRouter(): Router {
       const otp = typeof body.otp === 'string' ? body.otp.trim() : '';
 
       if (!email || !isValidEmailAddress(email)) {
-        res.status(400).json({ ok: false, error: 'Valid Gmail address is required.' });
+        res.status(400).json({ ok: false, error: 'Valid email address is required.' });
         return;
       }
       if (!/^\d{6}$/.test(otp)) {
@@ -1365,7 +1213,7 @@ export function createApiRouter(): Router {
       if (signed && signed.email !== email) {
         res.status(400).json({
           ok: false,
-          error: 'OTP token does not match the entered Gmail address. Please request a fresh OTP.',
+          error: 'OTP token does not match the entered email address. Please request a fresh OTP.',
         });
         return;
       }
@@ -1375,6 +1223,7 @@ export function createApiRouter(): Router {
         ? {
             ...signed,
             attempts: stored && stored.otpHash === signed.otpHash ? stored.attempts : 0,
+            salt: undefined,
           }
         : stored;
 
@@ -1404,7 +1253,7 @@ export function createApiRouter(): Router {
         return;
       }
 
-      if (!verifyHashedSecret(otp, activeOtp.salt, activeOtp.otpHash)) {
+      if (!verifyOtpSecret(otp, activeOtp.otpHash, activeOtp.salt)) {
         if (stored) {
           state = {
             ...state,
@@ -1420,7 +1269,7 @@ export function createApiRouter(): Router {
         }
         res.status(400).json({
           ok: false,
-          error: 'Invalid 6-digit verification OTP. Please check your Gmail inbox and try again.',
+          error: 'Invalid 6-digit verification OTP. Please check your inbox and try again.',
         });
         return;
       }
@@ -1430,7 +1279,7 @@ export function createApiRouter(): Router {
         ok: true,
         email,
         verifiedToken,
-        message: 'Gmail verified successfully! Now choose your User ID and Password.',
+        message: 'Email verified successfully! Choose your User ID and Password.',
       });
     } catch (err) {
       res.status(500).json({
@@ -1440,23 +1289,30 @@ export function createApiRouter(): Router {
     }
   });
 
-  router.post('/auth/signup/complete', (req: Request, res: Response) => {
+  router.post('/auth/signup/complete', async (req: Request, res: Response) => {
     try {
+      if (!checkRateLimit(req, 'signup-complete', 15, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many signup attempts.' });
+        return;
+      }
       const body = (req.body || {}) as {
         email?: unknown;
         username?: unknown;
         password?: unknown;
+        companyName?: unknown;
+        inviteCode?: unknown;
         verifiedToken?: unknown;
-        clientCredentialTokens?: unknown;
       };
       const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
       const username = typeof body.username === 'string' ? body.username.trim() : '';
       const password = typeof body.password === 'string' ? body.password : '';
+      const companyNameInput = typeof body.companyName === 'string' ? body.companyName.trim() : '';
+      const inviteCode = typeof body.inviteCode === 'string' ? body.inviteCode.trim() : '';
       const verifiedToken =
         typeof body.verifiedToken === 'string' ? body.verifiedToken.trim() : '';
 
       if (!email || !isValidEmailAddress(email)) {
-        res.status(400).json({ ok: false, error: 'A verified Gmail address is required.' });
+        res.status(400).json({ ok: false, error: 'A verified email address is required.' });
         return;
       }
 
@@ -1464,7 +1320,7 @@ export function createApiRouter(): Router {
       if (!verifiedClaim || verifiedClaim.email !== email || Date.now() > verifiedClaim.expiresAt) {
         res.status(403).json({
           ok: false,
-          error: 'Gmail OTP verification is missing or expired. Please verify your Gmail OTP again.',
+          error: 'Email OTP verification is missing or expired. Please verify your OTP again.',
         });
         return;
       }
@@ -1476,59 +1332,67 @@ export function createApiRouter(): Router {
         });
         return;
       }
-      if (password.length < 6 || password.length > 128) {
+      if (password.length < 8 || password.length > 128) {
         res.status(400).json({
           ok: false,
-          error: 'Password must be between 6 and 128 characters.',
+          error: 'Password must be between 8 and 128 characters.',
         });
         return;
       }
 
-      if (
-        username.toLowerCase() === ADMIN_USERNAME.toLowerCase() ||
-        email === RECOVERY_EMAIL.toLowerCase()
-      ) {
-        res.status(409).json({
-          ok: false,
-          error: 'This User ID or Gmail belongs to the primary Admin account.',
-        });
-        return;
-      }
-
-      const pool = buildUserPool(req, body as Record<string, unknown>);
-      const existingByUsername = findUserInPool(pool, username);
-      if (existingByUsername) {
+      if (findUserInState(username)) {
         res.status(409).json({
           ok: false,
           error: `User ID "${username}" is already taken. Please choose another User ID.`,
         });
         return;
       }
-      const existingByEmail = findUserInPool(pool, email);
-      if (existingByEmail) {
+      if (findUserInState(email)) {
         res.status(409).json({
           ok: false,
-          error: `Gmail "${email}" is already linked to account "${existingByEmail.username}".`,
+          error: `Email "${email}" is already linked to an existing account.`,
         });
         return;
       }
 
-      const slug = username
-        .toLowerCase()
-        .replace(/[^a-z0-9_-]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .slice(0, 48);
-      const userId = `sec_${slug}_${crypto.randomBytes(2).toString('hex')}`;
       const nowIso = new Date().toISOString();
-      const { salt, hash } = hashSecret(password);
+      let companyId = '';
+      let companyName = '';
+      let role: TeamRole = 'owner';
+
+      if (inviteCode) {
+        const invite = state.invites[inviteCode];
+        if (!invite || invite.usedAt || Date.now() > invite.expiresAt) {
+          res.status(403).json({ ok: false, error: 'Team invite code is invalid or expired.' });
+          return;
+        }
+        if (invite.email && invite.email.toLowerCase() !== email) {
+          res.status(403).json({
+            ok: false,
+            error: `This invite code belongs exclusively to ${invite.email}.`,
+          });
+          return;
+        }
+        companyId = invite.companyId;
+        companyName = invite.companyName;
+        role = normalizeServerRole(invite.role);
+      } else {
+        companyName = companyNameInput || `${username}'s Tender Desk`;
+        companyId = slugifyCompanyId(companyName);
+        role = 'owner';
+      }
+
+      const userId = slugifyUserId(role === 'owner' ? 'own' : 'usr', username);
+      const passwordHash = await hashPasswordBcrypt(password);
 
       const newUser: CrmServerUserRecord = {
         userId,
         username,
         email,
-        role: 'secondary',
-        salt,
-        hash,
+        role,
+        companyId,
+        companyName,
+        passwordHash,
         createdAt: nowIso,
         updatedAt: nowIso,
         isActive: true,
@@ -1536,11 +1400,34 @@ export function createApiRouter(): Router {
         presenceStatus: 'not_active',
       };
 
+      const nextCompanies = { ...state.companies };
+      if (!nextCompanies[companyId]) {
+        nextCompanies[companyId] = {
+          companyId,
+          companyName,
+          plan: 'starter',
+          ownerUserId: userId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          usage: { monthKey: currentMonthKey(), aiScansUsed: 0 },
+        };
+      }
+      const nextInvites = { ...state.invites };
+      if (inviteCode && nextInvites[inviteCode]) {
+        nextInvites[inviteCode] = {
+          ...nextInvites[inviteCode],
+          usedAt: nowIso,
+          usedByUserId: userId,
+        };
+      }
+
       const nextOtps = { ...state.pendingOtps };
       delete nextOtps[`signup:${email}`];
 
       state = {
         ...state,
+        companies: nextCompanies,
+        invites: nextInvites,
         users: {
           ...state.users,
           [newUser.userId]: newUser,
@@ -1549,12 +1436,11 @@ export function createApiRouter(): Router {
       };
       saveServerState(state);
 
-      const credentialToken = signUserCredentialToken(newUser);
       res.status(201).json({
         ok: true,
-        user: sanitizeServerUserForClient(newUser),
-        credentialToken,
-        message: 'Successful ID Creation! Redirecting to the Login screen.',
+        user: sanitizeServerUserForClient(newUser, companyName),
+        company: getCompanySummary(companyId),
+        message: 'Successful Account Creation! Redirecting to the Login screen.',
       });
     } catch (err) {
       res.status(500).json({
@@ -1566,7 +1452,7 @@ export function createApiRouter(): Router {
 
   router.post('/auth/forgot-password', async (req: Request, res: Response) => {
     try {
-      if (!checkOtpRateLimit(req, 'forgot-otp')) {
+      if (!checkRateLimit(req, 'forgot-otp', 10, 60_000)) {
         res.status(429).json({
           ok: false,
           error: 'Too many password reset requests. Please wait a minute before trying again.',
@@ -1577,7 +1463,6 @@ export function createApiRouter(): Router {
         identifier?: unknown;
         username?: unknown;
         targetEmail?: unknown;
-        clientCredentialTokens?: unknown;
       };
       const rawIdentifier =
         (typeof body.identifier === 'string' && body.identifier.trim()) ||
@@ -1585,29 +1470,32 @@ export function createApiRouter(): Router {
         (typeof body.targetEmail === 'string' && body.targetEmail.trim()) ||
         '';
 
-      const pool = buildUserPool(req, body as Record<string, unknown>);
-      const targetUser = rawIdentifier
-        ? findUserInPool(pool, rawIdentifier)
-        : pool.get(ADMIN_USER_ID) || null;
+      if (!rawIdentifier) {
+        res.status(400).json({
+          ok: false,
+          error: 'Please enter your User ID or registered email address.',
+        });
+        return;
+      }
 
+      const targetUser = findUserInState(rawIdentifier);
       if (!targetUser) {
         res.status(404).json({
           ok: false,
-          error: `No CRM account found matching "${rawIdentifier}". Enter your exact User ID or registered Gmail address.`,
+          error: `No CRM account found matching "${rawIdentifier}". Enter your exact User ID or registered email address.`,
         });
         return;
       }
 
       const otpCode = String(crypto.randomInt(100000, 1000000));
-      const { salt, hash } = hashSecret(otpCode);
+      const otpHash = hashOtpSecret(otpCode);
       const expiresAt = Date.now() + 15 * 60 * 1000;
       const otpToken = signOtpToken({
         kind: 'reset_otp',
         userId: targetUser.userId,
         username: targetUser.username,
         email: targetUser.email,
-        salt,
-        otpHash: hash,
+        otpHash,
         expiresAt,
       });
 
@@ -1616,8 +1504,7 @@ export function createApiRouter(): Router {
         userId: targetUser.userId,
         username: targetUser.username,
         email: targetUser.email,
-        salt,
-        otpHash: hash,
+        otpHash,
         expiresAt,
         attempts: 0,
         requestedAt: new Date().toISOString(),
@@ -1625,7 +1512,6 @@ export function createApiRouter(): Router {
 
       state = {
         ...state,
-        pendingOtp: targetUser.role === 'admin' ? otpRecord : state.pendingOtp,
         pendingOtps: {
           ...state.pendingOtps,
           [`reset:${targetUser.userId}`]: otpRecord,
@@ -1638,18 +1524,18 @@ export function createApiRouter(): Router {
         toEmail: targetUser.email,
       });
 
+      const masked = maskEmailAddress(targetUser.email);
+
       if (!delivery.sent && delivery.provider !== 'none') {
         res.status(502).json({
           ok: false,
           emailSent: false,
           userId: targetUser.userId,
           username: targetUser.username,
-          recipient: targetUser.email,
-          targetEmail: targetUser.email,
-          maskedEmail: maskEmailAddress(targetUser.email),
+          maskedEmail: masked,
           error:
             delivery.error ||
-            `Failed to deliver password reset email to ${targetUser.email}. Please check SMTP/Resend settings.`,
+            `Failed to deliver password reset email to ${masked}. Please check SMTP/Resend settings.`,
         });
         return;
       }
@@ -1661,10 +1547,8 @@ export function createApiRouter(): Router {
           providerConfigured: false,
           userId: targetUser.userId,
           username: targetUser.username,
-          recipient: targetUser.email,
-          targetEmail: targetUser.email,
-          maskedEmail: maskEmailAddress(targetUser.email),
-          message: `Email gateway (SMTP_USER/SMTP_PASS or RESEND_API_KEY) is not configured yet. Configure it to send OTP emails to ${targetUser.email}, or verify ownership directly with Google (${targetUser.email}) below.`,
+          maskedEmail: masked,
+          message: `Email gateway (SMTP_USER/SMTP_PASS or RESEND_API_KEY) is not configured yet. Verify account ownership with Google Sign-In (${masked}) below.`,
         });
         return;
       }
@@ -1676,12 +1560,10 @@ export function createApiRouter(): Router {
         provider: delivery.provider,
         userId: targetUser.userId,
         username: targetUser.username,
-        recipient: targetUser.email,
-        targetEmail: targetUser.email,
-        maskedEmail: maskEmailAddress(targetUser.email),
+        maskedEmail: masked,
         expiresInMinutes: 15,
         otpToken,
-        message: `A 6-digit password reset code has been sent to ${targetUser.email}.`,
+        message: `A 6-digit password reset code has been sent to ${masked}.`,
       });
     } catch (err) {
       res.status(500).json({
@@ -1693,10 +1575,13 @@ export function createApiRouter(): Router {
 
   const handleVerifyCode = (req: Request, res: Response) => {
     try {
+      if (!checkRateLimit(req, 'reset-verify', 15, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many verification attempts.' });
+        return;
+      }
       const body = (req.body || {}) as {
         otp?: unknown;
         otpToken?: unknown;
-        identifier?: unknown;
         userId?: unknown;
       };
       const otp = typeof body.otp === 'string' ? body.otp.trim() : '';
@@ -1706,20 +1591,16 @@ export function createApiRouter(): Router {
       const targetUserId =
         signedPayload?.userId ||
         (typeof body.userId === 'string' && body.userId.trim()) ||
-        ADMIN_USER_ID;
-      const storedForUser =
-        state.pendingOtps[`reset:${targetUserId}`] ||
-        (targetUserId === ADMIN_USER_ID ? state.pendingOtp : null);
+        '';
+      const storedForUser = targetUserId ? state.pendingOtps[`reset:${targetUserId}`] || null : null;
 
-      const targetEmail =
-        signedPayload?.email || storedForUser?.email || RECOVERY_EMAIL;
-      const targetUsername =
-        signedPayload?.username || storedForUser?.username || ADMIN_USERNAME;
+      const targetEmail = signedPayload?.email || storedForUser?.email || '';
+      const targetUsername = signedPayload?.username || storedForUser?.username || '';
 
       if (!/^\d{6}$/.test(otp)) {
         res.status(400).json({
           ok: false,
-          error: `Please enter the 6-digit verification code sent to ${targetEmail}.`,
+          error: 'Please enter the 6-digit verification code sent to your email.',
         });
         return;
       }
@@ -1731,10 +1612,11 @@ export function createApiRouter(): Router {
               storedForUser && storedForUser.otpHash === signedPayload.otpHash
                 ? storedForUser.attempts
                 : 0,
+            salt: undefined,
           }
         : storedForUser;
 
-      if (!activeOtp) {
+      if (!activeOtp || !targetUserId) {
         res.status(400).json({
           ok: false,
           error: 'No active reset code found. Please request a fresh code first.',
@@ -1744,11 +1626,7 @@ export function createApiRouter(): Router {
       if (Date.now() > activeOtp.expiresAt) {
         const nextOtps = { ...state.pendingOtps };
         delete nextOtps[`reset:${targetUserId}`];
-        state = {
-          ...state,
-          pendingOtp: targetUserId === ADMIN_USER_ID ? null : state.pendingOtp,
-          pendingOtps: nextOtps,
-        };
+        state = { ...state, pendingOtps: nextOtps };
         saveServerState(state);
         res.status(400).json({
           ok: false,
@@ -1759,11 +1637,7 @@ export function createApiRouter(): Router {
       if (activeOtp.attempts >= 5) {
         const nextOtps = { ...state.pendingOtps };
         delete nextOtps[`reset:${targetUserId}`];
-        state = {
-          ...state,
-          pendingOtp: targetUserId === ADMIN_USER_ID ? null : state.pendingOtp,
-          pendingOtps: nextOtps,
-        };
+        state = { ...state, pendingOtps: nextOtps };
         saveServerState(state);
         res.status(429).json({
           ok: false,
@@ -1772,13 +1646,12 @@ export function createApiRouter(): Router {
         return;
       }
 
-      const matches = verifyHashedSecret(otp, activeOtp.salt, activeOtp.otpHash);
+      const matches = verifyOtpSecret(otp, activeOtp.otpHash, activeOtp.salt);
       if (!matches) {
         if (storedForUser) {
           const bumped = { ...storedForUser, attempts: storedForUser.attempts + 1 };
           state = {
             ...state,
-            pendingOtp: targetUserId === ADMIN_USER_ID ? bumped : state.pendingOtp,
             pendingOtps: {
               ...state.pendingOtps,
               [`reset:${targetUserId}`]: bumped,
@@ -1804,7 +1677,7 @@ export function createApiRouter(): Router {
         verifiedToken,
         userId: targetUserId,
         username: targetUsername,
-        targetEmail,
+        maskedEmail: maskEmailAddress(targetEmail),
         message: 'Verification code confirmed. Enter your new password below.',
       });
     } catch (err) {
@@ -1818,8 +1691,79 @@ export function createApiRouter(): Router {
   router.post('/auth/verify-code', handleVerifyCode);
   router.post('/auth/verify-otp', handleVerifyCode);
 
+  router.post('/auth/reset/verify-google', async (req: Request, res: Response) => {
+    try {
+      if (!checkRateLimit(req, 'reset-verify-google', 10, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many Google verification attempts.' });
+        return;
+      }
+      const body = (req.body || {}) as {
+        identifier?: string;
+        userId?: string;
+        firebaseIdToken?: string;
+      };
+      const lookupKey =
+        (typeof body.userId === 'string' && body.userId.trim()) ||
+        (typeof body.identifier === 'string' && body.identifier.trim()) ||
+        '';
+      const targetUser = lookupKey ? findUserInState(lookupKey) : null;
+      if (!targetUser) {
+        res.status(404).json({
+          ok: false,
+          error: 'Target CRM account not found for password reset.',
+        });
+        return;
+      }
+      const accountEnabled =
+        targetUser.isEnabled !== undefined ? targetUser.isEnabled !== false : targetUser.isActive !== false;
+      if (!accountEnabled && normalizeServerRole(targetUser.role) !== 'owner') {
+        res.status(403).json({
+          ok: false,
+          error: 'This account is disabled. Contact your company administrator.',
+        });
+        return;
+      }
+      const token = typeof body.firebaseIdToken === 'string' ? body.firebaseIdToken.trim() : '';
+      if (!token) {
+        res.status(400).json({ ok: false, error: 'Google ID token is required.' });
+        return;
+      }
+      const verified = await verifyFirebaseIdToken(token, targetUser.email);
+      if (!verified.ok) {
+        res.status(403).json({
+          ok: false,
+          error: verified.error || 'Google verification does not match this account.',
+        });
+        return;
+      }
+      const verifiedToken = signVerifiedResetToken({
+        userId: targetUser.userId,
+        username: targetUser.username,
+        email: targetUser.email,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+      res.json({
+        ok: true,
+        verifiedToken,
+        userId: targetUser.userId,
+        username: targetUser.username,
+        maskedEmail: maskEmailAddress(targetUser.email),
+        message: 'Google account verified. Enter your new password below.',
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unable to verify Google identity.',
+      });
+    }
+  });
+
   router.post('/auth/reset-password', async (req: Request, res: Response) => {
     try {
+      if (!checkRateLimit(req, 'reset-password', 10, 60_000)) {
+        res.status(429).json({ ok: false, error: 'Too many password reset attempts.' });
+        return;
+      }
       const body = (req.body || {}) as {
         mode?: 'otp' | 'google';
         identifier?: string;
@@ -1829,18 +1773,16 @@ export function createApiRouter(): Router {
         verifiedToken?: string;
         firebaseIdToken?: string;
         newPassword?: string;
-        clientCredentialTokens?: unknown;
       };
       const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
-      if (newPassword.length < 6 || newPassword.length > 128) {
+      if (newPassword.length < 8 || newPassword.length > 128) {
         res.status(400).json({
           ok: false,
-          error: 'New password must be between 6 and 128 characters.',
+          error: 'New password must be between 8 and 128 characters.',
         });
         return;
       }
 
-      const pool = buildUserPool(req, body as Record<string, unknown>);
       const verifiedClaim =
         typeof body.verifiedToken === 'string' && body.verifiedToken
           ? verifyVerifiedResetToken(body.verifiedToken)
@@ -1853,9 +1795,9 @@ export function createApiRouter(): Router {
         signedOtpPayload?.userId ||
         (typeof body.userId === 'string' && body.userId.trim()) ||
         (typeof body.identifier === 'string' && body.identifier.trim()) ||
-        ADMIN_USER_ID;
+        '';
 
-      const targetUser = findUserInPool(pool, lookupKey);
+      const targetUser = lookupKey ? findUserInState(lookupKey) : null;
       if (!targetUser) {
         res.status(404).json({
           ok: false,
@@ -1870,7 +1812,7 @@ export function createApiRouter(): Router {
           res.status(400).json({ ok: false, error: 'Google verification token is required.' });
           return;
         }
-        const verified = await verifyGoogleIdTokenForEmail(token, targetUser.email);
+        const verified = await verifyFirebaseIdToken(token, targetUser.email);
         if (!verified.ok) {
           res.status(403).json({ ok: false, error: verified.error || 'Google verification failed.' });
           return;
@@ -1893,9 +1835,7 @@ export function createApiRouter(): Router {
           }
         } else {
           const otp = typeof body.otp === 'string' ? body.otp.trim() : '';
-          const storedForUser =
-            state.pendingOtps[`reset:${targetUser.userId}`] ||
-            (targetUser.role === 'admin' ? state.pendingOtp : null);
+          const storedForUser = state.pendingOtps[`reset:${targetUser.userId}`] || null;
           const activeOtp = signedOtpPayload
             ? {
                 ...signedOtpPayload,
@@ -1903,6 +1843,7 @@ export function createApiRouter(): Router {
                   storedForUser && storedForUser.otpHash === signedOtpPayload.otpHash
                     ? storedForUser.attempts
                     : 0,
+                salt: undefined,
               }
             : storedForUser;
 
@@ -1916,11 +1857,7 @@ export function createApiRouter(): Router {
           if (Date.now() > activeOtp.expiresAt) {
             const nextOtps = { ...state.pendingOtps };
             delete nextOtps[`reset:${targetUser.userId}`];
-            state = {
-              ...state,
-              pendingOtp: targetUser.role === 'admin' ? null : state.pendingOtp,
-              pendingOtps: nextOtps,
-            };
+            state = { ...state, pendingOtps: nextOtps };
             saveServerState(state);
             res.status(400).json({
               ok: false,
@@ -1931,11 +1868,7 @@ export function createApiRouter(): Router {
           if (activeOtp.attempts >= 5) {
             const nextOtps = { ...state.pendingOtps };
             delete nextOtps[`reset:${targetUser.userId}`];
-            state = {
-              ...state,
-              pendingOtp: targetUser.role === 'admin' ? null : state.pendingOtp,
-              pendingOtps: nextOtps,
-            };
+            state = { ...state, pendingOtps: nextOtps };
             saveServerState(state);
             res.status(429).json({
               ok: false,
@@ -1943,13 +1876,11 @@ export function createApiRouter(): Router {
             });
             return;
           }
-          const matches = verifyHashedSecret(otp, activeOtp.salt, activeOtp.otpHash);
-          if (!matches) {
+          if (!verifyOtpSecret(otp, activeOtp.otpHash, activeOtp.salt)) {
             if (storedForUser) {
               const bumped = { ...storedForUser, attempts: storedForUser.attempts + 1 };
               state = {
                 ...state,
-                pendingOtp: targetUser.role === 'admin' ? bumped : state.pendingOtp,
                 pendingOtps: {
                   ...state.pendingOtps,
                   [`reset:${targetUser.userId}`]: bumped,
@@ -1966,12 +1897,14 @@ export function createApiRouter(): Router {
         }
       }
 
-      const nextHash = hashSecret(newPassword);
+      const passwordHash = await hashPasswordBcrypt(newPassword);
       const updatedAt = new Date().toISOString();
       const updatedUser: CrmServerUserRecord = {
         ...targetUser,
-        salt: nextHash.salt,
-        hash: nextHash.hash,
+        passwordHash,
+        salt: undefined,
+        hash: undefined,
+        passwordChangedAt: updatedAt,
         updatedAt,
       };
 
@@ -1980,16 +1913,6 @@ export function createApiRouter(): Router {
 
       state = {
         ...state,
-        ...(targetUser.role === 'admin'
-          ? {
-              passwordRecord: {
-                salt: nextHash.salt,
-                hash: nextHash.hash,
-                updatedAt,
-              },
-              pendingOtp: null,
-            }
-          : {}),
         users: {
           ...state.users,
           [updatedUser.userId]: updatedUser,
@@ -1998,21 +1921,11 @@ export function createApiRouter(): Router {
       };
       saveServerState(state);
 
-      const credentialToken = signUserCredentialToken(updatedUser);
-      if (targetUser.role === 'admin') {
-        const isHttps =
-          req.secure || req.headers['x-forwarded-proto'] === 'https' || IS_VERCEL;
-        res.setHeader(
-          'Set-Cookie',
-          `vansh_crm_pwd=${encodeURIComponent(credentialToken)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isHttps ? '; Secure' : ''}`,
-        );
-      }
-
+      const company = getCompanySummary(updatedUser.companyId);
       res.json({
         ok: true,
         username: updatedUser.username,
-        user: sanitizeServerUserForClient(updatedUser),
-        credentialToken,
+        user: sanitizeServerUserForClient(updatedUser, company?.companyName),
         message: 'Password has been reset successfully. You can now log in with your new password.',
       });
     } catch (err) {
@@ -2023,136 +1936,296 @@ export function createApiRouter(): Router {
     }
   });
 
-  router.get('/auth/secondary-users', async (req: Request, res: Response) => {
-    if (!(await isAdminAuthorizedRequest(req))) {
-      res.status(403).json({
-        ok: false,
-        error: 'Admin session authorization is required to view secondary accounts.',
-      });
+  // Company Workspace Profile & Plan Management (Strictly company-isolated & authenticated)
+  router.get('/company/profile', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    const company = getCompanySummary(caller.companyId);
+    if (!company) {
+      res.status(404).json({ ok: false, error: 'Company workspace not found.' });
       return;
     }
-    const secondaryUsers = deduplicateServerSecondaryUsers(Object.values(state.users || {}));
-
+    const membersCount = Object.values(state.users).filter(
+      (u) => u.companyId === caller.companyId,
+    ).length;
     res.json({
       ok: true,
-      users: secondaryUsers,
+      company,
+      quotas: PLAN_QUOTAS[company.plan || 'starter'],
+      usage: {
+        usersCount: membersCount,
+        aiScansUsed: company.usage.aiScansUsed,
+        monthKey: company.usage.monthKey,
+      },
     });
   });
 
-  router.post('/auth/secondary-users/status', async (req: Request, res: Response) => {
+  router.put('/company/profile', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'billing.manage', res)) return;
+    const existing = getCompanySummary(caller.companyId);
+    if (!existing) {
+      res.status(404).json({ ok: false, error: 'Company workspace not found.' });
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      companyName?: unknown;
+      gstin?: unknown;
+      udyamNumber?: unknown;
+      plan?: unknown;
+    };
+    const nextName =
+      typeof body.companyName === 'string' && body.companyName.trim().length >= 2
+        ? body.companyName.trim().slice(0, 120)
+        : existing.companyName;
+    const nextGstin =
+      typeof body.gstin === 'string' ? body.gstin.trim().toUpperCase().slice(0, 32) : existing.gstin;
+    const nextUdyam =
+      typeof body.udyamNumber === 'string'
+        ? body.udyamNumber.trim().toUpperCase().slice(0, 40)
+        : existing.udyamNumber;
+    const nextPlan: CompanyPlanTier =
+      body.plan === 'starter' || body.plan === 'professional' || body.plan === 'business'
+        ? body.plan
+        : existing.plan;
+
+    const updated: CompanyServerRecord = {
+      ...existing,
+      companyName: nextName,
+      gstin: nextGstin,
+      udyamNumber: nextUdyam,
+      plan: nextPlan,
+      updatedAt: new Date().toISOString(),
+    };
+    const nextUsers = { ...state.users };
+    for (const [uid, u] of Object.entries(nextUsers)) {
+      if (u.companyId === caller.companyId) {
+        nextUsers[uid] = { ...u, companyName: nextName };
+      }
+    }
+    state = {
+      ...state,
+      companies: { ...state.companies, [caller.companyId]: updated },
+      users: nextUsers,
+    };
+    saveServerState(state);
+
+    res.json({
+      ok: true,
+      company: updated,
+      quotas: PLAN_QUOTAS[updated.plan],
+    });
+  });
+
+  router.get('/company/team', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'team.manage', res)) return;
+    const company = getCompanySummary(caller.companyId);
+    const members = listCompanyTeamUsers(caller.companyId);
+    const invites = Object.values(state.invites)
+      .filter((inv) => inv.companyId === caller.companyId && !inv.usedAt && Date.now() < inv.expiresAt)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    res.json({
+      ok: true,
+      company,
+      members,
+      invites,
+    });
+  });
+
+  router.post('/company/team/invite', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'team.manage', res)) return;
+    const company = getCompanySummary(caller.companyId);
+    if (!company) {
+      res.status(404).json({ ok: false, error: 'Company workspace not found.' });
+      return;
+    }
+
+    const body = (req.body || {}) as { email?: unknown; role?: unknown };
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const role = normalizeServerRole(typeof body.role === 'string' ? body.role : 'executive');
+    if (role === 'owner') {
+      res.status(403).json({ ok: false, error: 'Cannot invite another company owner directly.' });
+      return;
+    }
+    if (!email || !isValidEmailAddress(email)) {
+      res.status(400).json({ ok: false, error: 'Valid team member email address is required.' });
+      return;
+    }
+
+    const currentUsers = Object.values(state.users).filter((u) => u.companyId === caller.companyId);
+    const quota = PLAN_QUOTAS[company.plan || 'starter'];
+    if (currentUsers.length >= quota.maxUsers) {
+      res.status(403).json({
+        ok: false,
+        code: 'PLAN_USER_LIMIT',
+        error: `User limit (${quota.maxUsers}) reached for ${quota.label} plan. Upgrade plan to invite more members.`,
+      });
+      return;
+    }
+
+    const inviteCode = `INV-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    const invite: CompanyInviteRecord = {
+      inviteCode,
+      companyId: caller.companyId,
+      companyName: company.companyName,
+      email,
+      role,
+      invitedByUserId: caller.userId,
+      createdAt: new Date().toISOString(),
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    };
+
+    state = {
+      ...state,
+      invites: { ...state.invites, [inviteCode]: invite },
+    };
+    saveServerState(state);
+
+    res.status(201).json({ ok: true, invite });
+  });
+
+  router.post('/company/team/role', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'team.manage', res)) return;
+
+    const body = (req.body || {}) as { userId?: unknown; role?: unknown; isEnabled?: unknown };
+    const targetUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
+    if (!targetUserId) {
+      res.status(400).json({ ok: false, error: 'target userId is required.' });
+      return;
+    }
+    const target = state.users[targetUserId];
+    if (!target) {
+      res.status(404).json({ ok: false, error: 'Team member not found.' });
+      return;
+    }
+    if (target.companyId !== caller.companyId) {
+      res.status(403).json({
+        ok: false,
+        error: 'Cross-company access denied. Cannot manage users from another company.',
+      });
+      return;
+    }
+    if (normalizeServerRole(target.role) === 'owner') {
+      res.status(403).json({ ok: false, error: 'Workspace Owner role cannot be modified or disabled.' });
+      return;
+    }
+
+    const nextRole =
+      typeof body.role === 'string' ? normalizeServerRole(body.role) : normalizeServerRole(target.role);
+    if (nextRole === 'owner') {
+      res.status(403).json({ ok: false, error: 'Cannot promote a member to owner directly.' });
+      return;
+    }
+    const nextEnabled =
+      typeof body.isEnabled === 'boolean'
+        ? body.isEnabled
+        : target.isEnabled !== undefined
+          ? target.isEnabled !== false
+          : target.isActive !== false;
+
+    const nowIso = new Date().toISOString();
+    const updated: CrmServerUserRecord = {
+      ...target,
+      role: nextRole,
+      isEnabled: nextEnabled,
+      isActive: nextEnabled ? computeServerPresenceStatus(target) === 'active' : false,
+      disabledAt: nextEnabled ? undefined : nowIso,
+      presenceStatus: nextEnabled ? target.presenceStatus ?? 'not_active' : 'not_active',
+      updatedAt: nowIso,
+    };
+
+    state = {
+      ...state,
+      users: { ...state.users, [updated.userId]: updated },
+    };
+    saveServerState(state);
+
+    res.json({
+      ok: true,
+      member: sanitizeServerUserForClient(updated, state.companies[caller.companyId]?.companyName),
+    });
+  });
+
+  // Backwards-compatible team directory routes (strictly authenticated & company-scoped)
+  router.get('/auth/secondary-users', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!isWorkspaceAdminRole(caller.role)) {
+      res.status(403).json({
+        ok: false,
+        error: 'Workspace administrator authorization is required to view team accounts.',
+      });
+      return;
+    }
+    const companyUsers = listCompanyTeamUsers(caller.companyId).filter(
+      (u) => u.userId !== caller.userId,
+    );
+    res.json({
+      ok: true,
+      users: companyUsers,
+    });
+  });
+
+  router.post('/auth/secondary-users/status', (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!isWorkspaceAdminRole(caller.role)) {
+      res.status(403).json({
+        ok: false,
+        error: 'Workspace administrator authorization is required to update team member access.',
+      });
+      return;
+    }
+
     const body = (req.body || {}) as {
       userId?: unknown;
       username?: unknown;
       email?: unknown;
-      aliasUserIds?: unknown;
       isEnabled?: unknown;
-      byocProjectId?: unknown;
-      firebaseIdToken?: unknown;
-      clientCredentialTokens?: unknown;
     };
-
-    if (!(await isAdminAuthorizedRequest(req, body as Record<string, unknown>))) {
-      res.status(403).json({
-        ok: false,
-        error: 'Admin session authorization is required to change secondary user status.',
-      });
-      return;
-    }
 
     const rawUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
     const rawUsername = typeof body.username === 'string' ? body.username.trim() : '';
     const rawEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
-    const aliasUserIds = Array.isArray(body.aliasUserIds)
-      ? body.aliasUserIds.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-      : [];
     const targetIdentifier = rawUserId || rawUsername || rawEmail;
     if (!targetIdentifier || typeof body.isEnabled !== 'boolean') {
       res.status(400).json({ ok: false, error: 'userId and boolean isEnabled are required.' });
       return;
     }
 
-    const pool = buildUserPool(req, body as Record<string, unknown>);
-    let target =
-      pool.get(targetIdentifier) ||
-      findUserInPool(pool, targetIdentifier) ||
-      (rawEmail ? findUserInPool(pool, rawEmail) : null) ||
-      (rawUsername ? findUserInPool(pool, rawUsername) : null);
+    const target =
+      state.users[targetIdentifier] ||
+      findUserInState(targetIdentifier, caller.companyId) ||
+      (rawEmail ? findUserInState(rawEmail, caller.companyId) : null) ||
+      (rawUsername ? findUserInState(rawUsername, caller.companyId) : null);
 
     if (!target) {
-      for (const aliasId of aliasUserIds) {
-        const hit = pool.get(aliasId) || findUserInPool(pool, aliasId);
-        if (hit && hit.role !== 'admin') {
-          target = hit;
-          break;
-        }
-      }
+      res.status(404).json({ ok: false, error: 'Team member account not found in your company.' });
+      return;
+    }
+    if (target.companyId !== caller.companyId) {
+      res.status(403).json({
+        ok: false,
+        error: 'Cross-company access denied.',
+      });
+      return;
+    }
+    if (normalizeServerRole(target.role) === 'owner') {
+      res.status(403).json({ ok: false, error: 'Workspace Owner account cannot be disabled.' });
+      return;
     }
 
     const nowIso = new Date().toISOString();
     const isEnabled = body.isEnabled;
-
-    if (!target) {
-      // Handle serverless cold-starts where secondary user exists in Firestore / Admin UI
-      // without being in this ephemeral lambda's /tmp state yet.
-      if (
-        rawUsername &&
-        rawEmail &&
-        isValidEmailAddress(rawEmail) &&
-        rawUsername.toLowerCase() !== ADMIN_USERNAME.toLowerCase() &&
-        rawEmail !== RECOVERY_EMAIL.toLowerCase()
-      ) {
-        const { salt, hash } = hashSecret(crypto.randomBytes(16).toString('hex'));
-        target = {
-          userId: rawUserId || `sec_${rawUsername.toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`,
-          username: rawUsername,
-          email: rawEmail,
-          role: 'secondary',
-          salt,
-          hash,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          isActive: false,
-          isEnabled,
-          presenceStatus: 'not_active',
-          byocProjectId:
-            typeof body.byocProjectId === 'string' && body.byocProjectId.trim()
-              ? body.byocProjectId.trim()
-              : undefined,
-        };
-      } else {
-        res.status(404).json({ ok: false, error: 'Secondary user account not found.' });
-        return;
-      }
-    }
-
-    if (target.role === 'admin') {
-      res.status(404).json({ ok: false, error: 'Secondary user account not found.' });
-      return;
-    }
-
-    const targetEmail = (rawEmail || target.email || '').trim().toLowerCase();
-    const matchedIds = new Set<string>([target.userId, ...aliasUserIds]);
-    if (rawUserId) matchedIds.add(rawUserId);
-
-    const nextUsers = { ...state.users };
-    for (const [uid, existingUser] of Object.entries(nextUsers)) {
-      if (existingUser.role === 'admin') continue;
-      const matchesSameAccount =
-        matchedIds.has(uid) ||
-        matchedIds.has(existingUser.userId) ||
-        (targetEmail && existingUser.email.trim().toLowerCase() === targetEmail);
-      if (!matchesSameAccount) continue;
-      matchedIds.add(existingUser.userId);
-      nextUsers[uid] = {
-        ...existingUser,
-        isEnabled,
-        isActive: isEnabled ? computeServerPresenceStatus(existingUser) === 'active' : false,
-        disabledAt: isEnabled ? undefined : nowIso,
-        presenceStatus: isEnabled ? existingUser.presenceStatus ?? 'not_active' : 'not_active',
-        updatedAt: nowIso,
-      };
-    }
-
     const updatedUser: CrmServerUserRecord = {
       ...target,
       isEnabled,
@@ -2161,18 +2234,16 @@ export function createApiRouter(): Router {
       presenceStatus: isEnabled ? target.presenceStatus ?? 'not_active' : 'not_active',
       updatedAt: nowIso,
     };
-    nextUsers[updatedUser.userId] = updatedUser;
 
     state = {
       ...state,
-      users: nextUsers,
+      users: { ...state.users, [updatedUser.userId]: updatedUser },
     };
     saveServerState(state);
 
     res.json({
       ok: true,
-      user: sanitizeServerUserForClient(updatedUser, Array.from(matchedIds)),
-      credentialToken: signUserCredentialToken(updatedUser),
+      user: sanitizeServerUserForClient(updatedUser, state.companies[caller.companyId]?.companyName),
       message: isEnabled
         ? `Re-enabled access for ${updatedUser.username}.`
         : `Disabled access for ${updatedUser.username}. Active sessions will be locked out.`,
@@ -2180,21 +2251,34 @@ export function createApiRouter(): Router {
   });
 
   router.get('/notifications/email/status', (req: Request, res: Response) => {
-    const provider = detectEmailProvider();
-    const tenantId =
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+
+    const requestedTenant =
       typeof req.query.tenantId === 'string' && req.query.tenantId.trim()
         ? req.query.tenantId.trim()
-        : ADMIN_USER_ID;
-    const isAdminTenant = tenantId === ADMIN_USER_ID;
-    const scopedLogs = state.emailLogs.filter((entry) =>
-      isAdminTenant ? !entry.tenantId || entry.tenantId === ADMIN_USER_ID : entry.tenantId === tenantId,
+        : caller.companyId;
+    if (
+      requestedTenant !== caller.companyId &&
+      requestedTenant !== caller.userId
+    ) {
+      res.status(403).json({ ok: false, error: 'Cross-company notification access denied.' });
+      return;
+    }
+
+    const provider = detectEmailProvider();
+    const scopedLogs = state.emailLogs.filter(
+      (entry) =>
+        entry.companyId === caller.companyId ||
+        entry.tenantId === caller.companyId ||
+        entry.tenantId === caller.userId,
     );
     res.json({
       ok: true,
       provider,
       automatedConfigured: provider !== 'none',
-      defaultRecipientName: isAdminTenant ? DEFAULT_EMAIL_RECIPIENT_NAME : '',
-      defaultRecipientEmail: isAdminTenant ? RECOVERY_EMAIL : '',
+      defaultRecipientName: caller.username,
+      defaultRecipientEmail: caller.email,
       scheduleLabels: ['11:00 AM IST', '4:00 PM IST'],
       logs: scopedLogs,
     });
@@ -2202,6 +2286,10 @@ export function createApiRouter(): Router {
 
   router.post('/notifications/email', async (req: Request, res: Response) => {
     try {
+      const caller = requireAuth(req, res);
+      if (!caller) return;
+      if (!requirePermission(caller, 'alerts.send', res)) return;
+
       const body = (req.body || {}) as {
         tenantId?: string;
         slotKey?: string;
@@ -2216,20 +2304,20 @@ export function createApiRouter(): Router {
         html?: string;
       };
 
-      const tenantId =
+      const requestedTenant =
         typeof body.tenantId === 'string' && body.tenantId.trim()
           ? body.tenantId.trim()
-          : ADMIN_USER_ID;
-      const isAdminTenant = tenantId === ADMIN_USER_ID;
+          : caller.companyId;
+      if (requestedTenant !== caller.companyId && requestedTenant !== caller.userId) {
+        res.status(403).json({ ok: false, error: 'Cross-company notification dispatch denied.' });
+        return;
+      }
+
       const slot = body.slot || 'slot_11am';
       const tenderId = String(body.tenderId || '').trim();
       const tenderRefId = String(body.tenderRefId || tenderId).trim();
-      const recipientName = String(
-        body.recipientName || (isAdminTenant ? DEFAULT_EMAIL_RECIPIENT_NAME : 'User'),
-      ).trim();
-      const recipientEmail = String(
-        body.recipientEmail || (isAdminTenant ? RECOVERY_EMAIL : ''),
-      ).trim();
+      const recipientName = String(body.recipientName || caller.username).trim();
+      const recipientEmail = String(body.recipientEmail || caller.email).trim();
       const dueDateIso = String(body.dueDateIso || '').trim();
       const subject = String(body.subject || `NEW TENDER ALERT NOTIFICATION · ${tenderId}`).trim();
       const message = String(body.message || '').trim();
@@ -2246,14 +2334,19 @@ export function createApiRouter(): Router {
       const rawSlotKey =
         (typeof body.slotKey === 'string' && body.slotKey.trim()) ||
         `${tenderRefId}__${dueDateIso || 'none'}__${slot}`;
-      const slotKey = isAdminTenant ? rawSlotKey : `${tenantId}::${rawSlotKey}`;
+      const scopedSlotKey = `${caller.companyId}::${rawSlotKey}`;
 
       if (slot !== 'test' && slot !== 'manual') {
         const existingLog = state.emailLogs.find((l) => {
-          const logTenantMatches = isAdminTenant
-            ? !l.tenantId || l.tenantId === ADMIN_USER_ID
-            : l.tenantId === tenantId;
-          return logTenantMatches && (l.slotKey === slotKey || l.slotKey === rawSlotKey) && l.status === 'sent';
+          const sameCompany =
+            l.companyId === caller.companyId ||
+            l.tenantId === caller.companyId ||
+            l.tenantId === caller.userId;
+          return (
+            sameCompany &&
+            (l.slotKey === scopedSlotKey || l.slotKey === rawSlotKey) &&
+            l.status === 'sent'
+          );
         });
         if (existingLog) {
           res.json({
@@ -2276,8 +2369,9 @@ export function createApiRouter(): Router {
 
       const entry: ServerEmailAlertLogEntry = {
         id: `emlog-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        tenantId,
-        slotKey,
+        tenantId: requestedTenant,
+        companyId: caller.companyId,
+        slotKey: scopedSlotKey,
         tenderRefId,
         tenderId,
         slot,
@@ -2315,6 +2409,10 @@ export function createApiRouter(): Router {
   });
 
   router.post('/tenders/extract-pdf', async (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'ai.scan', res)) return;
+
     const routeStartedAt = Date.now();
     const TOTAL_ROUTE_BUDGET_MS = 54_000;
     const PRIMARY_ATTEMPT_TIMEOUT_MS = 14_000;
@@ -2366,6 +2464,10 @@ export function createApiRouter(): Router {
           retryable: false,
           error: 'Only PDF (.pdf) bid documents are supported for Bid Search scanning.',
         });
+        return;
+      }
+
+      if (!ensureAiQuotaAvailable(caller.companyId, res)) {
         return;
       }
 
@@ -2628,6 +2730,9 @@ export function createApiRouter(): Router {
         }
       }
 
+      checkAndIncrementAiQuota(caller.companyId, res);
+      if (res.headersSent) return;
+
       const extracted = normalizeExtractedBidDraft(parsed, fileName);
       res.status(200).json({
         ok: true,
@@ -2664,23 +2769,11 @@ export function createApiRouter(): Router {
     }
   });
 
-  function isValidAppsScriptUrl(rawUrl: string): boolean {
-    const trimmed = (rawUrl || '').trim();
-    if (!trimmed || trimmed.length > 500) return false;
-    try {
-      const parsed = new URL(trimmed);
-      if (parsed.protocol !== 'https:') return false;
-      const host = parsed.hostname.toLowerCase();
-      if (host === 'script.google.com' || host === 'script.googleusercontent.com') {
-        return parsed.pathname.startsWith('/macros/');
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
   router.post('/sheet-sync', async (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'sheets.sync', res)) return;
+
     const body = (req.body || {}) as {
       webhookUrl?: unknown;
       payload?: unknown;
@@ -2705,12 +2798,10 @@ export function createApiRouter(): Router {
     }
 
     try {
-      const upstream = await fetch(webhookUrl, {
+      const upstream = await safeFetchAppsScript(webhookUrl, {
         method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body.payload),
-        signal: AbortSignal.timeout(15000),
+        timeoutMs: 15000,
       });
 
       const rawText = await upstream.text();
@@ -2787,6 +2878,10 @@ export function createApiRouter(): Router {
   });
 
   router.post('/sheet-sync/pull', async (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'sheets.sync', res)) return;
+
     const body = (req.body || {}) as { webhookUrl?: unknown };
     const webhookUrl = typeof body.webhookUrl === 'string' ? body.webhookUrl.trim() : '';
 
@@ -2799,10 +2894,9 @@ export function createApiRouter(): Router {
     }
 
     try {
-      const upstream = await fetch(webhookUrl, {
+      const upstream = await safeFetchAppsScript(webhookUrl, {
         method: 'GET',
-        redirect: 'follow',
-        signal: AbortSignal.timeout(15000),
+        timeoutMs: 15000,
       });
       const text = await upstream.text();
       const trimmed = text.trim();
@@ -2833,6 +2927,10 @@ export function createApiRouter(): Router {
   });
 
   router.post('/maf/extract-from-attachments', async (req: Request, res: Response) => {
+    const caller = requireAuth(req, res);
+    if (!caller) return;
+    if (!requirePermission(caller, 'ai.scan', res)) return;
+
     const routeStartedAt = Date.now();
     const TOTAL_ROUTE_BUDGET_MS = 54_000;
     const PRIMARY_ATTEMPT_TIMEOUT_MS = 14_000;
@@ -2956,6 +3054,10 @@ export function createApiRouter(): Router {
           error:
             'Gemini API key is not configured on the server to extract MAF items from PDF/image attachments.',
         });
+        return;
+      }
+
+      if (!ensureAiQuotaAvailable(caller.companyId, res)) {
         return;
       }
 
@@ -3084,6 +3186,9 @@ export function createApiRouter(): Router {
           : built2?.plainText
             ? parsePlainTextSpecItems(built2.plainText)
             : [];
+
+      checkAndIncrementAiQuota(caller.companyId, res);
+      if (res.headersSent) return;
 
       res.status(200).json({
         ok: true,

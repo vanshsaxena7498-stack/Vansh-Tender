@@ -286,7 +286,11 @@ export interface CrmBackupPayload {
   oemDetails?: OemRecord[];
 }
 
-export type CrmUserRole = 'admin' | 'secondary';
+export type TeamRole = 'owner' | 'admin' | 'manager' | 'executive' | 'finance' | 'viewer';
+
+export type CrmUserRole = 'admin' | 'secondary' | TeamRole;
+
+export type CompanyPlanTier = 'starter' | 'professional' | 'business';
 
 export type PresenceStatus = 'active' | 'not_active';
 
@@ -312,11 +316,29 @@ export interface ByocConnectionState {
   verifiedAt?: string;
 }
 
+export interface CompanyWorkspaceSummary {
+  companyId: string;
+  companyName: string;
+  gstin?: string;
+  udyamNumber?: string;
+  gemSellerId?: string;
+  plan: CompanyPlanTier;
+  createdAt: string;
+  updatedAt: string;
+  usage?: {
+    monthKey: string;
+    aiPdfScans: number;
+  };
+}
+
 export interface CrmUserSession {
   userId: string;
   username: string;
   email: string;
   role: CrmUserRole;
+  companyId: string;
+  companyName?: string;
+  plan?: CompanyPlanTier;
   createdAt?: string;
   lastLoginAt?: string;
   isEnabled?: boolean;
@@ -334,6 +356,7 @@ export interface SecondaryUserSummary {
   username: string;
   email: string;
   role: CrmUserRole;
+  companyId?: string;
   createdAt: string;
   lastLoginAt?: string;
   isActive: boolean;
@@ -344,5 +367,17 @@ export interface SecondaryUserSummary {
   lastLogoutAt?: string;
   byocProjectId?: string;
   aliasUserIds?: string[];
+}
+
+export interface CompanyInviteSummary {
+  inviteId: string;
+  companyId: string;
+  companyName: string;
+  email: string;
+  role: TeamRole;
+  invitedBy: string;
+  createdAt: string;
+  expiresAt: string;
+  status: 'pending' | 'accepted' | 'revoked';
 }
 

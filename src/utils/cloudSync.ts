@@ -285,14 +285,10 @@ async function runInBatches<T>(
   }
 }
 
-function isBootstrappedAdminUser(user: User | null): boolean {
-  return Boolean(user?.emailVerified && user.email === 'vanshsaxena7498@gmail.com');
-}
-
 function normalizeTenantId(workspaceTenantId?: string | null): string | null {
   if (!workspaceTenantId || typeof workspaceTenantId !== 'string') return null;
   const trimmed = workspaceTenantId.trim();
-  if (!trimmed || trimmed === 'admin_vanshsales') return null;
+  if (!trimmed) return null;
   return sanitizeDocId(trimmed);
 }
 
@@ -502,9 +498,9 @@ function docToProfile(data: Record<string, unknown>): FirmProfile {
 }
 
 function docToPreferences(data: Record<string, unknown>): UserPreferences {
-  const pin = String(data.adminPin ?? '1234');
+  const pin = String(data.adminPin ?? '').trim();
   return {
-    adminPin: /^\d{4}$/.test(pin) ? pin : '1234',
+    adminPin: /^\d{4,6}$/.test(pin) ? pin : '',
     darkMode: Boolean(data.darkMode),
   };
 }
@@ -1797,10 +1793,7 @@ export async function fetchMissingAttachmentsBackground(params: {
   return result;
 }
 
-export const KNOWN_ADMIN_UIDS = [
-  '4uQty7KjogbYUmjY1ZxnJMtn7rj1',
-  'JdizphoE56bNDu7OPtS4WZxrb0H2',
-] as const;
+export const KNOWN_ADMIN_UIDS = [] as const;
 
 export interface CloudWorkspaceDataset {
   profile: FirmProfile | null;
@@ -1847,19 +1840,22 @@ async function safeGetDoc(docRef: ReturnType<typeof doc>) {
 }
 
 /**
- * Strictly for Bootstrapped Primary Admin (vanshsaxena7498@gmail.com).
- * Parallel read-only scan across sibling Admin UIDs, legacy root collections, and the (default) DB.
- * Designed so it can execute in a non-blocking background pass after fast core UI hydration.
+ * Parallel read-only scan across verified admin UIDs / legacy collections in the admin's own project.
  */
 export async function fetchAdminLegacyFallbackWorkspace(
   adminUser: User,
   options?: { includeAttachments?: boolean },
 ): Promise<CloudWorkspaceDataset> {
   const supplemental = createEmptyCloudDataset();
-  if (!isBootstrappedAdminUser(adminUser)) {
+  if (!adminUser?.uid || !adminUser.emailVerified) {
+    return supplemental;
+  }
+  const adminDocSnap = await safeGetDoc(doc(centralDb, 'admins', adminUser.uid));
+  if (!adminDocSnap?.exists()) {
     return supplemental;
   }
 
+  const normalizedAdminEmail = (adminUser.email || '').trim().toLowerCase();
   const includeAttachments = options?.includeAttachments !== false;
   const knownAdminUidSet = new Set<string>([adminUser.uid, ...KNOWN_ADMIN_UIDS]);
   const excludedSecondaryOwnerUids = new Set<string>();
@@ -1902,7 +1898,14 @@ export async function fetchAdminLegacyFallbackWorkspace(
   ) => {
     for (const d of docs) {
       const raw = d.data();
-      if (isLegacyDocExcludedFromAdmin(raw, knownAdminUidSet, excludedSecondaryOwnerUids)) {
+      if (
+        isLegacyDocExcludedFromAdmin(
+          raw,
+          knownAdminUidSet,
+          excludedSecondaryOwnerUids,
+          normalizedAdminEmail,
+        )
+      ) {
         continue;
       }
       if (kind === 'tenders') {
@@ -1968,7 +1971,7 @@ export async function fetchAdminLegacyFallbackWorkspace(
           const rootEmail = String(rootDocSnap.data().email ?? '')
             .trim()
             .toLowerCase();
-          if (rootEmail && rootEmail !== 'vanshsaxena7498@gmail.com') {
+          if (rootEmail && normalizedAdminEmail && rootEmail !== normalizedAdminEmail) {
             excludedSecondaryOwnerUids.add(candidateUid);
             return;
           }

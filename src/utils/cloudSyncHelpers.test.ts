@@ -50,13 +50,16 @@ test('buildCloudProfilePayload enforces blueprint keys and strips oversized phot
   ]);
 });
 
-test('buildCloudPreferencesPayload validates 4-digit PIN and darkMode boolean', () => {
+test('buildCloudPreferencesPayload validates 4-6 digit PIN and darkMode boolean', () => {
   const valid = buildCloudPreferencesPayload({ adminPin: '4321', darkMode: true }, 'uid-1', TOKEN);
   assert.equal(valid.adminPin, '4321');
   assert.equal(valid.darkMode, true);
 
+  const sixDigit = buildCloudPreferencesPayload({ adminPin: '654321', darkMode: false }, 'uid-1', TOKEN);
+  assert.equal(sixDigit.adminPin, '654321');
+
   const fallback = buildCloudPreferencesPayload({ adminPin: 'abc', darkMode: false }, 'uid-1', TOKEN);
-  assert.equal(fallback.adminPin, '1234');
+  assert.equal(fallback.adminPin, '');
   assert.equal(fallback.darkMode, false);
 });
 
@@ -251,14 +254,14 @@ test('buildCloudEmailConfigPayload and buildCloudEmailAlertLogPayload validate b
     './cloudSyncHelpers'
   );
   const cfgPayload = buildCloudEmailConfigPayload(
-    { enabled: true, recipientName: 'Vansh', recipientEmail: 'vanshsaxena7498@gmail.com' },
+    { enabled: true, recipientName: 'Aarav', recipientEmail: 'alerts@acmeinfra.example' },
     'uid-1',
     TOKEN,
   );
   assert.equal(cfgPayload.ownerUid, 'uid-1');
   assert.equal(cfgPayload.enabled, true);
-  assert.equal(cfgPayload.recipientName, 'Vansh');
-  assert.equal(cfgPayload.recipientEmail, 'vanshsaxena7498@gmail.com');
+  assert.equal(cfgPayload.recipientName, 'Aarav');
+  assert.equal(cfgPayload.recipientEmail, 'alerts@acmeinfra.example');
 
   const logPayload = buildCloudEmailAlertLogPayload(
     {
@@ -267,8 +270,8 @@ test('buildCloudEmailConfigPayload and buildCloudEmailAlertLogPayload validate b
       tenderRefId: 'tnd-1',
       tenderId: 'GEM/2026/B/123',
       slot: 'slot_11am',
-      recipientName: 'Vansh',
-      recipientEmail: 'vanshsaxena7498@gmail.com',
+      recipientName: 'Aarav',
+      recipientEmail: 'alerts@acmeinfra.example',
       dueDateIso: '2026-11-15T14:00',
       status: 'sent',
       provider: 'smtp',
@@ -281,7 +284,7 @@ test('buildCloudEmailConfigPayload and buildCloudEmailAlertLogPayload validate b
   );
   assert.equal(logPayload.ownerUid, 'uid-1');
   assert.equal(logPayload.slot, 'slot_11am');
-  assert.equal(logPayload.recipientEmail, 'vanshsaxena7498@gmail.com');
+  assert.equal(logPayload.recipientEmail, 'alerts@acmeinfra.example');
 });
 
 test('buildCloudSheetConfigPayload enforces blueprint keys and HTTPS webhook URL constraint', async () => {

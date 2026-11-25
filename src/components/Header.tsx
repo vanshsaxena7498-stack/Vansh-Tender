@@ -29,6 +29,7 @@ import {
   DEFAULT_EMAIL_ALERT_SETTINGS,
   getIstDateTimeParts,
 } from '../utils/emailAlerts';
+import { isWorkspaceAdminRole } from '../utils/authCredentials';
 
 export interface CloudUserSummary {
   uid: string;
@@ -123,7 +124,7 @@ export function Header({
         </button>
         <div className="min-w-0 flex-1">
           <h1 className="font-display text-sm sm:text-lg font-semibold text-slate-900 dark:text-white truncate">
-            {activeTab === 'settings' && currentUser?.role === 'secondary'
+            {activeTab === 'settings' && !isWorkspaceAdminRole(currentUser?.role)
               ? 'Workspace Settings & Backups'
               : TAB_TITLES[activeTab]}
           </h1>

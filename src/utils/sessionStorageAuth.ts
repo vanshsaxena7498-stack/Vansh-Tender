@@ -16,7 +16,7 @@ const VALID_TABS: ReadonlySet<TabKey> = new Set([
 
 export interface PerTabCrmSessionEnvelope {
   session: CrmUserSession;
-  adminSessionToken: string;
+  sessionToken: string;
   loginAtMs: number;
   activeTab: TabKey;
 }
@@ -53,7 +53,8 @@ function isValidCrmSession(val: unknown): val is CrmUserSession {
     typeof s.username === 'string' &&
     s.username.trim().length > 0 &&
     typeof s.email === 'string' &&
-    (s.role === 'admin' || s.role === 'secondary')
+    typeof s.role === 'string' &&
+    s.role.trim().length > 0
   );
 }
 
@@ -80,7 +81,7 @@ export function clearPerTabCrmSession(storage: Storage | null = getDefaultSessio
 export function savePerTabCrmSession(
   params: {
     session: CrmUserSession;
-    adminSessionToken?: string;
+    sessionToken?: string;
     loginAtMs: number;
     activeTab?: TabKey;
   },
@@ -89,7 +90,7 @@ export function savePerTabCrmSession(
   if (!storage) return;
   const envelope: PerTabCrmSessionEnvelope = {
     session: params.session,
-    adminSessionToken: params.adminSessionToken || '',
+    sessionToken: params.sessionToken || '',
     loginAtMs: params.loginAtMs,
     activeTab: normalizeTabKey(params.activeTab),
   };
@@ -108,13 +109,21 @@ export function updatePerTabActiveTab(
   try {
     const raw = storage.getItem(CRM_SESSION_STORAGE_KEY);
     if (!raw) return;
-    const parsed = JSON.parse(raw) as Partial<PerTabCrmSessionEnvelope>;
+    const parsed = JSON.parse(raw) as Partial<PerTabCrmSessionEnvelope> & {
+      adminSessionToken?: string;
+    };
     if (!isValidCrmSession(parsed.session) || typeof parsed.loginAtMs !== 'number') {
       return;
     }
+    const token =
+      typeof parsed.sessionToken === 'string' && parsed.sessionToken
+        ? parsed.sessionToken
+        : typeof parsed.adminSessionToken === 'string'
+          ? parsed.adminSessionToken
+          : '';
     const nextEnvelope: PerTabCrmSessionEnvelope = {
       session: parsed.session,
-      adminSessionToken: typeof parsed.adminSessionToken === 'string' ? parsed.adminSessionToken : '',
+      sessionToken: token,
       loginAtMs: parsed.loginAtMs,
       activeTab: normalizeTabKey(activeTab),
     };
@@ -122,6 +131,16 @@ export function updatePerTabActiveTab(
   } catch {
     // Ignore parse/storage errors
   }
+}
+
+export function getActivePerTabSessionToken(
+  storage: Storage | null = getDefaultSessionStorage(),
+): string {
+  const loaded = loadValidPerTabCrmSession(Date.now(), storage);
+  if (loaded.status === 'valid') {
+    return loaded.data.sessionToken;
+  }
+  return '';
 }
 
 export function loadValidPerTabCrmSession(
@@ -138,7 +157,9 @@ export function loadValidPerTabCrmSession(
   if (!raw) return { status: 'none' };
 
   try {
-    const parsed = JSON.parse(raw) as Partial<PerTabCrmSessionEnvelope>;
+    const parsed = JSON.parse(raw) as Partial<PerTabCrmSessionEnvelope> & {
+      adminSessionToken?: string;
+    };
     if (
       !parsed ||
       typeof parsed !== 'object' ||
@@ -160,12 +181,24 @@ export function loadValidPerTabCrmSession(
       };
     }
 
+    const token =
+      typeof parsed.sessionToken === 'string' && parsed.sessionToken
+        ? parsed.sessionToken
+        : typeof parsed.adminSessionToken === 'string'
+          ? parsed.adminSessionToken
+          : '';
+
     return {
       status: 'valid',
       data: {
-        session: parsed.session,
-        adminSessionToken:
-          typeof parsed.adminSessionToken === 'string' ? parsed.adminSessionToken : '',
+        session: {
+          ...parsed.session,
+          companyId:
+            typeof parsed.session.companyId === 'string' && parsed.session.companyId.trim()
+              ? parsed.session.companyId.trim()
+              : parsed.session.userId,
+        },
+        sessionToken: token,
         loginAtMs: parsed.loginAtMs,
         activeTab: normalizeTabKey(parsed.activeTab),
       },
