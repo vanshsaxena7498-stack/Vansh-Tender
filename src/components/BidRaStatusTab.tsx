@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Check,
   Clock,
+  FileText,
   Gavel,
   Search,
 } from 'lucide-react';
@@ -23,8 +24,17 @@ import {
 import {
   formatDateTime,
   formatINR,
+  formatShortDate,
+  getLatestRemarkText,
   getLocalDateInputValue,
 } from '../utils/formatters';
+import { sortRecordsByDate, type DateSortDirection } from '../utils/tableSorting';
+import {
+  CrmCompactTable,
+  DeleteConfirmModal,
+  PreviewField,
+  RecordPreviewModal,
+} from './CompactTableKit';
 
 interface BidRaStatusTabProps {
   tenders: Tender[];
@@ -32,6 +42,7 @@ interface BidRaStatusTabProps {
   selectedTenderId?: string | null;
   onSelectTenderId?: (id: string | null) => void;
   onSaveTenderUpdate: (updatedTender: Tender) => void;
+  onDeleteTender: (id: string) => void;
 }
 
 const PORTAL_OPTIONS: PortalType[] = [
@@ -1050,11 +1061,15 @@ export function BidRaStatusTab({
   selectedTenderId,
   onSelectTenderId,
   onSaveTenderUpdate,
+  onDeleteTender,
 }: BidRaStatusTabProps) {
   const [internalSelectedId, setInternalSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [techFilter, setTechFilter] = useState<'ALL' | TechnicalEvalStatus>('ALL');
   const [finFilter, setFinFilter] = useState<'ALL' | FinancialRaStatus>('ALL');
+  const [dateSortDir, setDateSortDir] = useState<DateSortDirection>('desc');
+  const [previewTender, setPreviewTender] = useState<Tender | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Tender | null>(null);
 
   const activeSelectedId =
     selectedTenderId !== undefined ? selectedTenderId : internalSelectedId;
@@ -1097,27 +1112,26 @@ export function BidRaStatusTab({
 
   const filteredTenders = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return tenders
-      .filter((t) => {
-        if (q) {
-          const matches =
-            t.tenderId.toLowerCase().includes(q) ||
-            t.title.toLowerCase().includes(q) ||
-            (t.clientName || '').toLowerCase().includes(q) ||
-            t.department.toLowerCase().includes(q) ||
-            t.location.toLowerCase().includes(q) ||
-            (t.l1BidderName || '').toLowerCase().includes(q) ||
-            (t.assignedOwner || '').toLowerCase().includes(q);
-          if (!matches) return false;
-        }
-        const tech = t.technicalStatus ?? 'Pending';
-        const fin = t.financialRaStatus ?? 'Not Opened';
-        if (techFilter !== 'ALL' && tech !== techFilter) return false;
-        if (finFilter !== 'ALL' && fin !== finFilter) return false;
-        return true;
-      })
-      .sort((a, b) => b.submissionDueDate.localeCompare(a.submissionDueDate));
-  }, [tenders, searchQuery, techFilter, finFilter]);
+    const matched = tenders.filter((t) => {
+      if (q) {
+        const matches =
+          t.tenderId.toLowerCase().includes(q) ||
+          t.title.toLowerCase().includes(q) ||
+          (t.clientName || '').toLowerCase().includes(q) ||
+          t.department.toLowerCase().includes(q) ||
+          t.location.toLowerCase().includes(q) ||
+          (t.l1BidderName || '').toLowerCase().includes(q) ||
+          (t.assignedOwner || '').toLowerCase().includes(q);
+        if (!matches) return false;
+      }
+      const tech = t.technicalStatus ?? 'Pending';
+      const fin = t.financialRaStatus ?? 'Not Opened';
+      if (techFilter !== 'ALL' && tech !== techFilter) return false;
+      if (finFilter !== 'ALL' && fin !== finFilter) return false;
+      return true;
+    });
+    return sortRecordsByDate(matched, (t) => t.submissionDueDate, dateSortDir);
+  }, [tenders, searchQuery, techFilter, finFilter, dateSortDir]);
 
   if (selectedTender) {
     return (
@@ -1243,137 +1257,252 @@ export function BidRaStatusTab({
         </div>
       </div>
 
-      {/* Due-Passed Tenders Table */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/60 text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                <th className="py-3 px-2.5 w-10">S.No.</th>
-                <th className="py-3 px-2.5">Tender ID</th>
-                <th className="py-3 px-2.5">Dept &amp; Work Scope</th>
-                <th className="py-3 px-2.5">Due Date &amp; Time</th>
-                <th className="py-3 px-2.5">Tech Status</th>
-                <th className="py-3 px-2.5">Financial / RA</th>
-                <th className="py-3 px-2.5">Stage &amp; Rank</th>
-                <th className="py-3 px-2.5 text-right">Quoted / L1</th>
-                <th className="py-3 px-2.5 text-right">Action</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
-              {filteredTenders.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={9}
-                    className="py-10 px-4 text-center text-slate-500 dark:text-slate-400"
-                  >
-                    {tenders.length === 0
-                      ? 'No due-passed tenders yet. Tenders move here automatically once their Due Date & Time passes.'
-                      : 'No due-passed tenders match your current search or filters.'}
-                  </td>
-                </tr>
-              ) : (
-                filteredTenders.map((t, idx) => {
-                  const techStatus = t.technicalStatus ?? 'Pending';
-                  const finStatus = t.financialRaStatus ?? 'Not Opened';
-                  return (
-                    <tr
-                      key={t.id}
-                      className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors"
+      {/* Compact 6-Column + Actions Table */}
+      <CrmCompactTable
+        rows={filteredTenders}
+        getRowKey={(t) => t.id}
+        getTenderNo={(t) => t.tenderId}
+        onClickTenderNo={(t) => setActiveSelectedId(t.id)}
+        getDepartmentName={(t) => t.clientName || t.department}
+        getLocation={(t) => t.location || '—'}
+        getDateLabel={(t) => formatShortDate(t.submissionDueDate)}
+        getDescription={(t) => t.title}
+        getRecordLabel={(t) => t.tenderId}
+        getRowClassName={(t) =>
+          t.stage === 'Tender Not Filled'
+            ? 'bg-red-50/75 hover:bg-red-100/75 dark:bg-red-950/30 dark:hover:bg-red-950/45'
+            : ''
+        }
+        dateSortDir={dateSortDir}
+        onToggleDateSort={() =>
+          setDateSortDir((prev) => (prev === 'desc' ? 'asc' : 'desc'))
+        }
+        onPreview={(t) => setPreviewTender(t)}
+        onEdit={(t) => setActiveSelectedId(t.id)}
+        onRequestDelete={(t) => setDeleteTarget(t)}
+        emptyContent={
+          <div className="py-10 px-4 text-center text-xs text-slate-500 dark:text-slate-400 space-y-2.5">
+            <p>
+              {tenders.length === 0
+                ? 'No due-passed tenders yet. Tenders move here automatically once their Due Date & Time passes.'
+                : 'No due-passed tenders match your current search or filters.'}
+            </p>
+            {(searchQuery || techFilter !== 'ALL' || finFilter !== 'ALL') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  setTechFilter('ALL');
+                  setFinFilter('ALL');
+                }}
+                className="px-3.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200"
+              >
+                Clear Filters
+              </button>
+            )}
+          </div>
+        }
+      />
+
+      {/* Full-Detail Read-Only Preview Modal */}
+      {previewTender && (
+        <RecordPreviewModal
+          open
+          title={previewTender.tenderId}
+          subtitle={`${previewTender.department} · ${previewTender.location || 'India'}`}
+          badge={
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span
+                className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${getStageBadgeClass(
+                  previewTender.stage,
+                )}`}
+              >
+                {previewTender.stage}
+              </span>
+              <span
+                className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${getTechStatusBadgeClass(
+                  previewTender.technicalStatus ?? 'Pending',
+                )}`}
+              >
+                {previewTender.technicalStatus ?? 'Pending'}
+              </span>
+              <span
+                className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${getFinancialStatusBadgeClass(
+                  previewTender.financialRaStatus ?? 'Not Opened',
+                )}`}
+              >
+                {previewTender.financialRaStatus ?? 'Not Opened'}
+              </span>
+            </div>
+          }
+          onClose={() => setPreviewTender(null)}
+        >
+          <div className="space-y-5">
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                Brief Description &amp; Scope of Work
+              </p>
+              <p className="text-sm font-medium text-slate-900 dark:text-slate-100 mt-1">
+                {previewTender.title}
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
+              <PreviewField
+                label="Client / Organization Name"
+                value={previewTender.clientName || previewTender.department}
+              />
+              <PreviewField
+                label="Location / Department"
+                value={
+                  previewTender.locationDepartment ||
+                  [previewTender.location, previewTender.department].filter(Boolean).join(' / ')
+                }
+              />
+              <PreviewField label="Portal / Source" value={previewTender.portal} />
+              <PreviewField label="Location" value={previewTender.location || '—'} />
+              <PreviewField
+                label="Assigned Person / Owner"
+                value={previewTender.assignedOwner || '—'}
+              />
+              <PreviewField label="Category" value={previewTender.category || '—'} />
+              <PreviewField
+                label="Publish Date"
+                value={formatShortDate(previewTender.publishDate)}
+                mono
+              />
+              <PreviewField
+                label="Submission Due Date & Time"
+                value={formatDateTime(previewTender.submissionDueDate)}
+                mono
+              />
+              <PreviewField
+                label="Technical Opening"
+                value={
+                  previewTender.technicalOpeningDateTime
+                    ? formatDateTime(previewTender.technicalOpeningDateTime)
+                    : formatShortDate(previewTender.technicalOpeningDate)
+                }
+                mono
+              />
+              <PreviewField
+                label="Financial / RA Date & Time"
+                value={
+                  previewTender.financialOpeningRaDateTime
+                    ? formatDateTime(previewTender.financialOpeningRaDateTime)
+                    : formatShortDate(
+                        previewTender.financialOpeningDate || previewTender.completionDate,
+                      )
+                }
+                mono
+              />
+              <PreviewField
+                label="Estimated Value (INR)"
+                value={formatINR(previewTender.estimatedValue)}
+                mono
+              />
+              <PreviewField
+                label="Our Quoted Value (INR)"
+                value={
+                  previewTender.quotedValue > 0 ? formatINR(previewTender.quotedValue) : '—'
+                }
+                mono
+              />
+              <PreviewField
+                label="RA Final Value (INR)"
+                value={
+                  previewTender.raFinalValue && previewTender.raFinalValue > 0
+                    ? formatINR(previewTender.raFinalValue)
+                    : '—'
+                }
+                mono
+              />
+              <PreviewField label="L1 Bidder Name" value={previewTender.l1BidderName || '—'} />
+              <PreviewField
+                label="L1 Quoted Value (INR)"
+                value={
+                  previewTender.l1QuotedValue && previewTender.l1QuotedValue > 0
+                    ? formatINR(previewTender.l1QuotedValue)
+                    : '—'
+                }
+                mono
+              />
+              <PreviewField
+                label="Our Position / Rank"
+                value={previewTender.ourPositionRank || '—'}
+              />
+              <PreviewField
+                label="EMD Security"
+                value={`${
+                  previewTender.emdAmount > 0 ? formatINR(previewTender.emdAmount) : 'Exempt / ₹ 0'
+                } (${previewTender.emdStatus})`}
+                mono
+              />
+            </div>
+
+            <div className="space-y-3">
+              <PreviewField
+                label="Technical Remarks / Deviations"
+                value={previewTender.technicalRemarks || '—'}
+              />
+              <PreviewField
+                label="RA & Financial Remarks"
+                value={previewTender.raFinancialRemarks || '—'}
+              />
+              <PreviewField
+                label="Result / Remarks Summary"
+                value={
+                  [previewTender.resultInfo, getLatestRemarkText(previewTender.remarks)]
+                    .filter(Boolean)
+                    .join(' | ') || '—'
+                }
+              />
+            </div>
+
+            {previewTender.attachments && previewTender.attachments.length > 0 && (
+              <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  Attached Documents ({previewTender.attachments.length})
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {previewTender.attachments.map((att) => (
+                    <a
+                      key={att.id}
+                      href={att.dataUrl}
+                      download={att.fileName}
+                      className="flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
                     >
-                      <td className="py-3 px-2.5 font-mono-num text-slate-500 dark:text-slate-400">
-                        {idx + 1}
-                      </td>
-                      <td className="py-3 px-2.5">
-                        <button
-                          type="button"
-                          onClick={() => setActiveSelectedId(t.id)}
-                          className="font-mono-num font-semibold text-[#1E3A8A] dark:text-blue-400 hover:underline text-left whitespace-nowrap"
-                        >
-                          {t.tenderId}
-                        </button>
-                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                          {t.portal}
-                        </div>
-                      </td>
-                      <td className="py-3 px-2.5 max-w-[200px]">
-                        <p className="font-medium text-slate-900 dark:text-slate-100 truncate">
-                          {t.clientName || t.department}
+                      <FileText className="h-3.5 w-3.5 text-[#1E3A8A] dark:text-blue-400 shrink-0" />
+                      <div className="min-w-0">
+                        <p className="font-medium truncate">{att.fileName}</p>
+                        <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                          {att.slotLabel}
                         </p>
-                        <p
-                          className="text-[11px] text-slate-500 dark:text-slate-400 truncate"
-                          title={t.title}
-                        >
-                          {t.title}
-                        </p>
-                      </td>
-                      <td className="py-3 px-2.5 font-mono-num text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                        {formatDateTime(t.submissionDueDate)}
-                      </td>
-                      <td className="py-3 px-2.5">
-                        <span
-                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium whitespace-nowrap ${getTechStatusBadgeClass(
-                            techStatus,
-                          )}`}
-                        >
-                          {techStatus}
-                        </span>
-                      </td>
-                      <td className="py-3 px-2.5">
-                        <span
-                          className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium whitespace-nowrap ${getFinancialStatusBadgeClass(
-                            finStatus,
-                          )}`}
-                        >
-                          {finStatus}
-                        </span>
-                      </td>
-                      <td className="py-3 px-2.5">
-                        <div className="flex flex-col items-start gap-1">
-                          <span
-                            className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium whitespace-nowrap ${getStageBadgeClass(
-                              t.stage,
-                            )}`}
-                          >
-                            {t.stage}
-                          </span>
-                          {t.ourPositionRank && (
-                            <span className="font-mono-num text-[11px] text-slate-600 dark:text-slate-300">
-                              Rank: {t.ourPositionRank}
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="py-3 px-2.5 text-right font-mono-num whitespace-nowrap">
-                        <div className="text-slate-900 dark:text-slate-100 font-medium">
-                          {t.quotedValue > 0 ? formatINR(t.quotedValue) : '—'}
-                        </div>
-                        {(t.raFinalValue || t.l1QuotedValue) ? (
-                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                            {t.raFinalValue
-                              ? `RA: ${formatINR(t.raFinalValue)}`
-                              : `L1: ${formatINR(t.l1QuotedValue || 0)}`}
-                          </div>
-                        ) : null}
-                      </td>
-                      <td className="py-3 px-2.5 text-right whitespace-nowrap">
-                        <button
-                          type="button"
-                          onClick={() => setActiveSelectedId(t.id)}
-                          aria-label={`Open / Update ${t.tenderId}`}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#1E3A8A] hover:bg-[#172554] dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-medium"
-                        >
-                          <span>Open / Update</span>
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </RecordPreviewModal>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmModal
+        open={Boolean(deleteTarget)}
+        title={`Delete Tender ${deleteTarget?.tenderId ?? ''}`}
+        description={`Are you sure you want to permanently delete tender "${
+          deleteTarget?.tenderId ?? ''
+        }" (${deleteTarget?.department ?? ''})?`}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (deleteTarget) {
+            onDeleteTender(deleteTarget.id);
+          }
+          setDeleteTarget(null);
+        }}
+      />
     </div>
   );
 }

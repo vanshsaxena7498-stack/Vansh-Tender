@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Download, Pencil, Plus, Search, Trash2 } from 'lucide-react';
+import { Download, FileText, Plus, Search } from 'lucide-react';
 import type { EmdBgRecord, Tender } from '../types/crm';
 import {
   ACTIVE_LOCKED_STATUSES,
@@ -15,6 +15,13 @@ import {
   formatShortDate,
   getDaysRemaining,
 } from '../utils/formatters';
+import { sortRecordsByDate, type DateSortDirection } from '../utils/tableSorting';
+import {
+  CrmCompactTable,
+  DeleteConfirmModal,
+  PreviewField,
+  RecordPreviewModal,
+} from './CompactTableKit';
 
 interface EmdBgTabProps {
   records: EmdBgRecord[];
@@ -27,6 +34,40 @@ interface EmdBgTabProps {
 type InstrumentFilter = 'ALL' | 'EMD_ONLY' | 'BG_FDR_ONLY';
 type StatusFilter = 'ALL' | 'ACTIVE' | 'EXPIRING_SOON' | 'PENDING_REFUND' | 'RELEASED';
 
+function getValidityBadge(r: EmdBgRecord): { label: string; cls: string } {
+  const isReleased = r.status === 'Refunded / Released' || r.status === 'Forfeited';
+  const daysLeft = r.expiryDate ? getDaysRemaining(r.expiryDate) : null;
+
+  if (isReleased) {
+    return {
+      label: r.status === 'Forfeited' ? 'Forfeited' : 'Closed',
+      cls: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    };
+  }
+  if (daysLeft === null) {
+    return {
+      label: 'No Expiry',
+      cls: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    };
+  }
+  if (daysLeft < 0) {
+    return {
+      label: `Expired (${Math.abs(daysLeft)}d)`,
+      cls: 'bg-red-50 text-red-700 dark:bg-red-950/60 dark:text-red-400',
+    };
+  }
+  if (daysLeft < 30) {
+    return {
+      label: `Expiring in ${daysLeft}d`,
+      cls: 'bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400',
+    };
+  }
+  return {
+    label: `Safe (${daysLeft}d)`,
+    cls: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400',
+  };
+}
+
 export function EmdBgTab({
   records,
   tenders,
@@ -37,7 +78,9 @@ export function EmdBgTab({
   const [searchQuery, setSearchQuery] = useState('');
   const [instrumentFilter, setInstrumentFilter] = useState<InstrumentFilter>('ALL');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
-  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [dateSortDir, setDateSortDir] = useState<DateSortDirection>('desc');
+  const [previewRecord, setPreviewRecord] = useState<EmdBgRecord | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<EmdBgRecord | null>(null);
 
   const summary = useMemo(
     () => computeEmdBgSummary(records, tenders),
@@ -52,7 +95,7 @@ export function EmdBgTab({
   const filteredRecords = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const now = new Date();
-    return records.filter((r) => {
+    const matched = records.filter((r) => {
       if (q) {
         const hit =
           r.tenderId.toLowerCase().includes(q) ||
@@ -89,7 +132,8 @@ export function EmdBgTab({
           return true;
       }
     });
-  }, [records, searchQuery, instrumentFilter, statusFilter, tenderByCode]);
+    return sortRecordsByDate(matched, (r) => r.issueDate || r.expiryDate, dateSortDir);
+  }, [records, searchQuery, instrumentFilter, statusFilter, tenderByCode, dateSortDir]);
 
   const handleExportCsv = () => {
     const headers = [
@@ -152,6 +196,11 @@ export function EmdBgTab({
       tone: 'text-emerald-700 dark:text-emerald-400',
     },
   ];
+
+  const previewValidity = previewRecord ? getValidityBadge(previewRecord) : null;
+  const previewLocation = previewRecord
+    ? tenderByCode.get(previewRecord.tenderId.toLowerCase())?.location || '—'
+    : '—';
 
   return (
     <div className="space-y-4">
@@ -275,9 +324,25 @@ export function EmdBgTab({
         </div>
       </div>
 
-      {/* Data Table */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-        {filteredRecords.length === 0 ? (
+      {/* Compact 6-Column + Actions Table */}
+      <CrmCompactTable
+        rows={filteredRecords}
+        getRowKey={(r) => r.id}
+        getTenderNo={(r) => r.tenderId}
+        onClickTenderNo={(r) => setPreviewRecord(r)}
+        getDepartmentName={(r) => r.department}
+        getLocation={(r) => tenderByCode.get(r.tenderId.toLowerCase())?.location || '—'}
+        getDateLabel={(r) => formatShortDate(r.issueDate || r.expiryDate)}
+        getDescription={(r) => r.remarks || `${r.instrumentType} · ${r.referenceNo}`}
+        getRecordLabel={(r) => `${r.tenderId} (${r.referenceNo})`}
+        dateSortDir={dateSortDir}
+        onToggleDateSort={() =>
+          setDateSortDir((prev) => (prev === 'desc' ? 'asc' : 'desc'))
+        }
+        onPreview={(r) => setPreviewRecord(r)}
+        onEdit={(r) => onEditRecord(r)}
+        onRequestDelete={(r) => setDeleteTarget(r)}
+        emptyContent={
           <div className="px-6 py-12 text-center space-y-3">
             <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
               No EMD or Bank Guarantee records match your filters.
@@ -294,169 +359,117 @@ export function EmdBgTab({
               Reset Filters
             </button>
           </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 text-slate-600 dark:text-slate-400">
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Tender ID & Dept</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Instrument & Ref</th>
-                  <th className="py-2.5 px-3 font-semibold">Issuing Bank</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">Amount (₹)</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Dates</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Validity</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Status</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {filteredRecords.map((r) => {
-                  const isReleased =
-                    r.status === 'Refunded / Released' || r.status === 'Forfeited';
-                  const daysLeft = r.expiryDate ? getDaysRemaining(r.expiryDate) : null;
+        }
+      />
 
-                  let validityBadge = {
-                    label: 'No Expiry',
-                    cls: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
-                  };
-                  if (isReleased) {
-                    validityBadge = {
-                      label: r.status === 'Forfeited' ? 'Forfeited' : 'Closed',
-                      cls: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
-                    };
-                  } else if (daysLeft !== null) {
-                    if (daysLeft < 0) {
-                      validityBadge = {
-                        label: `Expired (${Math.abs(daysLeft)}d)`,
-                        cls: 'bg-red-50 text-red-700 dark:bg-red-950/60 dark:text-red-400',
-                      };
-                    } else if (daysLeft < 30) {
-                      validityBadge = {
-                        label: `Expiring in ${daysLeft}d`,
-                        cls: 'bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400',
-                      };
-                    } else {
-                      validityBadge = {
-                        label: `Safe (${daysLeft}d)`,
-                        cls: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400',
-                      };
-                    }
-                  }
+      {/* Full-Detail Read-Only Preview Modal */}
+      {previewRecord && (
+        <RecordPreviewModal
+          open
+          title={`${previewRecord.tenderId} · ${previewRecord.referenceNo}`}
+          subtitle={`${previewRecord.department} · ${previewLocation}`}
+          badge={
+            previewValidity && (
+              <span
+                className={`font-mono-num inline-block px-2 py-0.5 rounded text-[11px] font-semibold ${previewValidity.cls}`}
+              >
+                {previewValidity.label}
+              </span>
+            )
+          }
+          onClose={() => setPreviewRecord(null)}
+        >
+          <div className="space-y-5">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
+              <PreviewField label="Tender ID" value={previewRecord.tenderId} mono />
+              <PreviewField label="Department" value={previewRecord.department} />
+              <PreviewField label="Location" value={previewLocation} />
+              <PreviewField label="Instrument Type" value={previewRecord.instrumentType} />
+              <PreviewField
+                label="Reference / UTR / BG No."
+                value={previewRecord.referenceNo}
+                mono
+              />
+              <PreviewField label="Issuing Bank" value={previewRecord.bankName || '—'} />
+              <PreviewField
+                label="Amount (INR)"
+                value={formatINR(previewRecord.amount)}
+                mono
+              />
+              <PreviewField label="Current Status" value={previewRecord.status} />
+              <PreviewField
+                label="Issue Date"
+                value={formatShortDate(previewRecord.issueDate)}
+                mono
+              />
+              <PreviewField
+                label="Expiry / Maturity Date"
+                value={formatShortDate(previewRecord.expiryDate)}
+                mono
+              />
+              <PreviewField
+                label="Claim End Date"
+                value={formatShortDate(previewRecord.claimEndDate)}
+                mono
+              />
+              <PreviewField
+                label="Refund / Release Date"
+                value={formatShortDate(previewRecord.refundDate)}
+                mono
+              />
+              <PreviewField
+                label="Refund Reference"
+                value={previewRecord.refundRef || '—'}
+                mono
+              />
+            </div>
 
-                  return (
-                    <tr
-                      key={r.id}
-                      className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
+            <PreviewField label="Remarks" value={previewRecord.remarks || '—'} />
+
+            {previewRecord.attachments && previewRecord.attachments.length > 0 && (
+              <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  Attached Documents ({previewRecord.attachments.length})
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {previewRecord.attachments.map((att) => (
+                    <a
+                      key={att.id}
+                      href={att.dataUrl}
+                      download={att.fileName}
+                      className="flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
                     >
-                      <td className="py-2.5 px-3 align-top max-w-[165px]">
-                        <p className="font-mono-num font-semibold text-[#1E3A8A] dark:text-blue-400 truncate">
-                          {r.tenderId}
+                      <FileText className="h-3.5 w-3.5 text-[#1E3A8A] dark:text-blue-400 shrink-0" />
+                      <div className="min-w-0">
+                        <p className="font-medium truncate">{att.fileName}</p>
+                        <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                          {att.slotLabel}
                         </p>
-                        <p className="text-slate-700 dark:text-slate-300 truncate mt-0.5">
-                          {r.department}
-                        </p>
-                        {r.remarks && (
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5">
-                            {r.remarks}
-                          </p>
-                        )}
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top max-w-[165px]">
-                        <p className="font-medium text-slate-900 dark:text-slate-100 truncate">
-                          {r.instrumentType}
-                        </p>
-                        <p className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">
-                          {r.referenceNo}
-                          {(r.attachments?.length ?? 0) > 0
-                            ? ` · ${r.attachments?.length} ${r.attachments?.length === 1 ? 'doc' : 'docs'}`
-                            : ''}
-                        </p>
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top max-w-[140px] text-slate-700 dark:text-slate-300">
-                        <span className="line-clamp-2">{r.bankName}</span>
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top text-right font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                        {formatINR(r.amount)}
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top font-mono-num text-[11px] text-slate-600 dark:text-slate-400 whitespace-nowrap space-y-0.5">
-                        <div>Iss: {formatShortDate(r.issueDate)}</div>
-                        <div>Exp: {formatShortDate(r.expiryDate)}</div>
-                        {r.claimEndDate && <div>Clm: {formatShortDate(r.claimEndDate)}</div>}
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap">
-                        <span
-                          className={`font-mono-num inline-block px-2 py-1 rounded text-[11px] font-semibold ${validityBadge.cls}`}
-                        >
-                          {validityBadge.label}
-                        </span>
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top max-w-[140px]">
-                        <p className="font-medium text-slate-900 dark:text-slate-100 truncate">
-                          {r.status}
-                        </p>
-                        {r.refundDate && (
-                          <p className="font-mono-num text-[11px] text-emerald-700 dark:text-emerald-400 mt-0.5 truncate">
-                            {formatShortDate(r.refundDate)} {r.refundRef ? `· ${r.refundRef}` : ''}
-                          </p>
-                        )}
-                      </td>
-
-                      <td className="py-2.5 px-3 align-top text-right whitespace-nowrap">
-                        {deleteConfirmId === r.id ? (
-                          <div className="inline-flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                onDeleteRecord(r.id);
-                                setDeleteConfirmId(null);
-                              }}
-                              className="px-2 py-1 rounded bg-red-600 text-white text-[11px] font-medium"
-                            >
-                              Confirm
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setDeleteConfirmId(null)}
-                              className="px-2 py-1 rounded border border-slate-300 dark:border-slate-700 text-[11px]"
-                            >
-                              No
-                            </button>
-                          </div>
-                        ) : (
-                          <div className="inline-flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => onEditRecord(r)}
-                              aria-label={`Edit ${r.referenceNo}`}
-                              className="p-1.5 rounded-md text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700"
-                            >
-                              <Pencil className="h-4 w-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setDeleteConfirmId(r.id)}
-                              aria-label={`Delete ${r.referenceNo}`}
-                              className="p-1.5 rounded-md text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </button>
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        </RecordPreviewModal>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmModal
+        open={Boolean(deleteTarget)}
+        title={`Delete EMD / BG ${deleteTarget?.referenceNo ?? ''}`}
+        description={`Are you sure you want to delete ${deleteTarget?.instrumentType ?? 'this entry'} (${
+          deleteTarget?.referenceNo ?? ''
+        }) for tender "${deleteTarget?.tenderId ?? ''}"?`}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (deleteTarget) {
+            onDeleteRecord(deleteTarget.id);
+          }
+          setDeleteTarget(null);
+        }}
+      />
     </div>
   );
 }

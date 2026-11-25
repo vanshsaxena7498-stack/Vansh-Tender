@@ -3759,6 +3759,7 @@ export default function App() {
               onAddTender={() => setTenderModalTarget(null)}
               onEditTender={(tender) => setTenderModalTarget(tender)}
               onOpenTender={(tender) => setSelectedTenderId(tender.id)}
+              onDeleteTender={handleDeleteTender}
             />
           )}
 
@@ -3766,6 +3767,7 @@ export default function App() {
             <OemDetailsTab
               oemRecords={oemRecords}
               mafTrackers={mafTrackers}
+              tenders={tenders}
               onAddOem={() => setOemModalTarget(null)}
               onEditOem={(oem) => setOemModalTarget(oem)}
               onDeleteOem={handleDeleteOemRecord}
@@ -3805,6 +3807,7 @@ export default function App() {
               selectedTenderId={selectedBidRaTenderId}
               onSelectTenderId={setSelectedBidRaTenderId}
               onSaveTenderUpdate={handleSaveBidRaTender}
+              onDeleteTender={handleDeleteTender}
             />
           )}
 

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Download, Eye, Pencil, Plus, Search } from 'lucide-react';
+import { Download, FileText, Plus, Search } from 'lucide-react';
 import type { EmdBgRecord, Tender, TenderStage } from '../types/crm';
 import {
   buildCsvContent,
@@ -14,6 +14,13 @@ import {
   MIS_MONTHLY_TENDER_HEADERS,
   serializeTenderForSheet,
 } from '../utils/googleSheetSync';
+import { sortRecordsByDate, type DateSortDirection } from '../utils/tableSorting';
+import {
+  CrmCompactTable,
+  DeleteConfirmModal,
+  PreviewField,
+  RecordPreviewModal,
+} from './CompactTableKit';
 
 interface TendersTabProps {
   tenders: Tender[];
@@ -22,6 +29,7 @@ interface TendersTabProps {
   onAddTender: () => void;
   onEditTender: (tender: Tender) => void;
   onOpenTender: (tender: Tender) => void;
+  onDeleteTender: (id: string) => void;
 }
 
 type QuickFilterKey =
@@ -70,54 +78,57 @@ export function TendersTab({
   onAddTender,
   onEditTender,
   onOpenTender,
+  onDeleteTender,
 }: TendersTabProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [quickFilter, setQuickFilter] = useState<QuickFilterKey>('ALL');
+  const [dateSortDir, setDateSortDir] = useState<DateSortDirection>('desc');
+  const [previewTender, setPreviewTender] = useState<Tender | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Tender | null>(null);
 
   const filteredTenders = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const now = new Date();
-    return tenders
-      .filter((t) => {
-        if (q) {
-          const matches =
-            t.tenderId.toLowerCase().includes(q) ||
-            t.title.toLowerCase().includes(q) ||
-            (t.clientName || '').toLowerCase().includes(q) ||
-            t.department.toLowerCase().includes(q) ||
-            (t.locationDepartment || '').toLowerCase().includes(q) ||
-            t.location.toLowerCase().includes(q) ||
-            t.category.toLowerCase().includes(q) ||
-            (t.assignedOwner || '').toLowerCase().includes(q) ||
-            (t.l1BidderName || '').toLowerCase().includes(q) ||
-            t.portal.toLowerCase().includes(q);
-          if (!matches) return false;
+    const matched = tenders.filter((t) => {
+      if (q) {
+        const matches =
+          t.tenderId.toLowerCase().includes(q) ||
+          t.title.toLowerCase().includes(q) ||
+          (t.clientName || '').toLowerCase().includes(q) ||
+          t.department.toLowerCase().includes(q) ||
+          (t.locationDepartment || '').toLowerCase().includes(q) ||
+          t.location.toLowerCase().includes(q) ||
+          t.category.toLowerCase().includes(q) ||
+          (t.assignedOwner || '').toLowerCase().includes(q) ||
+          (t.l1BidderName || '').toLowerCase().includes(q) ||
+          t.portal.toLowerCase().includes(q);
+        if (!matches) return false;
+      }
+      switch (quickFilter) {
+        case 'DUE_WEEK': {
+          const d = getDaysRemaining(t.submissionDueDate, now);
+          return (
+            d >= 0 &&
+            d <= 7 &&
+            (t.stage === 'Identified / Reviewing' || t.stage === 'Doc Preparation')
+          );
         }
-        switch (quickFilter) {
-          case 'DUE_WEEK': {
-            const d = getDaysRemaining(t.submissionDueDate, now);
-            return (
-              d >= 0 &&
-              d <= 7 &&
-              (t.stage === 'Identified / Reviewing' || t.stage === 'Doc Preparation')
-            );
-          }
-          case 'SUBMITTED':
-            return t.stage === 'Submitted';
-          case 'UNDER_EVAL':
-            return t.stage === 'Technical Eval' || t.stage === 'Financial / BOQ Eval';
-          case 'WON':
-            return t.stage === 'L1 / Won';
-          case 'LOST':
-            return t.stage === 'Lost (L2/L3)';
-          case 'NOT_FILLED':
-            return t.stage === 'Tender Not Filled';
-          default:
-            return true;
-        }
-      })
-      .sort((a, b) => b.submissionDueDate.localeCompare(a.submissionDueDate));
-  }, [tenders, searchQuery, quickFilter]);
+        case 'SUBMITTED':
+          return t.stage === 'Submitted';
+        case 'UNDER_EVAL':
+          return t.stage === 'Technical Eval' || t.stage === 'Financial / BOQ Eval';
+        case 'WON':
+          return t.stage === 'L1 / Won';
+        case 'LOST':
+          return t.stage === 'Lost (L2/L3)';
+        case 'NOT_FILLED':
+          return t.stage === 'Tender Not Filled';
+        default:
+          return true;
+      }
+    });
+    return sortRecordsByDate(matched, (t) => t.submissionDueDate, dateSortDir);
+  }, [tenders, searchQuery, quickFilter, dateSortDir]);
 
   const handleExportCsv = () => {
     const headers = [...MIS_MONTHLY_TENDER_HEADERS];
@@ -247,9 +258,30 @@ export function TendersTab({
         </div>
       </div>
 
-      {/* Master Operations Table */}
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-        {filteredTenders.length === 0 ? (
+      {/* Compact 6-Column + Actions Table */}
+      <CrmCompactTable
+        rows={filteredTenders}
+        getRowKey={(t) => t.id}
+        getTenderNo={(t) => t.tenderId}
+        onClickTenderNo={(t) => onOpenTender(t)}
+        getDepartmentName={(t) => t.clientName || t.department}
+        getLocation={(t) => t.location || '—'}
+        getDateLabel={(t) => formatShortDate(t.submissionDueDate)}
+        getDescription={(t) => t.title}
+        getRecordLabel={(t) => t.tenderId}
+        getRowClassName={(t) =>
+          t.stage === 'Tender Not Filled'
+            ? 'bg-red-50/75 hover:bg-red-100/75 dark:bg-red-950/30 dark:hover:bg-red-950/45'
+            : ''
+        }
+        dateSortDir={dateSortDir}
+        onToggleDateSort={() =>
+          setDateSortDir((prev) => (prev === 'desc' ? 'asc' : 'desc'))
+        }
+        onPreview={(t) => setPreviewTender(t)}
+        onEdit={(t) => onEditTender(t)}
+        onRequestDelete={(t) => setDeleteTarget(t)}
+        emptyContent={
           <div className="px-6 py-12 text-center space-y-3">
             <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
               No tenders match your current search or stage filter.
@@ -274,265 +306,190 @@ export function TendersTab({
               </button>
             </div>
           </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="min-w-[2300px] w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 text-slate-600 dark:text-slate-400">
-                  <th className="py-2.5 px-3 font-semibold text-center whitespace-nowrap">S.No.</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Tender Ref / ID</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Client / Organization Name</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Location / Department</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Location</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Brief Description &amp; Scope of Work</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Portal / Platform</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Publish / Tender Date</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Due Date &amp; Time</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Pre-Bid Meeting Date</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">Estimated Tender Value (INR)</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">EMD Amount (INR)</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">EMD Mode / Form</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Current Status</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Technical Opening Date</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Financial Opening Date</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">L1 Bidder Name</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">L1 Quoted Value (INR)</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Our Position / Rank</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Assigned Person / Owner</th>
-                  <th className="py-2.5 px-3 font-semibold whitespace-nowrap">Remarks / Next Action</th>
-                  <th className="py-2.5 px-3 font-semibold text-right whitespace-nowrap">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {filteredTenders.map((t, index) => {
-                  const days = getDaysRemaining(t.submissionDueDate);
-                  const isOpenStage =
-                    t.stage === 'Identified / Reviewing' || t.stage === 'Doc Preparation';
-                  const dueColor =
-                    isOpenStage && days <= 2
-                      ? 'text-red-600 dark:text-red-400 font-semibold'
-                      : isOpenStage && days <= 5
-                        ? 'text-amber-600 dark:text-amber-400 font-medium'
-                        : 'text-slate-600 dark:text-slate-400';
-                  const isSynced = syncedSet.has(t.tenderId.toLowerCase());
-                  const isNotFilled = t.stage === 'Tender Not Filled';
-                  const clientName = t.clientName || t.department;
-                  const locationDept =
-                    t.locationDepartment ||
-                    [t.location, t.department].filter(Boolean).join(' / ');
-                  const latestRemark = getLatestRemarkText(t.remarks);
-                  const remarksSummary = [latestRemark, (t.resultInfo || '').trim()]
+        }
+      />
+
+      {/* Full-Detail Read-Only Preview Modal */}
+      {previewTender && (
+        <RecordPreviewModal
+          open
+          title={previewTender.tenderId}
+          subtitle={`${previewTender.department} · ${previewTender.location || 'India'}`}
+          badge={
+            <span
+              className={`inline-block px-2 py-0.5 rounded text-[11px] font-semibold ${getStageBadgeClass(
+                previewTender.stage,
+              )}`}
+            >
+              {previewTender.stage}
+            </span>
+          }
+          onClose={() => setPreviewTender(null)}
+        >
+          <div className="space-y-5">
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                Brief Description &amp; Scope of Work
+              </p>
+              <p className="text-sm font-medium text-slate-900 dark:text-slate-100 mt-1">
+                {previewTender.title}
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
+              <PreviewField
+                label="Client / Organization Name"
+                value={previewTender.clientName || previewTender.department}
+              />
+              <PreviewField
+                label="Location / Department"
+                value={
+                  previewTender.locationDepartment ||
+                  [previewTender.location, previewTender.department].filter(Boolean).join(' / ')
+                }
+              />
+              <PreviewField label="Portal / Platform" value={previewTender.portal} />
+              <PreviewField label="Work / Item Category" value={previewTender.category || '—'} />
+              <PreviewField
+                label="Assigned Person / Owner"
+                value={previewTender.assignedOwner || defaultOwner || '—'}
+              />
+              <PreviewField label="Location" value={previewTender.location || '—'} />
+              <PreviewField
+                label="Publish / Tender Date"
+                value={formatShortDate(previewTender.publishDate)}
+                mono
+              />
+              <PreviewField
+                label="Due Date & Time"
+                value={formatDateTime(previewTender.submissionDueDate)}
+                mono
+              />
+              <PreviewField
+                label="Pre-Bid Meeting Date"
+                value={formatShortDate(previewTender.preBidDate)}
+                mono
+              />
+              <PreviewField
+                label="Technical Opening Date"
+                value={formatShortDate(previewTender.technicalOpeningDate)}
+                mono
+              />
+              <PreviewField
+                label="Financial Opening Date"
+                value={formatShortDate(
+                  previewTender.financialOpeningDate || previewTender.completionDate,
+                )}
+                mono
+              />
+              <PreviewField
+                label="Estimated Value (INR)"
+                value={formatINR(previewTender.estimatedValue)}
+                mono
+              />
+              <PreviewField
+                label="Our Quoted Bid (INR)"
+                value={
+                  previewTender.quotedValue > 0 ? formatINR(previewTender.quotedValue) : '—'
+                }
+                mono
+              />
+              <PreviewField
+                label="EMD Amount & Mode"
+                value={`${
+                  previewTender.emdAmount > 0 ? formatINR(previewTender.emdAmount) : 'Exempt / ₹ 0'
+                } (${previewTender.emdStatus})${
+                  syncedSet.has(previewTender.tenderId.toLowerCase()) ? ' · Synced' : ''
+                }`}
+                mono
+              />
+              <PreviewField label="L1 Bidder Name" value={previewTender.l1BidderName || '—'} />
+              <PreviewField
+                label="L1 Quoted Value (INR)"
+                value={
+                  previewTender.l1QuotedValue && previewTender.l1QuotedValue > 0
+                    ? formatINR(previewTender.l1QuotedValue)
+                    : previewTender.quotedValue > 0
+                      ? formatINR(previewTender.quotedValue)
+                      : '—'
+                }
+                mono
+              />
+              <PreviewField
+                label="Our Position / Rank"
+                value={
+                  previewTender.ourPositionRank ||
+                  (previewTender.stage === 'L1 / Won'
+                    ? 'L1'
+                    : previewTender.stage === 'Lost (L2/L3)'
+                      ? 'L2 / L3'
+                      : '—')
+                }
+              />
+              <PreviewField
+                label="Checklist Progress"
+                value={`${previewTender.checklist.filter((c) => c.checked).length} / ${
+                  previewTender.checklist.length
+                } Ready`}
+                mono
+              />
+            </div>
+
+            <div className="space-y-2">
+              <PreviewField
+                label="Result / Remarks Summary"
+                value={
+                  [getLatestRemarkText(previewTender.remarks), (previewTender.resultInfo || '').trim()]
                     .filter(Boolean)
-                    .join(' | ');
-                  const l1Quoted =
-                    typeof t.l1QuotedValue === 'number' && t.l1QuotedValue > 0
-                      ? t.l1QuotedValue
-                      : t.quotedValue;
-                  const rankDisplay =
-                    t.ourPositionRank ||
-                    (t.stage === 'L1 / Won'
-                      ? 'L1'
-                      : t.stage === 'Lost (L2/L3)'
-                        ? 'L2 / L3'
-                        : '—');
-                  const techOpen =
-                    t.technicalOpeningDate ||
-                    (t.stage === 'Technical Eval' ? t.completionDate : '');
-                  const finOpen = t.financialOpeningDate || t.completionDate;
+                    .join(' | ') || '—'
+                }
+              />
+            </div>
 
-                  return (
-                    <tr
-                      key={t.id}
-                      data-stage={t.stage}
-                      className={`transition-colors ${
-                        isNotFilled
-                          ? 'bg-red-50/80 hover:bg-red-100/80 border-l-4 border-l-red-500 dark:bg-red-950/30 dark:hover:bg-red-950/45 dark:border-l-red-500'
-                          : 'hover:bg-slate-50 dark:hover:bg-slate-800/40'
-                      }`}
+            {previewTender.attachments && previewTender.attachments.length > 0 && (
+              <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  Attached Documents ({previewTender.attachments.length})
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {previewTender.attachments.map((att) => (
+                    <a
+                      key={att.id}
+                      href={att.dataUrl}
+                      download={att.fileName}
+                      className="flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
                     >
-                      {/* 1. S.No. */}
-                      <td className="py-2.5 px-3 align-top text-center font-mono-num text-slate-600 dark:text-slate-400 whitespace-nowrap">
-                        {index + 1}
-                      </td>
-
-                      {/* 2. Tender Ref / ID */}
-                      <td className="py-2.5 px-3 align-top max-w-[180px]">
-                        <button
-                          type="button"
-                          onClick={() => onOpenTender(t)}
-                          className={`font-mono-num font-semibold hover:underline text-left block truncate max-w-full ${
-                            isNotFilled
-                              ? 'text-red-700 dark:text-red-400'
-                              : 'text-[#1E3A8A] dark:text-blue-400'
-                          }`}
-                          title={t.tenderId}
-                        >
-                          {t.tenderId}
-                        </button>
-                        {(t.attachments?.length ?? 0) > 0 && (
-                          <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">
-                            {t.attachments?.length} {t.attachments?.length === 1 ? 'doc' : 'docs'}
-                          </div>
-                        )}
-                      </td>
-
-                      {/* 3. Client / Organization Name */}
-                      <td className="py-2.5 px-3 align-top max-w-[200px]">
-                        <p className="font-medium text-slate-900 dark:text-slate-100 truncate" title={clientName}>
-                          {clientName}
+                      <FileText className="h-3.5 w-3.5 text-[#1E3A8A] dark:text-blue-400 shrink-0" />
+                      <div className="min-w-0">
+                        <p className="font-medium truncate">{att.fileName}</p>
+                        <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                          {att.slotLabel}
                         </p>
-                      </td>
-
-                      {/* 4. Location / Department */}
-                      <td className="py-2.5 px-3 align-top max-w-[200px]">
-                        <p className="text-slate-700 dark:text-slate-300 truncate" title={locationDept}>
-                          {locationDept || '—'}
-                        </p>
-                      </td>
-
-                      {/* 5. Location */}
-                      <td className="py-2.5 px-3 align-top max-w-[150px]">
-                        <p className="text-slate-600 dark:text-slate-400 truncate" title={t.location}>
-                          {t.location || '—'}
-                        </p>
-                      </td>
-
-                      {/* 6. Brief Description & Scope of Work + Item Category Badge */}
-                      <td className="py-2.5 px-3 align-top max-w-[260px]">
-                        <p className="font-medium text-slate-900 dark:text-slate-100 line-clamp-2" title={t.title}>
-                          {t.title}
-                        </p>
-                        {t.category && (
-                          <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] font-medium text-slate-600 dark:text-slate-300">
-                            {t.category}
-                          </span>
-                        )}
-                      </td>
-
-                      {/* 7. Portal / Platform */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap text-slate-700 dark:text-slate-300">
-                        {t.portal}
-                      </td>
-
-                      {/* 8. Publish / Tender Date */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
-                        {formatShortDate(t.publishDate)}
-                      </td>
-
-                      {/* 9. Due Date & Time */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap">
-                        <div className={`font-mono-num ${dueColor}`}>
-                          {formatDateTime(t.submissionDueDate)}
-                        </div>
-                        {isOpenStage && (
-                          <div className="font-mono-num text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                            {days < 0 ? 'Past due' : days === 0 ? 'Due Today' : `${days}d left`}
-                          </div>
-                        )}
-                      </td>
-
-                      {/* 10. Pre-Bid Meeting Date */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
-                        {formatShortDate(t.preBidDate)}
-                      </td>
-
-                      {/* 11. Estimated Tender Value (INR) */}
-                      <td className="py-2.5 px-3 align-top text-right font-mono-num text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                        {formatINR(t.estimatedValue)}
-                      </td>
-
-                      {/* 12. EMD Amount (INR) */}
-                      <td className="py-2.5 px-3 align-top text-right font-mono-num font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                        {t.emdAmount > 0 ? formatINR(t.emdAmount) : 'Exempt / ₹ 0'}
-                      </td>
-
-                      {/* 13. EMD Mode / Form */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap text-slate-700 dark:text-slate-300">
-                        <span>{t.emdStatus === 'Exempted - MSME/Startup' ? 'MSME Exempt' : t.emdStatus}</span>
-                        {isSynced && (
-                          <span className="ml-1 text-[11px] text-emerald-700 dark:text-emerald-400">
-                            · Synced
-                          </span>
-                        )}
-                      </td>
-
-                      {/* 14. Current Status */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap">
-                        <span
-                          className={`inline-block px-2 py-1 rounded text-[11px] font-semibold ${getStageBadgeClass(
-                            t.stage,
-                          )}`}
-                        >
-                          {t.stage}
-                        </span>
-                      </td>
-
-                      {/* 15. Technical Opening Date */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
-                        {formatShortDate(techOpen)}
-                      </td>
-
-                      {/* 16. Financial Opening Date */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-mono-num text-slate-600 dark:text-slate-400">
-                        {formatShortDate(finOpen)}
-                      </td>
-
-                      {/* 17. L1 Bidder Name */}
-                      <td className="py-2.5 px-3 align-top max-w-[160px] text-slate-700 dark:text-slate-300 truncate" title={t.l1BidderName || ''}>
-                        {t.l1BidderName || '—'}
-                      </td>
-
-                      {/* 18. L1 Quoted Value (INR) */}
-                      <td className="py-2.5 px-3 align-top text-right font-mono-num font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                        {l1Quoted > 0 ? formatINR(l1Quoted) : '—'}
-                      </td>
-
-                      {/* 19. Our Position / Rank */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap font-medium text-slate-700 dark:text-slate-300">
-                        {rankDisplay}
-                      </td>
-
-                      {/* 20. Assigned Person / Owner */}
-                      <td className="py-2.5 px-3 align-top whitespace-nowrap text-slate-700 dark:text-slate-300">
-                        {t.assignedOwner || defaultOwner || '—'}
-                      </td>
-
-                      {/* 21. Remarks / Next Action */}
-                      <td className="py-2.5 px-3 align-top max-w-[240px]">
-                        <p className="text-slate-600 dark:text-slate-400 line-clamp-2" title={remarksSummary}>
-                          {remarksSummary || '—'}
-                        </p>
-                      </td>
-
-                      {/* Actions */}
-                      <td className="py-2.5 px-3 align-top text-right whitespace-nowrap">
-                        <div className="inline-flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => onOpenTender(t)}
-                            aria-label={`Inspect ${t.tenderId}`}
-                            className="p-1.5 rounded-md text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700"
-                          >
-                            <Eye className="h-4 w-4" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onEditTender(t)}
-                            aria-label={`Edit ${t.tenderId}`}
-                            className="p-1.5 rounded-md text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700"
-                          >
-                            <Pencil className="h-4 w-4" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        </RecordPreviewModal>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmModal
+        open={Boolean(deleteTarget)}
+        title={`Delete Tender ${deleteTarget?.tenderId ?? ''}`}
+        description={`Are you sure you want to permanently delete tender "${
+          deleteTarget?.tenderId ?? ''
+        }" (${deleteTarget?.department ?? ''})?`}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (deleteTarget) {
+            onDeleteTender(deleteTarget.id);
+          }
+          setDeleteTarget(null);
+        }}
+      />
     </div>
   );
 }
